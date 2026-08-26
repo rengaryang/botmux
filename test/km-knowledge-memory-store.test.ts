@@ -17,7 +17,7 @@ afterEach(() => {
 const sourceRefs = [{ kind: 'api', ref: 'test/evidence-1' }];
 
 describe('KM Phase 2 knowledge and memory store', () => {
-  it('migrates a v1 observation store additively to schema v2', async () => {
+  it('migrates a v1 observation store additively through the latest schema', async () => {
     const dir = tempDir();
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(dir, 'botmux-km.sqlite'));
@@ -34,7 +34,7 @@ describe('KM Phase 2 knowledge and memory store', () => {
     `);
     db.close();
     const store = await ObservationStore.open(dir);
-    expect(store.schemaVersion()).toBe(2);
+    expect(store.schemaVersion()).toBe(3);
     expect(store.listKnowledge({ limit: 10 })).toEqual([]);
     store.close();
   });
