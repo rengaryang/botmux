@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { handleKmObservationApi } from '../src/dashboard/km-observation-api.js';
 
@@ -94,6 +95,37 @@ describe('KM observation dashboard API', () => {
     await handleKmObservationApi({ method: 'GET' } as any, retrieval.res,
       new URL('http://localhost/api/km/retrieve?q=failover&scope=user&targetLayer=L3&subject=u1'), deps);
     expect(retrieve).toHaveBeenCalledWith({ text: 'failover', limit: 20, subject: 'u1', scopes: ['user'], targetLayers: ['L3'] });
+  });
+
+  it('serves trace/evolution reads and enforces approval grade through the store', async () => {
+    const listTrace = vi.fn(() => [{ edgeId: 'edge-1' }]);
+    const listEvolution = vi.fn(() => [{ proposalId: 'evo-1' }]);
+    const decideProposal = vi.fn(() => ({ approvalId: 'approval-1', state: 'approved' }));
+    const deps = {
+      enabled: true,
+      openStore: async () => ({
+        schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+        listTrace, listEvolution, decideProposal,
+      }),
+    };
+    const trace = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, trace.res,
+      new URL('http://localhost/api/km/trace?type=turn&id=turn-1&limit=999'), deps);
+    expect(listTrace).toHaveBeenCalledWith({ type: 'turn', id: 'turn-1', limit: 500 });
+    expect(trace.bodies).toEqual([{ items: [{ edgeId: 'edge-1' }] }]);
+
+    const proposals = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, proposals.res,
+      new URL('http://localhost/api/km/evolution/proposals'), deps);
+    expect(proposals.bodies).toEqual([{ items: [{ proposalId: 'evo-1' }] }]);
+
+    const decision = response();
+    const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ decision: 'approved', grade: 'G2', scope: { target: 'skill' }, riskAck: {} }))]), {
+      method: 'POST', headers: { 'x-km-actor-id': 'reviewer-1' },
+    });
+    await handleKmObservationApi(req as any, decision.res,
+      new URL('http://localhost/api/km/evolution/proposals/evo-1/decision'), deps);
+    expect(decideProposal).toHaveBeenCalledWith({ proposalId: 'evo-1', decision: 'approved', actorId: 'reviewer-1', grade: 'G2', scope: { target: 'skill' }, riskAck: {} });
   });
 
   it('returns one event and rejects unsupported methods', async () => {
