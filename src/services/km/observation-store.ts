@@ -297,6 +297,16 @@ export interface RetrievalItem {
   freshness: 'fresh' | 'stale' | 'purged' | 'unknown';
 }
 
+export interface KnowledgeExportDryRun {
+  knowledgeId: string;
+  targetLayer: KnowledgeLayer;
+  allowed: boolean;
+  requiredApprovalGrade: 'G2';
+  reason?: string;
+  action: { kind: 'knowledge-export'; targetLayer: KnowledgeLayer; claimKey: string; title: string };
+  risk: { mutatesWorkspace: true; automaticExecution: false };
+}
+
 interface ExistingIdentityRow {
   event_id: string;
   payload_hash: string;
@@ -655,6 +665,21 @@ export class ObservationStore {
       throw error;
     }
     return this.getKnowledge(input.knowledgeId)!;
+  }
+
+  knowledgeExportDryRun(knowledgeId: string): KnowledgeExportDryRun {
+    const item = this.getKnowledge(knowledgeId);
+    if (!item) throw new Error('km_knowledge_not_found');
+    const allowed = item.state === 'approved' && item.targetLayer !== 'reviewed-only';
+    return {
+      knowledgeId: item.knowledgeId,
+      targetLayer: item.targetLayer,
+      allowed,
+      requiredApprovalGrade: 'G2',
+      ...(!allowed ? { reason: item.targetLayer === 'reviewed-only' ? 'reviewed_only_not_exportable' : 'knowledge_not_approved' } : {}),
+      action: { kind: 'knowledge-export', targetLayer: item.targetLayer, claimKey: item.claimKey, title: item.title },
+      risk: { mutatesWorkspace: true, automaticExecution: false },
+    };
   }
 
   upsertMemory(input: MemoryUpsertInput): { item: MemoryItem; created: boolean; conflicted: boolean } {
