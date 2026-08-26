@@ -112,7 +112,7 @@ describe('KM observation dashboard API', () => {
 
     const second = response();
     await handleKmObservationApi(
-      { method: 'POST' } as any,
+      { method: 'POST', headers: {} } as any,
       second.res,
       new URL('http://localhost/api/km/observations'),
       { enabled: true, openStore: vi.fn() },

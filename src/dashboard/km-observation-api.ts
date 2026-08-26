@@ -12,6 +12,8 @@ export interface KmObservationApiStore {
   listKnowledge?(filter: Parameters<ObservationStore['listKnowledge']>[0]): ReturnType<ObservationStore['listKnowledge']>;
   listMemory?(filter: Parameters<ObservationStore['listMemory']>[0]): ReturnType<ObservationStore['listMemory']>;
   retrieve?(query: Parameters<ObservationStore['retrieve']>[0]): ReturnType<ObservationStore['retrieve']>;
+  transitionKnowledge?(input: Parameters<ObservationStore['transitionKnowledge']>[0]): ReturnType<ObservationStore['transitionKnowledge']>;
+  knowledgeExportDryRun?(knowledgeId: string): ReturnType<ObservationStore['knowledgeExportDryRun']>;
   close(): void;
 }
 
@@ -39,20 +41,43 @@ export async function handleKmObservationApi(
     || url.pathname.startsWith('/api/km/observations')
     || url.pathname === '/api/km/knowledge'
     || url.pathname === '/api/km/memory'
-    || url.pathname === '/api/km/retrieve';
+    || url.pathname === '/api/km/retrieve'
+    || /^\/api\/km\/knowledge\/[^/]+\/(state|export-dry-run)$/.test(url.pathname);
   if (!kmReadPath) return false;
   if (!deps.enabled) {
     jsonRes(res, 404, { error: 'km_observation_disabled' });
     return true;
   }
-  if (req.method !== 'GET') {
-    jsonRes(res, 405, { error: 'method_not_allowed' });
-    return true;
-  }
-
   let store: KmObservationApiStore | undefined;
   try {
     store = await deps.openStore();
+    const transition = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/state$/);
+    if (transition) {
+      if (req.method !== 'PATCH') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.transitionKnowledge) throw new Error('km_knowledge_review_unavailable');
+      const idempotencyKey = req.headers['idempotency-key'];
+      if (typeof idempotencyKey !== 'string' || !idempotencyKey.trim()) { jsonRes(res, 400, { error: 'idempotency_key_required' }); return true; }
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+      const actorId = req.headers['x-km-actor-id'];
+      if (typeof actorId !== 'string' || !actorId.trim()) { jsonRes(res, 403, { error: 'reviewer_actor_required' }); return true; }
+      const item = store.transitionKnowledge({ knowledgeId: decodeURIComponent(transition[1]),
+        toState: String(body.toState) as any, reasonCode: String(body.reasonCode ?? ''), actorId });
+      jsonRes(res, 200, item);
+      return true;
+    }
+
+    const dryRun = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/export-dry-run$/);
+    if (dryRun) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.knowledgeExportDryRun) throw new Error('km_knowledge_export_unavailable');
+      jsonRes(res, 200, store.knowledgeExportDryRun(decodeURIComponent(dryRun[1])));
+      return true;
+    }
+
+    if (req.method !== 'GET') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+
     if (url.pathname === '/api/km/health') {
       jsonRes(res, 200, {
         enabled: true,

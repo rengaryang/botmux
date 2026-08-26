@@ -73,6 +73,25 @@ describe('KM Phase 2 knowledge and memory store', () => {
     store.close();
   });
 
+  it('keeps export as a G2 dry-run and never executes it', async () => {
+    const store = await ObservationStore.open(tempDir());
+    const reviewedOnly = store.proposeKnowledge({
+      targetLayer: 'reviewed-only', category: 'note', title: 'Reference only', claimKey: 'note', claimText: 'Do not export.',
+      confidence: 'observed', privacyClass: 'internal', sourceRefs,
+    }).item;
+    expect(store.knowledgeExportDryRun(reviewedOnly.knowledgeId)).toEqual(expect.objectContaining({ allowed: false, reason: 'reviewed_only_not_exportable', requiredApprovalGrade: 'G2' }));
+
+    const exportable = store.proposeKnowledge({
+      targetLayer: 'L2', category: 'sop', title: 'Approved SOP', claimKey: 'sop', claimText: 'Reviewed procedure.',
+      confidence: 'observed', privacyClass: 'internal', sourceRefs,
+    }).item;
+    expect(store.knowledgeExportDryRun(exportable.knowledgeId).allowed).toBe(false);
+    store.transitionKnowledge({ knowledgeId: exportable.knowledgeId, toState: 'review_pending', reasonCode: 'ready', actorId: 'human' });
+    store.transitionKnowledge({ knowledgeId: exportable.knowledgeId, toState: 'approved', reasonCode: 'approved', actorId: 'human' });
+    expect(store.knowledgeExportDryRun(exportable.knowledgeId)).toEqual(expect.objectContaining({ allowed: true, requiredApprovalGrade: 'G2', risk: { mutatesWorkspace: true, automaticExecution: false } }));
+    store.close();
+  });
+
   it('detects conflicting memory and excludes non-active memory from retrieval', async () => {
     const store = await ObservationStore.open(tempDir());
     const first = store.upsertMemory({
