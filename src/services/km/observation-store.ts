@@ -8,7 +8,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -110,6 +110,11 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE5_SCHEMA = `
+  ALTER TABLE sync_outbox ADD COLUMN payload_json TEXT;
+  ALTER TABLE sync_outbox ADD COLUMN payload_hash TEXT;
 `;
 
 const PHASE4_SCHEMA = `
@@ -471,6 +476,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 2) this.migrateToPhase2();
     if (this.schemaVersion() < 3) this.migrateToPhase3();
     if (this.schemaVersion() < 4) this.migrateToPhase4();
+    if (this.schemaVersion() < 5) this.migrateToPhase5();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -1009,15 +1015,47 @@ export class ObservationStore {
     return this.listSyncStatus().find(item => item.sinkId === input.sinkId)!;
   }
 
-  enqueueSync(input: { sinkId: string; eventId: string; payload: Record<string, unknown>; payloadHash: string }): { outboxId: string; created: boolean } {
+  enqueueSync(input: { sinkId: string; eventId: string; payload: Record<string, unknown>; payloadHash: string; now?: number }): { outboxId: string; created: boolean } {
     const sink = this.db.prepare('SELECT enabled FROM sync_sinks WHERE sink_id=?').get(input.sinkId) as { enabled: number } | undefined;
     if (!sink) throw new Error('km_sync_sink_not_found');
     if (!sink.enabled) throw new Error('km_sync_sink_disabled');
     const outboxId = `outbox_${createHash('sha256').update(`${input.sinkId}:${input.eventId}`).digest('hex')}`;
     const now = new Date().toISOString();
     const result = this.db.prepare(`INSERT OR IGNORE INTO sync_outbox(outbox_id,event_id,sink_id,status,attempts,next_attempt_at,created_at)
-      VALUES(?,?,?,'pending',0,?,?)`).run(outboxId, input.eventId, input.sinkId, Date.now(), now);
+      VALUES(?,?,?,'pending',0,?,?)`).run(outboxId, input.eventId, input.sinkId, input.now ?? Date.now(), now);
+    if (Number(result.changes) === 1) this.db.prepare('UPDATE sync_outbox SET payload_json=?,payload_hash=? WHERE outbox_id=?')
+      .run(JSON.stringify(input.payload), input.payloadHash, outboxId);
     return { outboxId, created: Number(result.changes) === 1 };
+  }
+
+  claimSyncBatch(input: { sinkId: string; limit: number; now?: number; leaseMs?: number }): { claimToken: string; items: Array<{ outboxId: string; eventId: string; payload: Record<string, unknown>; payloadHash: string }> } {
+    const now = input.now ?? Date.now();
+    const token = `claim_${randomUUID().replaceAll('-', '')}`;
+    const leaseMs = Math.max(1_000, input.leaseMs ?? 30_000);
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`UPDATE sync_outbox SET status='failed',claim_token=NULL,claimed_at=NULL,last_error='claim_lease_expired',next_attempt_at=?
+        WHERE sink_id=? AND status='inflight' AND claimed_at<?`).run(now, input.sinkId, now - leaseMs);
+      const rows = this.db.prepare(`SELECT outbox_id FROM sync_outbox WHERE sink_id=? AND status IN ('pending','failed') AND next_attempt_at<=?
+        ORDER BY created_at,outbox_id LIMIT ?`).all(input.sinkId, now, Math.max(1, Math.min(input.limit, 100))) as any[];
+      const claim = this.db.prepare(`UPDATE sync_outbox SET status='inflight',attempts=attempts+1,claimed_at=?,claim_token=? WHERE outbox_id=?`);
+      for (const row of rows) claim.run(now, token, row.outbox_id);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+    const items = this.db.prepare(`SELECT outbox_id,event_id,payload_json,payload_hash FROM sync_outbox WHERE claim_token=? ORDER BY created_at,outbox_id`)
+      .all(token) as any[];
+    return { claimToken: token, items: items.map(row => ({ outboxId: row.outbox_id, eventId: row.event_id,
+      payload: JSON.parse(row.payload_json ?? '{}'), payloadHash: String(row.payload_hash ?? '') })) };
+  }
+
+  failSyncClaim(input: { claimToken: string; error: string; now?: number; baseDelayMs?: number }): void {
+    const now = input.now ?? Date.now();
+    const rows = this.db.prepare(`SELECT outbox_id,attempts FROM sync_outbox WHERE claim_token=? AND status='inflight'`).all(input.claimToken) as any[];
+    const update = this.db.prepare(`UPDATE sync_outbox SET status='failed',claim_token=NULL,claimed_at=NULL,last_error=?,next_attempt_at=? WHERE outbox_id=?`);
+    for (const row of rows) {
+      const delay = Math.min(300_000, (input.baseDelayMs ?? 1_000) * 2 ** Math.max(0, Number(row.attempts) - 1));
+      update.run(input.error.slice(0, 500), now + delay, row.outbox_id);
+    }
   }
 
   acknowledgeSync(input: { sinkId: string; batchId: string; acceptedEventIds: string[]; centralCursor?: string }): void {
@@ -1113,6 +1151,19 @@ export class ObservationStore {
       if (this.schemaVersion() >= 3) { this.db.exec('COMMIT;'); return; }
       this.db.exec(PHASE3_SCHEMA);
       this.db.exec('PRAGMA user_version=3;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
+  private migrateToPhase5(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 5) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE5_SCHEMA);
+      this.db.exec('PRAGMA user_version=5;');
       this.db.exec('COMMIT;');
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
