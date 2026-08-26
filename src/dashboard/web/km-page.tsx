@@ -8,6 +8,12 @@ type Health = {
   counts: { observations: number; quarantined: number; knowledge?: number; memory?: number };
 };
 
+type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; title: string; confidence: string; freshness: string };
+type MemoryItem = { memoryId: string; state: string; scope: string; subject: string; claimKey: string; confidence: string };
+type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; targetId: string; passCount: number; warnCount: number; failCount: number };
+type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
+type TraceEdge = { edgeId: string; fromType: string; fromId: string; toType: string; toId: string; edgeType: string };
+
 type ObservationEvent = {
   eventId: string;
   eventType: string;
@@ -42,22 +48,45 @@ function KmPage(): React.JSX.Element {
   const [events, setEvents] = useState<ObservationEvent[]>([]);
   const [error, setError] = useState('');
   const [typeFilter, setTypeFilter] = useState<string>('');
+  const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
+  const [memory, setMemory] = useState<MemoryItem[]>([]);
+  const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
+  const [proposals, setProposals] = useState<EvolutionProposal[]>([]);
+  const [traceType, setTraceType] = useState('turn');
+  const [traceId, setTraceId] = useState('');
+  const [traceEdges, setTraceEdges] = useState<TraceEdge[]>([]);
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
+        getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
+        getJson<{ items: MemoryItem[] }>('/api/km/memory?limit=20'),
+        getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
+        getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
       ]);
       setHealth(h);
       setEvents(list.items);
+      setKnowledge(knowledgeList.items);
+      setMemory(memoryList.items);
+      setEvalRuns(evalList.items);
+      setProposals(proposalList.items);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
   useEffect(() => { void load(); }, []);
+
+  const loadTrace = async () => {
+    if (!traceType.trim() || !traceId.trim()) return;
+    try {
+      const result = await getJson<{ items: TraceEdge[] }>(`/api/km/trace?type=${encodeURIComponent(traceType)}&id=${encodeURIComponent(traceId)}&limit=100`);
+      setTraceEdges(result.items);
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
 
   const funnel = funnelCounts(events);
   const maxFunnel = Math.max(1, ...Object.values(funnel));
@@ -94,6 +123,30 @@ function KmPage(): React.JSX.Element {
         <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
           manifest.resolved = 会话分发的 Skill；invoked = 模型实际执行 botmux skill show/read 拉取内容；completed/failed = 命令退出状态。
         </p>
+      </section>
+
+      <section className="panel">
+        <h2>Knowledge / Memory Review</h2>
+        <div className="feedback-deliveries">
+          {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}</b></div>)}
+          {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}</b></div>)}
+          {knowledge.length + memory.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Trace / Eval / Evolution</h2>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          <input value={traceType} onChange={e => setTraceType(e.target.value)} placeholder="类型，如 turn" />
+          <input value={traceId} onChange={e => setTraceId(e.target.value)} placeholder="ID" />
+          <button onClick={() => void loadTrace()}>查询 Trace</button>
+        </div>
+        <div className="feedback-deliveries">
+          {traceEdges.map(edge => <div key={edge.edgeId}><code>{edge.edgeType}</code><span>{edge.fromType}:{edge.fromId}</span><span>{edge.toType}:{edge.toId}</span><b>edge</b></div>)}
+          {evalRuns.map(run => <div key={run.evalRunId}><code>{run.evaluatorName}</code><span>{run.targetType}:{run.targetId}</span><span>pass {run.passCount} · warn {run.warnCount}</span><b>fail {run.failCount}</b></div>)}
+          {proposals.map(proposal => <div key={proposal.proposalId}><code>{proposal.proposalType}</code><span>{proposal.summary}</span><span>{proposal.targetRef}</span><b>{proposal.approvalGrade} · {proposal.state}</b></div>)}
+          {traceEdges.length + evalRuns.length + proposals.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Trace、Eval 或 Evolution 数据。</p>}
+        </div>
       </section>
 
       <section className="panel">

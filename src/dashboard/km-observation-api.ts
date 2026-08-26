@@ -16,6 +16,7 @@ export interface KmObservationApiStore {
   knowledgeExportDryRun?(knowledgeId: string): ReturnType<ObservationStore['knowledgeExportDryRun']>;
   listTrace?(input: Parameters<ObservationStore['listTrace']>[0]): ReturnType<ObservationStore['listTrace']>;
   listEvolution?(limit: number): ReturnType<ObservationStore['listEvolution']>;
+  listEvalRuns?(limit: number): ReturnType<ObservationStore['listEvalRuns']>;
   decideProposal?(input: Parameters<ObservationStore['decideProposal']>[0]): ReturnType<ObservationStore['decideProposal']>;
   close(): void;
 }
@@ -47,6 +48,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/retrieve'
     || /^\/api\/km\/knowledge\/[^/]+\/(state|export-dry-run)$/.test(url.pathname)
     || url.pathname === '/api/km/trace'
+    || url.pathname === '/api/km/eval/runs'
     || url.pathname === '/api/km/evolution/proposals'
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
   if (!kmReadPath) return false;
@@ -103,6 +105,12 @@ export async function handleKmObservationApi(
       const type = url.searchParams.get('type')?.trim(); const id = url.searchParams.get('id')?.trim();
       if (!type || !id) { jsonRes(res, 400, { error: 'trace_type_and_id_required' }); return true; }
       jsonRes(res, 200, { items: store.listTrace({ type, id, limit: positiveInteger(url.searchParams.get('limit'), 100, 500) }) });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/eval/runs') {
+      if (!store.listEvalRuns) throw new Error('km_eval_unavailable');
+      jsonRes(res, 200, { items: store.listEvalRuns(positiveInteger(url.searchParams.get('limit'), 50, 100)) });
       return true;
     }
 
