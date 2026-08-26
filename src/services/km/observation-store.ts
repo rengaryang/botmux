@@ -8,7 +8,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -110,6 +110,29 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE4_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS sync_sinks (
+    sink_id TEXT PRIMARY KEY,
+    protocol_version INTEGER NOT NULL CHECK(protocol_version>=1),
+    endpoint_ref TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    redaction_policy_json TEXT NOT NULL CHECK(json_valid(redaction_policy_json)),
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sync_cursors (
+    sink_id TEXT PRIMARY KEY REFERENCES sync_sinks(sink_id) ON DELETE CASCADE,
+    last_local_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_local_seq>=0),
+    last_batch_id TEXT, last_ack_at TEXT, central_cursor TEXT,
+    status TEXT NOT NULL CHECK(status IN ('idle','syncing','degraded','blocked')),
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sync_quarantine (
+    quarantine_id TEXT PRIMARY KEY, sink_id TEXT NOT NULL,
+    event_id TEXT, reason TEXT NOT NULL, payload_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL, resolved_at TEXT
+  );
 `;
 
 const PHASE3_SCHEMA = `
@@ -354,6 +377,15 @@ export interface EvalResultInput {
   verdict: 'pass' | 'warn' | 'fail' | 'not_applicable' | 'inconclusive';
   confidence: KmConfidence; details?: Record<string, unknown>; sourceRefs: unknown[];
 }
+export interface SyncSinkInput {
+  sinkId: string; protocolVersion: number; endpointRef: string; enabled?: boolean; redactionPolicy?: Record<string, unknown>;
+}
+export interface SyncStatus {
+  sinkId: string; endpointRef: string; enabled: boolean; status: string;
+  lastLocalSeq: number; lastBatchId?: string; lastAckAt?: string; centralCursor?: string;
+  pending: number; quarantined: number;
+}
+
 export interface EvolutionProposalInput {
   proposalType: 'skill-route' | 'skill-edit' | 'knowledge-promotion' | 'memory-policy' | 'dashboard-warning' | 'workflow-revision' | 'cleanup-action' | 'external-action';
   targetRef: string; approvalGrade: ApprovalGrade; summary: string; evidenceRefs: unknown[];
@@ -438,6 +470,7 @@ export class ObservationStore {
     if (version === 0) this.createFreshSchema();
     if (this.schemaVersion() < 2) this.migrateToPhase2();
     if (this.schemaVersion() < 3) this.migrateToPhase3();
+    if (this.schemaVersion() < 4) this.migrateToPhase4();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -960,6 +993,67 @@ export class ObservationStore {
       ...(row.approved_by ? { approvedBy: row.approved_by } : {}), createdAt: row.created_at, updatedAt: row.updated_at }));
   }
 
+  configureSyncSink(input: SyncSinkInput): SyncStatus {
+    const now = new Date().toISOString();
+    if (!input.endpointRef.startsWith('mock://') && input.enabled) throw new Error('km_sync_real_sink_requires_explicit_external_approval');
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`INSERT INTO sync_sinks(sink_id,protocol_version,endpoint_ref,enabled,redaction_policy_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(sink_id) DO UPDATE SET protocol_version=excluded.protocol_version,
+        endpoint_ref=excluded.endpoint_ref,enabled=excluded.enabled,redaction_policy_json=excluded.redaction_policy_json,updated_at=excluded.updated_at`)
+        .run(requireText(input.sinkId, 'sink_id'), input.protocolVersion, requireText(input.endpointRef, 'sink_endpoint'), input.enabled ? 1 : 0,
+          JSON.stringify(input.redactionPolicy ?? {}), now, now);
+      this.db.prepare(`INSERT OR IGNORE INTO sync_cursors(sink_id,last_local_seq,status,updated_at) VALUES(?,0,'idle',?)`).run(input.sinkId, now);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+    return this.listSyncStatus().find(item => item.sinkId === input.sinkId)!;
+  }
+
+  enqueueSync(input: { sinkId: string; eventId: string; payload: Record<string, unknown>; payloadHash: string }): { outboxId: string; created: boolean } {
+    const sink = this.db.prepare('SELECT enabled FROM sync_sinks WHERE sink_id=?').get(input.sinkId) as { enabled: number } | undefined;
+    if (!sink) throw new Error('km_sync_sink_not_found');
+    if (!sink.enabled) throw new Error('km_sync_sink_disabled');
+    const outboxId = `outbox_${createHash('sha256').update(`${input.sinkId}:${input.eventId}`).digest('hex')}`;
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`INSERT OR IGNORE INTO sync_outbox(outbox_id,event_id,sink_id,status,attempts,next_attempt_at,created_at)
+      VALUES(?,?,?,'pending',0,?,?)`).run(outboxId, input.eventId, input.sinkId, Date.now(), now);
+    return { outboxId, created: Number(result.changes) === 1 };
+  }
+
+  acknowledgeSync(input: { sinkId: string; batchId: string; acceptedEventIds: string[]; centralCursor?: string }): void {
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const delivered = this.db.prepare(`UPDATE sync_outbox SET status='delivered',delivered_at=? WHERE sink_id=? AND event_id=?`);
+      for (const eventId of input.acceptedEventIds) delivered.run(now, input.sinkId, eventId);
+      const row = this.db.prepare(`SELECT COALESCE(MAX(o.local_seq),0) max_seq FROM observation_events o JOIN sync_outbox x ON x.event_id=o.event_id WHERE x.sink_id=? AND x.status='delivered'`)
+        .get(input.sinkId) as { max_seq: number };
+      this.db.prepare(`UPDATE sync_cursors SET last_local_seq=?,last_batch_id=?,last_ack_at=?,central_cursor=?,status='idle',updated_at=? WHERE sink_id=?`)
+        .run(Number(row.max_seq), input.batchId, now, input.centralCursor ?? null, now, input.sinkId);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  quarantineSync(input: { sinkId: string; eventId?: string; reason: string; payloadHash: string }): string {
+    const id = `syncq_${randomUUID().replaceAll('-', '')}`;
+    this.db.prepare(`INSERT INTO sync_quarantine(quarantine_id,sink_id,event_id,reason,payload_hash,created_at) VALUES(?,?,?,?,?,?)`)
+      .run(id, input.sinkId, input.eventId ?? null, requireText(input.reason, 'sync_quarantine_reason'), input.payloadHash, new Date().toISOString());
+    if (input.eventId) this.db.prepare(`UPDATE sync_outbox SET status='quarantined',last_error=? WHERE sink_id=? AND event_id=?`)
+      .run(input.reason, input.sinkId, input.eventId);
+    return id;
+  }
+
+  listSyncStatus(): SyncStatus[] {
+    const rows = this.db.prepare(`SELECT s.*,c.last_local_seq,c.last_batch_id,c.last_ack_at,c.central_cursor,c.status,
+      (SELECT COUNT(*) FROM sync_outbox x WHERE x.sink_id=s.sink_id AND x.status IN ('pending','failed')) pending,
+      (SELECT COUNT(*) FROM sync_quarantine q WHERE q.sink_id=s.sink_id AND q.resolved_at IS NULL) quarantined
+      FROM sync_sinks s JOIN sync_cursors c ON c.sink_id=s.sink_id ORDER BY s.sink_id`).all() as any[];
+    return rows.map(row => ({ sinkId: row.sink_id, endpointRef: row.endpoint_ref, enabled: Boolean(row.enabled), status: row.status,
+      lastLocalSeq: Number(row.last_local_seq), ...(row.last_batch_id ? { lastBatchId: row.last_batch_id } : {}),
+      ...(row.last_ack_at ? { lastAckAt: row.last_ack_at } : {}), ...(row.central_cursor ? { centralCursor: row.central_cursor } : {}),
+      pending: Number(row.pending), quarantined: Number(row.quarantined) }));
+  }
+
   private knowledgeFromRow(row: any): KnowledgeItem {
     return {
       knowledgeId: row.knowledge_id, state: row.state, targetLayer: row.target_layer,
@@ -1026,6 +1120,19 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase4(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 4) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE4_SCHEMA);
+      this.db.exec('PRAGMA user_version=4;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
   private validateSchema(): void {
     const required = [
       'observation_events',
@@ -1044,6 +1151,9 @@ export class ObservationStore {
       'eval_results',
       'evolution_proposals',
       'approval_decisions',
+      'sync_sinks',
+      'sync_cursors',
+      'sync_quarantine',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
