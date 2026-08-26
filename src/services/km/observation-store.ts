@@ -895,6 +895,23 @@ export class ObservationStore {
     return { evalRunId, created: true };
   }
 
+  listEvalRuns(limit: number): Array<Record<string, unknown>> {
+    const rows = this.db.prepare(`
+      SELECT r.*,COUNT(x.eval_result_id) result_count,
+        SUM(CASE WHEN x.verdict='pass' THEN 1 ELSE 0 END) pass_count,
+        SUM(CASE WHEN x.verdict='warn' THEN 1 ELSE 0 END) warn_count,
+        SUM(CASE WHEN x.verdict='fail' THEN 1 ELSE 0 END) fail_count
+      FROM eval_runs r LEFT JOIN eval_results x ON x.eval_run_id=r.eval_run_id
+      GROUP BY r.eval_run_id ORDER BY r.updated_at DESC,r.eval_run_id DESC LIMIT ?
+    `).all(Math.max(1, Math.min(limit, 500))) as any[];
+    return rows.map(row => ({ evalRunId: row.eval_run_id, state: row.state,
+      evaluatorName: row.evaluator_name, evaluatorVersion: row.evaluator_version,
+      targetType: row.target_type, targetId: row.target_id,
+      resultCount: Number(row.result_count), passCount: Number(row.pass_count ?? 0),
+      warnCount: Number(row.warn_count ?? 0), failCount: Number(row.fail_count ?? 0),
+      createdAt: row.created_at, updatedAt: row.updated_at }));
+  }
+
   createEvolutionProposal(input: EvolutionProposalInput): string {
     if (input.evidenceRefs.length === 0) throw new Error('km_evolution_evidence_required');
     const now = new Date().toISOString();

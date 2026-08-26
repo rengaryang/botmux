@@ -101,11 +101,12 @@ describe('KM observation dashboard API', () => {
     const listTrace = vi.fn(() => [{ edgeId: 'edge-1' }]);
     const listEvolution = vi.fn(() => [{ proposalId: 'evo-1' }]);
     const decideProposal = vi.fn(() => ({ approvalId: 'approval-1', state: 'approved' }));
+    const listEvalRuns = vi.fn(() => [{ evalRunId: 'eval-1' }]);
     const deps = {
       enabled: true,
       openStore: async () => ({
         schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
-        listTrace, listEvolution, decideProposal,
+        listTrace, listEvolution, decideProposal, listEvalRuns,
       }),
     };
     const trace = response();
@@ -113,6 +114,11 @@ describe('KM observation dashboard API', () => {
       new URL('http://localhost/api/km/trace?type=turn&id=turn-1&limit=999'), deps);
     expect(listTrace).toHaveBeenCalledWith({ type: 'turn', id: 'turn-1', limit: 500 });
     expect(trace.bodies).toEqual([{ items: [{ edgeId: 'edge-1' }] }]);
+
+    const evals = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, evals.res,
+      new URL('http://localhost/api/km/eval/runs'), deps);
+    expect(evals.bodies).toEqual([{ items: [{ evalRunId: 'eval-1' }] }]);
 
     const proposals = response();
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, proposals.res,

@@ -30,6 +30,7 @@ describe('KM Phase 3 trace, eval and evolution', () => {
     };
     expect(store.recordEval(input).created).toBe(true);
     expect(store.recordEval(input).created).toBe(false);
+    expect(store.listEvalRuns(10)[0]).toEqual(expect.objectContaining({ evaluatorName: 'artifact-completeness', resultCount: 1, passCount: 1, failCount: 0 }));
     expect(() => store.recordEval({ ...input, targetId: 'artifact-2', results: [{ ...input.results[0], sourceRefs: [] }] })).toThrow(/source_refs_required/);
     store.close();
   });
