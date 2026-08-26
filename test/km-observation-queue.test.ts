@@ -71,6 +71,23 @@ describe('KM observation queue', () => {
     store.close();
   });
 
+  it('retries a busy SQLite writer without blocking the event loop', async () => {
+    const dir = freshDir();
+    const store = await ObservationStore.open(dir);
+    (store as any).db.exec('BEGIN IMMEDIATE;');
+
+    let resolved = false;
+    const queued = enqueueObservation({ dataDir: dir, event: event() }).then(() => { resolved = true; });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(resolved).toBe(false);
+    expect(__testOnly_pendingObservationCount()).toBe(1);
+
+    (store as any).db.exec('COMMIT;');
+    await queued;
+    expect(resolved).toBe(true);
+    store.close();
+  });
+
   it('drains accepted work and refuses work submitted after admission closes', async () => {
     const dir = freshDir();
     void enqueueObservation({ dataDir: dir, event: event() });

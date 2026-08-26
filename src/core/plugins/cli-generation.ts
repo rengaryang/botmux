@@ -9,6 +9,8 @@ import { refreshSessionPluginManifest, type SessionPluginManifest } from './sess
 import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
 import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
+import { observationFromSessionSkillManifest } from '../../services/km/observation-producers.js';
+import { enqueueObservation, isKmObservationEnabled } from '../../services/km/observation-queue.js';
 
 export interface CliPluginGenerationResult {
   pluginManifest: SessionPluginManifest;
@@ -78,6 +80,15 @@ export function prepareCliPluginGeneration(opts: {
     botPolicy: opts.bot.skills,
     pluginSkills: pluginSkills.skills,
   });
+  if (preparedSkills.manifest && isKmObservationEnabled() && opts.dataDir) {
+    void enqueueObservation({
+      dataDir: opts.dataDir,
+      event: observationFromSessionSkillManifest({
+        botAppId: opts.bot.larkAppId,
+        manifest: preparedSkills.manifest,
+      }),
+    });
+  }
   const delivery = prepareSkillDelivery(
     opts.adapter,
     preparedSkills.manifest,

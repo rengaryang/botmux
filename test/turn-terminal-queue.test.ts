@@ -51,6 +51,22 @@ describe('turn-terminal nonblocking queue', () => {
     expect(events[0].payload.status).toBe('completed');
   });
 
+  it('reports the canonical completion payload after durable reconciliation', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    delivery(store, dir);
+    const persisted: unknown[] = [];
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
+      onPersisted: payload => persisted.push(payload),
+    });
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]).toMatchObject({
+      type: 'turn.completed', botAppId: 'app', sessionId: 'sess', turnId: 'turn-1', status: 'completed',
+    });
+  });
+
   it('dedupes concurrent enqueues of the same turn into one in-flight item and one event', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
