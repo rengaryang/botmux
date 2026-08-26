@@ -14706,6 +14706,50 @@ switch (command) {
     }
     break;
   }
+  case 'km': {
+    // `botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]`
+    // Read-only backfill of historical turn.completed events into the KM
+    // observation store. Dry-run (default: no, requires --execute to write).
+    const kmArgs = process.argv.slice(3);
+    const kmSub = kmArgs[0] ?? 'help';
+    if (kmSub !== 'backfill') {
+      console.error('用法: botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]');
+      process.exitCode = 2;
+      break;
+    }
+    {
+      const flags = kmArgs.slice(1);
+      const dryRun = flags.includes('--dry-run');
+      const sinceIdx = flags.indexOf('--since');
+      const since = sinceIdx >= 0 && flags[sinceIdx + 1] ? flags[sinceIdx + 1] : undefined;
+      const limitIdx = flags.indexOf('--limit');
+      const limit = limitIdx >= 0 && flags[limitIdx + 1] ? Number(flags[limitIdx + 1]) : undefined;
+      const { config } = await import('./config.js');
+      const { isKmObservationEnabled, enqueueObservation, drainObservationQueue } =
+        await import('./services/km/observation-queue.js');
+      const { backfillTurnCompletionObservations } = await import('./services/km/observation-backfill.js');
+      const { result, events } = backfillTurnCompletionObservations({
+        dataDir: config.session.dataDir,
+        ...(since ? { since } : {}),
+        ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+      });
+      if (dryRun) {
+        console.log(JSON.stringify({ dryRun: true, ...result }, null, 2));
+      } else {
+        if (!isKmObservationEnabled()) {
+          console.error('KM 观测未开启（BOTMUX_KM_OBSERVATION_ENABLED），拒绝写入。先开启或在 dry-run 验证。');
+          process.exitCode = 2;
+          break;
+        }
+        for (const event of events) {
+          await enqueueObservation({ dataDir: config.session.dataDir, event });
+        }
+        const undrained = await drainObservationQueue(3_000);
+        console.log(JSON.stringify({ ...result, undrained }, null, 2));
+      }
+    }
+    break;
+  }
   case 'skills': {
     const { runSkillsAdminCommand } = await import('./core/skills/cli-admin-command.js');
     const result = runSkillsAdminCommand(process.argv.slice(3));
