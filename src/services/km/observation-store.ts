@@ -8,7 +8,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -110,6 +110,52 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE3_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS trace_edges (
+    edge_id TEXT PRIMARY KEY,
+    from_type TEXT NOT NULL, from_id TEXT NOT NULL,
+    to_type TEXT NOT NULL, to_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL CHECK(edge_type IN ('caused','used','produced','evaluated','superseded','conflicted','approved','synced','purged')),
+    evidence_event_id TEXT REFERENCES observation_events(event_id), created_at TEXT NOT NULL,
+    UNIQUE(from_type,from_id,to_type,to_id,edge_type)
+  );
+  CREATE INDEX IF NOT EXISTS trace_edges_from ON trace_edges(from_type,from_id,edge_type);
+  CREATE INDEX IF NOT EXISTS trace_edges_to ON trace_edges(to_type,to_id,edge_type);
+  CREATE TABLE IF NOT EXISTS eval_runs (
+    eval_run_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK(state IN ('queued','running','scored','accepted','skipped','failed','inconclusive','superseded')),
+    evaluator_name TEXT NOT NULL, evaluator_version TEXT NOT NULL,
+    target_type TEXT NOT NULL CHECK(target_type IN ('turn','workflow-artifact','knowledge','memory','skill','sync-batch','proposal')),
+    target_id TEXT NOT NULL, started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(evaluator_name,evaluator_version,target_type,target_id)
+  );
+  CREATE TABLE IF NOT EXISTS eval_results (
+    eval_result_id TEXT PRIMARY KEY, eval_run_id TEXT NOT NULL REFERENCES eval_runs(eval_run_id) ON DELETE CASCADE,
+    metric_key TEXT NOT NULL, score REAL,
+    verdict TEXT NOT NULL CHECK(verdict IN ('pass','warn','fail','not_applicable','inconclusive')),
+    confidence TEXT NOT NULL CHECK(confidence IN ('observed','inferred')),
+    details_json TEXT NOT NULL CHECK(json_valid(details_json)), source_refs_json TEXT NOT NULL CHECK(json_valid(source_refs_json)),
+    created_at TEXT NOT NULL, UNIQUE(eval_run_id,metric_key)
+  );
+  CREATE TABLE IF NOT EXISTS evolution_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK(state IN ('draft','review_pending','approved','executing','applied','verified','failed','rejected','abandoned','expired','reverted','superseded')),
+    proposal_type TEXT NOT NULL CHECK(proposal_type IN ('skill-route','skill-edit','knowledge-promotion','memory-policy','dashboard-warning','workflow-revision','cleanup-action','external-action')),
+    target_ref TEXT NOT NULL, approval_grade TEXT NOT NULL CHECK(approval_grade IN ('G0','G1','G2','G3','G4')),
+    summary TEXT NOT NULL, evidence_refs_json TEXT NOT NULL CHECK(json_valid(evidence_refs_json)),
+    proposed_action_json TEXT NOT NULL CHECK(json_valid(proposed_action_json)), risk_json TEXT NOT NULL CHECK(json_valid(risk_json)),
+    rollback_json TEXT NOT NULL CHECK(json_valid(rollback_json)), created_by TEXT NOT NULL, approved_by TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS approval_decisions (
+    approval_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL REFERENCES evolution_proposals(proposal_id) ON DELETE CASCADE,
+    grade TEXT NOT NULL CHECK(grade IN ('G0','G1','G2','G3','G4')),
+    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected','request_changes','expired','revoked')),
+    actor_id TEXT NOT NULL, scope_json TEXT NOT NULL CHECK(json_valid(scope_json)), risk_ack_json TEXT NOT NULL CHECK(json_valid(risk_ack_json)),
+    created_at TEXT NOT NULL
+  );
 `;
 
 const PHASE2_SCHEMA = `
@@ -297,6 +343,23 @@ export interface RetrievalItem {
   freshness: 'fresh' | 'stale' | 'purged' | 'unknown';
 }
 
+export type ApprovalGrade = 'G0' | 'G1' | 'G2' | 'G3' | 'G4';
+export interface TraceEdgeInput {
+  fromType: string; fromId: string; toType: string; toId: string;
+  edgeType: 'caused' | 'used' | 'produced' | 'evaluated' | 'superseded' | 'conflicted' | 'approved' | 'synced' | 'purged';
+  evidenceEventId?: string;
+}
+export interface EvalResultInput {
+  metricKey: string; score?: number;
+  verdict: 'pass' | 'warn' | 'fail' | 'not_applicable' | 'inconclusive';
+  confidence: KmConfidence; details?: Record<string, unknown>; sourceRefs: unknown[];
+}
+export interface EvolutionProposalInput {
+  proposalType: 'skill-route' | 'skill-edit' | 'knowledge-promotion' | 'memory-policy' | 'dashboard-warning' | 'workflow-revision' | 'cleanup-action' | 'external-action';
+  targetRef: string; approvalGrade: ApprovalGrade; summary: string; evidenceRefs: unknown[];
+  proposedAction: Record<string, unknown>; risk: Record<string, unknown>; rollback: Record<string, unknown>; createdBy: string;
+}
+
 export interface KnowledgeExportDryRun {
   knowledgeId: string;
   targetLayer: KnowledgeLayer;
@@ -325,7 +388,7 @@ function quarantineId(): string {
   return `q_${randomUUID().replaceAll('-', '')}`;
 }
 
-function kmId(prefix: 'kn' | 'mem' | 'hist'): string {
+function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval'): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
@@ -374,6 +437,7 @@ export class ObservationStore {
     if (version > SCHEMA_VERSION) throw new Error(`km_observation_schema_newer:${version}`);
     if (version === 0) this.createFreshSchema();
     if (this.schemaVersion() < 2) this.migrateToPhase2();
+    if (this.schemaVersion() < 3) this.migrateToPhase3();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -781,6 +845,104 @@ export class ObservationStore {
     return items.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
   }
 
+  addTraceEdge(input: TraceEdgeInput): { edgeId: string; created: boolean } {
+    const edgeId = kmId('edge');
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO trace_edges(edge_id,from_type,from_id,to_type,to_id,edge_type,evidence_event_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?)
+    `).run(edgeId, requireText(input.fromType, 'trace_from_type'), requireText(input.fromId, 'trace_from_id'),
+      requireText(input.toType, 'trace_to_type'), requireText(input.toId, 'trace_to_id'), input.edgeType,
+      input.evidenceEventId ?? null, new Date().toISOString());
+    if (Number(result.changes) === 1) return { edgeId, created: true };
+    const existing = this.db.prepare(`SELECT edge_id FROM trace_edges WHERE from_type=? AND from_id=? AND to_type=? AND to_id=? AND edge_type=?`)
+      .get(input.fromType, input.fromId, input.toType, input.toId, input.edgeType) as { edge_id: string };
+    return { edgeId: existing.edge_id, created: false };
+  }
+
+  listTrace(input: { type: string; id: string; limit: number }): Array<Record<string, unknown>> {
+    const rows = this.db.prepare(`
+      SELECT * FROM trace_edges WHERE (from_type=? AND from_id=?) OR (to_type=? AND to_id=?)
+      ORDER BY created_at DESC,edge_id DESC LIMIT ?
+    `).all(input.type, input.id, input.type, input.id, Math.max(1, Math.min(input.limit, 500))) as any[];
+    return rows.map(row => ({ edgeId: row.edge_id, fromType: row.from_type, fromId: row.from_id,
+      toType: row.to_type, toId: row.to_id, edgeType: row.edge_type,
+      ...(row.evidence_event_id ? { evidenceEventId: row.evidence_event_id } : {}), createdAt: row.created_at }));
+  }
+
+  recordEval(input: {
+    evaluatorName: string; evaluatorVersion: string;
+    targetType: 'turn' | 'workflow-artifact' | 'knowledge' | 'memory' | 'skill' | 'sync-batch' | 'proposal';
+    targetId: string; results: EvalResultInput[];
+  }): { evalRunId: string; created: boolean } {
+    if (input.results.length === 0) throw new Error('km_eval_results_required');
+    if (input.results.some(result => result.sourceRefs.length === 0)) throw new Error('km_eval_source_refs_required');
+    const existing = this.db.prepare(`SELECT eval_run_id FROM eval_runs WHERE evaluator_name=? AND evaluator_version=? AND target_type=? AND target_id=?`)
+      .get(input.evaluatorName, input.evaluatorVersion, input.targetType, input.targetId) as { eval_run_id: string } | undefined;
+    if (existing) return { evalRunId: existing.eval_run_id, created: false };
+    const now = new Date().toISOString();
+    const evalRunId = kmId('eval');
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`INSERT INTO eval_runs(eval_run_id,state,evaluator_name,evaluator_version,target_type,target_id,started_at,completed_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(evalRunId, 'accepted', requireText(input.evaluatorName, 'evaluator_name'),
+        requireText(input.evaluatorVersion, 'evaluator_version'), input.targetType, requireText(input.targetId, 'eval_target_id'), now, now, now, now);
+      const insert = this.db.prepare(`INSERT INTO eval_results(eval_result_id,eval_run_id,metric_key,score,verdict,confidence,details_json,source_refs_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`);
+      for (const result of input.results) insert.run(kmId('result'), evalRunId, requireText(result.metricKey, 'metric_key'), result.score ?? null,
+        result.verdict, result.confidence, JSON.stringify(result.details ?? {}), JSON.stringify(result.sourceRefs), now);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch { /* closed */ } throw error; }
+    return { evalRunId, created: true };
+  }
+
+  createEvolutionProposal(input: EvolutionProposalInput): string {
+    if (input.evidenceRefs.length === 0) throw new Error('km_evolution_evidence_required');
+    const now = new Date().toISOString();
+    const proposalId = kmId('evo');
+    this.db.prepare(`INSERT INTO evolution_proposals(
+      proposal_id,state,proposal_type,target_ref,approval_grade,summary,evidence_refs_json,
+      proposed_action_json,risk_json,rollback_json,created_by,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(proposalId, 'review_pending', input.proposalType,
+      requireText(input.targetRef, 'proposal_target'), input.approvalGrade, requireText(input.summary, 'proposal_summary'),
+      JSON.stringify(input.evidenceRefs), JSON.stringify(input.proposedAction), JSON.stringify(input.risk),
+      JSON.stringify(input.rollback), requireText(input.createdBy, 'proposal_creator'), now, now);
+    return proposalId;
+  }
+
+  decideProposal(input: {
+    proposalId: string; decision: 'approved' | 'rejected' | 'request_changes';
+    actorId: string; grade: ApprovalGrade; scope: Record<string, unknown>; riskAck?: Record<string, unknown>;
+  }): { approvalId: string; state: string } {
+    const proposal = this.db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=?').get(input.proposalId) as any;
+    if (!proposal) throw new Error('km_evolution_proposal_not_found');
+    if (proposal.state !== 'review_pending') throw new Error(`km_evolution_invalid_state:${proposal.state}`);
+    const rank = (grade: ApprovalGrade) => Number(grade.slice(1));
+    if (input.decision === 'approved' && rank(input.grade) < rank(proposal.approval_grade)) throw new Error('km_approval_grade_insufficient');
+    const approvalId = kmId('approval');
+    const now = new Date().toISOString();
+    const state = input.decision === 'approved' ? 'approved' : input.decision === 'rejected' ? 'rejected' : 'draft';
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`INSERT INTO approval_decisions(approval_id,proposal_id,grade,decision,actor_id,scope_json,risk_ack_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(approvalId, input.proposalId, input.grade, input.decision,
+        requireText(input.actorId, 'approval_actor'), JSON.stringify(input.scope), JSON.stringify(input.riskAck ?? {}), now);
+      this.db.prepare('UPDATE evolution_proposals SET state=?,approved_by=?,updated_at=? WHERE proposal_id=?')
+        .run(state, input.decision === 'approved' ? input.actorId : null, now, input.proposalId);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch { /* closed */ } throw error; }
+    return { approvalId, state };
+  }
+
+  listEvolution(limit: number): Array<Record<string, unknown>> {
+    const rows = this.db.prepare('SELECT * FROM evolution_proposals ORDER BY updated_at DESC,proposal_id DESC LIMIT ?')
+      .all(Math.max(1, Math.min(limit, 500))) as any[];
+    return rows.map(row => ({ proposalId: row.proposal_id, state: row.state, proposalType: row.proposal_type,
+      targetRef: row.target_ref, approvalGrade: row.approval_grade, summary: row.summary,
+      evidenceRefs: parseJsonArray(row.evidence_refs_json), proposedAction: JSON.parse(row.proposed_action_json),
+      risk: JSON.parse(row.risk_json), rollback: JSON.parse(row.rollback_json), createdBy: row.created_by,
+      ...(row.approved_by ? { approvedBy: row.approved_by } : {}), createdAt: row.created_at, updatedAt: row.updated_at }));
+  }
+
   private knowledgeFromRow(row: any): KnowledgeItem {
     return {
       knowledgeId: row.knowledge_id, state: row.state, targetLayer: row.target_layer,
@@ -834,6 +996,19 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase3(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 3) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE3_SCHEMA);
+      this.db.exec('PRAGMA user_version=3;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
   private validateSchema(): void {
     const required = [
       'observation_events',
@@ -847,6 +1022,11 @@ export class ObservationStore {
       'knowledge_state_history',
       'memory_items',
       'memory_state_history',
+      'trace_edges',
+      'eval_runs',
+      'eval_results',
+      'evolution_proposals',
+      'approval_decisions',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
