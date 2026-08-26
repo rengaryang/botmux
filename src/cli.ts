@@ -14667,10 +14667,43 @@ switch (command) {
   }
   case 'skill': {
     const { runSkillSessionCommand } = await import('./core/skills/cli-session-command.js');
-    const result = runSkillSessionCommand(process.argv.slice(3));
+    const skillArgs = process.argv.slice(3);
+    const result = runSkillSessionCommand(skillArgs);
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exitCode = result.code;
+    // KM observation: a `skill show|read` executed inside a live CLI session is
+    // observed evidence the model actually pulled skill content. Failures of
+    // this telemetry must never break the command output above.
+    if ((skillArgs[0] === 'show' || skillArgs[0] === 'read') && skillArgs[1]) {
+      try {
+        const { isKmObservationEnabled, enqueueObservation } = await import('./services/km/observation-queue.js');
+        if (isKmObservationEnabled()) {
+          const { observationFromSkillCommand } = await import('./services/km/observation-producers.js');
+          const { config } = await import('./config.js');
+          const botAppId = process.env.BOTMUX_LARK_APP_ID;
+          const sessionId = process.env.BOTMUX_SESSION_ID;
+          if (botAppId && sessionId) {
+            void enqueueObservation({
+              dataDir: config.session.dataDir,
+              event: observationFromSkillCommand({
+                botAppId,
+                sessionId,
+                turnId: process.env.BOTMUX_TURN_ID ?? null,
+                subcommand: skillArgs[0],
+                skillName: skillArgs[1],
+                exitCode: result.code,
+                bytes: result.stdout ? Buffer.byteLength(result.stdout) : undefined,
+                at: new Date().toISOString(),
+                invocationId: randomUUID(),
+              }),
+            });
+          }
+        }
+      } catch {
+        // Telemetry is best-effort; never fail the skill command on it.
+      }
+    }
     break;
   }
   case 'skills': {
