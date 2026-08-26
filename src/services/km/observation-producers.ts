@@ -145,6 +145,65 @@ export function observationFromSessionSkillManifest(input: {
   });
 }
 
+/** An actually-executed `botmux skill show|read` from inside a live CLI
+ *  session — the strongest available evidence that the model pulled skill
+ *  content (stronger than manifest-resolved, which only proves delivery).
+ *  Runs in the CLI subprocess, so identity comes from BOTMUX_* env vars. */
+export interface SkillCommandObservationInput {
+  botAppId: string;
+  sessionId: string;
+  turnId?: string | null;
+  subcommand: 'show' | 'read';
+  skillName: string;
+  exitCode: number;
+  bytes?: number;
+  at: string;
+  /** Unique per execution (uuid) so two reads of the same skill stay two events. */
+  invocationId: string;
+}
+
+export function observationFromSkillCommand(input: SkillCommandObservationInput): ObservationEvent {
+  const failed = input.exitCode !== 0;
+  return ObservationEventSchema.parse({
+    schemaVersion: 1,
+    eventId: stableId('km_skill_cmd', input.botAppId, input.sessionId, input.skillName, input.at, input.invocationId),
+    eventType: failed ? 'skill.failed' : 'skill.invoked',
+    source: {
+      producer: 'skill-cli',
+      adapter: 'unknown',
+      nativeSessionId: null,
+      resolverStatus: 'resolved',
+      confidence: 'observed',
+    },
+    identity: {
+      botAppId: input.botAppId,
+      sessionId: input.sessionId,
+      turnId: input.turnId ?? null,
+      skillName: input.skillName,
+    },
+    ordering: {
+      sourceKey: `skill-command:${input.botAppId}`,
+      idempotencyKey: `${input.sessionId}|${input.skillName}|${input.at}|${input.invocationId}`,
+      parentEventIds: [],
+      observedAt: input.at,
+    },
+    provenance: {
+      evidenceLevel: 'runtime',
+      parserVersion: 'skill-cli/v1',
+      sourceRefs: [{ kind: 'api', ref: `skill-command/${input.invocationId}` }],
+      privacyClass: 'internal',
+      redactionStatus: 'not_needed',
+    },
+    content: { hash: null, storageMode: 'none' },
+    payload: {
+      subcommand: input.subcommand,
+      exitCode: input.exitCode,
+      ...(input.bytes !== undefined ? { bytes: input.bytes } : {}),
+    },
+    createdAt: input.at,
+  });
+}
+
 export interface WorkflowArtifactObservationInput {
   botAppId: string;
   sessionId: string;
