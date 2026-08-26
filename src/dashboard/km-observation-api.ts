@@ -18,6 +18,7 @@ export interface KmObservationApiStore {
   listEvolution?(limit: number): ReturnType<ObservationStore['listEvolution']>;
   listEvalRuns?(limit: number): ReturnType<ObservationStore['listEvalRuns']>;
   decideProposal?(input: Parameters<ObservationStore['decideProposal']>[0]): ReturnType<ObservationStore['decideProposal']>;
+  listSyncStatus?(): ReturnType<ObservationStore['listSyncStatus']>;
   close(): void;
 }
 
@@ -50,6 +51,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/trace'
     || url.pathname === '/api/km/eval/runs'
     || url.pathname === '/api/km/evolution/proposals'
+    || url.pathname === '/api/km/sync/sinks'
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
   if (!kmReadPath) return false;
   if (!deps.enabled) {
@@ -105,6 +107,12 @@ export async function handleKmObservationApi(
       const type = url.searchParams.get('type')?.trim(); const id = url.searchParams.get('id')?.trim();
       if (!type || !id) { jsonRes(res, 400, { error: 'trace_type_and_id_required' }); return true; }
       jsonRes(res, 200, { items: store.listTrace({ type, id, limit: positiveInteger(url.searchParams.get('limit'), 100, 500) }) });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/sync/sinks') {
+      if (!store.listSyncStatus) throw new Error('km_sync_unavailable');
+      jsonRes(res, 200, { items: store.listSyncStatus() });
       return true;
     }
 

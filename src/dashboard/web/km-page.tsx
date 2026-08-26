@@ -13,6 +13,7 @@ type MemoryItem = { memoryId: string; state: string; scope: string; subject: str
 type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; targetId: string; passCount: number; warnCount: number; failCount: number };
 type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
 type TraceEdge = { edgeId: string; fromType: string; fromId: string; toType: string; toId: string; edgeType: string };
+type SyncStatus = { sinkId: string; endpointRef: string; enabled: boolean; status: string; pending: number; quarantined: number; lastLocalSeq: number; lastAckAt?: string };
 
 type ObservationEvent = {
   eventId: string;
@@ -55,17 +56,19 @@ function KmPage(): React.JSX.Element {
   const [traceType, setTraceType] = useState('turn');
   const [traceId, setTraceId] = useState('');
   const [traceEdges, setTraceEdges] = useState<TraceEdge[]>([]);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus[]>([]);
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
         getJson<{ items: MemoryItem[] }>('/api/km/memory?limit=20'),
         getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
         getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
+        getJson<{ items: SyncStatus[] }>('/api/km/sync/sinks'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -73,6 +76,7 @@ function KmPage(): React.JSX.Element {
       setMemory(memoryList.items);
       setEvalRuns(evalList.items);
       setProposals(proposalList.items);
+      setSyncStatus(syncList.items);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -146,6 +150,14 @@ function KmPage(): React.JSX.Element {
           {evalRuns.map(run => <div key={run.evalRunId}><code>{run.evaluatorName}</code><span>{run.targetType}:{run.targetId}</span><span>pass {run.passCount} · warn {run.warnCount}</span><b>fail {run.failCount}</b></div>)}
           {proposals.map(proposal => <div key={proposal.proposalId}><code>{proposal.proposalType}</code><span>{proposal.summary}</span><span>{proposal.targetRef}</span><b>{proposal.approvalGrade} · {proposal.state}</b></div>)}
           {traceEdges.length + evalRuns.length + proposals.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Trace、Eval 或 Evolution 数据。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Central Sink / Sync（默认禁用）</h2>
+        <div className="feedback-deliveries">
+          {syncStatus.map(sink => <div key={sink.sinkId}><code>{sink.sinkId}</code><span>{sink.endpointRef}</span><span>pending {sink.pending} · quarantine {sink.quarantined} · seq {sink.lastLocalSeq}</span><b>{sink.enabled ? sink.status : 'disabled'}</b></div>)}
+          {syncStatus.length === 0 && <p style={{ color: 'var(--text-dim)' }}>未配置 Sink；本地能力不受影响。</p>}
         </div>
       </section>
 
