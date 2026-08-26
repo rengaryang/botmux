@@ -100,7 +100,7 @@ describe('ObservationStore', () => {
   it('uses an isolated botmux-km.sqlite with hardened pragmas', async () => {
     const store = await ObservationStore.open(tempDir());
     expect(store.path.endsWith('botmux-km.sqlite')).toBe(true);
-    expect(store.schemaVersion()).toBe(1);
+    expect(store.schemaVersion()).toBe(2);
     expect(store.pragmas()).toEqual(expect.objectContaining({
       journalMode: 'wal',
       foreignKeys: 1,
@@ -144,7 +144,7 @@ describe('ObservationStore', () => {
       eventId: 'evt-turn-1',
       localSeq: 1,
     }));
-    expect(store.counts()).toEqual({ observations: 1, quarantined: 0 });
+    expect(store.counts()).toEqual({ observations: 1, quarantined: 0, knowledge: 0, memory: 0 });
     store.close();
   });
 
@@ -157,7 +157,7 @@ describe('ObservationStore', () => {
     }));
 
     expect(collision).toEqual(expect.objectContaining({ status: 'quarantined' }));
-    expect(store.counts()).toEqual({ observations: 1, quarantined: 1 });
+    expect(store.counts()).toEqual({ observations: 1, quarantined: 1, knowledge: 0, memory: 0 });
     expect(store.listQuarantined(10)[0]).toEqual(expect.objectContaining({
       eventId: 'evt-turn-conflict',
       reason: 'idempotency_collision',

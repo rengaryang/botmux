@@ -5,7 +5,7 @@ type Health = {
   enabled: boolean;
   schemaVersion: number;
   pragmas: { journalMode: string; foreignKeys: number; busyTimeout: number };
-  counts: { observations: number; quarantined: number };
+  counts: { observations: number; quarantined: number; knowledge?: number; memory?: number };
 };
 
 type ObservationEvent = {
@@ -75,6 +75,8 @@ function KmPage(): React.JSX.Element {
       <section className="feedback-kpis">
         <article><span>观测事件</span><strong>{health?.counts.observations ?? '—'}</strong></article>
         <article><span>隔离冲突</span><strong>{health?.counts.quarantined ?? '—'}</strong></article>
+        <article><span>知识候选</span><strong>{health?.counts.knowledge ?? '—'}</strong></article>
+        <article><span>记忆条目</span><strong>{health?.counts.memory ?? '—'}</strong></article>
         <article><span>Schema 版本</span><strong>{health?.schemaVersion ?? '—'}</strong></article>
         <article><span>WAL 模式</span><strong>{health?.pragmas.journalMode ?? '—'}</strong></article>
         <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
