@@ -42,6 +42,10 @@ export interface EnqueueTurnTerminalInput {
   sessionId: string;
   terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'dispatchAttempt' | 'status'>;
   onError?: (error: unknown) => void;
+  /** Called after the durable feedback store creates or replays the canonical
+   * turn.completed payload. Undefined means the terminal is durable but its
+   * delivery has not arrived yet, so reconciliation will happen later. */
+  onPersisted?: (payload: TurnCompletionEventPayload | undefined) => void;
   /** Test/tuning knobs. */
   retryBaseMs?: number;
   maxRetryMs?: number;
@@ -137,7 +141,11 @@ async function attempt(key: string): Promise<void> {
       dispatchAttempt: input.terminal.dispatchAttempt,
       status: input.terminal.status,
     });
-    if (result.done) { finish(key); return; }
+    if (result.done) {
+      input.onPersisted?.(result.payload);
+      finish(key);
+      return;
+    }
     // Write lock busy: reschedule with capped backoff, yielding the loop.
     if (item.attempts >= maxAttempts) {
       input.onError?.(new Error(`turn_terminal_persist_gave_up:${input.terminal.turnId.slice(0, 12)}:busy_after_${item.attempts}`));

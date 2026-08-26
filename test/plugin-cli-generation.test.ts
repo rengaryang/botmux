@@ -13,6 +13,12 @@ import {
 import { pluginMcpPrivatePath } from '../src/core/plugins/paths.js';
 import { readSessionPluginManifest } from '../src/core/plugins/session-manifest.js';
 import { readSessionSkillManifest } from '../src/core/skills/manifest-store.js';
+import {
+  __testOnly_closeObservationStores,
+  __testOnly_reopenObservationAdmission,
+  drainObservationQueue,
+} from '../src/services/km/observation-queue.js';
+import { ObservationStore } from '../src/services/km/observation-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -30,7 +36,10 @@ describe('CLI plugin generation', () => {
     vi.stubEnv('SESSION_DATA_DIR', dataDir);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await drainObservationQueue(3_000);
+    await __testOnly_closeObservationStores();
+    __testOnly_reopenObservationAdmission();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
@@ -119,5 +128,43 @@ describe('CLI plugin generation', () => {
     expect(sessionMcpRuntimeHostOnlyPaths(refreshedMcpRuntime, dataDir)).toEqual([
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
+  });
+
+  it('emits a redacted skill manifest observation only when the feature flag is enabled', async () => {
+    vi.stubEnv('BOTMUX_KM_OBSERVATION_ENABLED', 'true');
+    const source = join(home, 'observed-source');
+    write(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-observed', version: '0.1.0', keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'observed' },
+    }));
+    write(join(source, 'dist', 'skills', 'browser', 'SKILL.md'), [
+      '---', 'name: browser', 'description: Browser tools', '---', '# Browser',
+    ].join('\n'));
+    installLocalPlugin(source);
+
+    prepareCliPluginGeneration({
+      sessionId: 'observed-session',
+      bot: { larkAppId: 'app-observed', plugins: ['observed'] },
+      global: { plugins: [] },
+      dataDir,
+      cliId: 'codex',
+      adapter: { id: 'codex' } as CliAdapter,
+      workingDir: '/private/repo',
+      prompt: 'hello',
+      replacesPriorGeneration: false,
+      now: () => '2026-07-12T00:00:00.000Z',
+    });
+    await drainObservationQueue(3_000);
+
+    const store = await ObservationStore.open(dataDir);
+    const events = store.list({ limit: 10, eventType: 'skill.manifest.resolved' });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      identity: { botAppId: 'app-observed', sessionId: 'observed-session' },
+      payload: { skills: [{ name: 'browser', sourceType: 'plugin' }] },
+    });
+    expect(JSON.stringify(events[0])).not.toContain('/private/repo');
+    expect(JSON.stringify(events[0])).not.toContain(source);
+    store.close();
   });
 });

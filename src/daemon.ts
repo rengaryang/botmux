@@ -84,6 +84,8 @@ import {
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
+import { observationFromTurnCompletion } from './services/km/observation-producers.js';
+import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -21801,6 +21803,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
+          onPersisted: payload => {
+            if (!payload || !isKmObservationEnabled()) return;
+            void enqueueObservation({
+              dataDir: config.session.dataDir,
+              event: observationFromTurnCompletion(payload),
+              onError: error => logger.warn(
+                `[km-observation] turn persistence failed turn=${terminal.turnId.slice(0, 12)}: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              ),
+            });
+          },
         });
       }
     },
@@ -23013,6 +23026,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (drainBudget > 0) {
         const undrained = await drainTurnTerminalQueue(drainBudget);
         if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
+        if (isKmObservationEnabled()) {
+          const kmBudget = remainingBudget();
+          if (kmBudget > 0) {
+            const kmUndrained = await drainObservationQueue(kmBudget);
+            if (kmUndrained > 0) logger.warn(`[km-observation] shutdown drain timed out with ${kmUndrained} pending`);
+          } else {
+            logger.warn('[km-observation] shutdown deadline exhausted before observation drain');
+          }
+        }
       } else {
         logger.error('[turn-completion] shutdown deadline exhausted before drain — in-memory queued turn terminals were NOT persisted and are LOST (they are not yet in the durable store)');
       }

@@ -10,8 +10,10 @@ export interface EnqueueObservationInput {
 
 interface PendingItem {
   input: EnqueueObservationInput;
+  attempts: number;
   promise: Promise<void>;
   resolve: () => void;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 const pending = new Map<string, PendingItem>();
@@ -54,7 +56,7 @@ export function enqueueObservation(input: EnqueueObservationInput): Promise<void
 
   let resolve!: () => void;
   const promise = new Promise<void>(r => { resolve = r; });
-  pending.set(key, { input, promise, resolve });
+  pending.set(key, { input, attempts: 0, promise, resolve });
   queueMicrotask(() => { void persist(key); });
   return promise;
 }
@@ -62,16 +64,39 @@ export function enqueueObservation(input: EnqueueObservationInput): Promise<void
 async function persist(key: string): Promise<void> {
   const item = pending.get(key);
   if (!item) return;
+  item.attempts += 1;
   try {
     const store = await getStore(item.input.dataDir);
-    const result = store.append(item.input.event);
-    item.input.onResult?.(result);
+    const attempt = store.tryAppend(item.input.event);
+    if (!attempt.done) {
+      if (item.attempts >= 50) {
+        item.input.onError?.(new Error(`km_observation_persist_gave_up:${item.input.event.eventId}:busy_after_${item.attempts}`));
+        finish(key);
+        return;
+      }
+      scheduleRetry(key, item);
+      return;
+    }
+    item.input.onResult?.(attempt.result);
+    finish(key);
   } catch (error) {
     item.input.onError?.(error);
-  } finally {
-    pending.delete(key);
-    item.resolve();
+    finish(key);
   }
+}
+
+function scheduleRetry(key: string, item: PendingItem): void {
+  const delay = Math.min(25 * item.attempts, 500);
+  item.timer = setTimeout(() => { void persist(key); }, delay);
+  item.timer.unref?.();
+}
+
+function finish(key: string): void {
+  const item = pending.get(key);
+  if (!item) return;
+  if (item.timer) clearTimeout(item.timer);
+  pending.delete(key);
+  item.resolve();
 }
 
 /** Close queue admission and await already accepted writes within a bound. */

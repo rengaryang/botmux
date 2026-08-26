@@ -11,6 +11,16 @@ import {
 const SCHEMA_VERSION = 1;
 const BUSY_TIMEOUT_MS = 5_000;
 
+function isSqliteBusyError(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code;
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') return true;
+  const message = String((error as { message?: unknown })?.message ?? error).toLowerCase();
+  return message.includes('database is locked')
+    || message.includes('database table is locked')
+    || message.includes('sqlite_busy')
+    || message.includes('sqlite_locked');
+}
+
 const FRESH_SCHEMA = `
   CREATE TABLE observation_events (
     event_id TEXT PRIMARY KEY,
@@ -149,7 +159,11 @@ export class ObservationStore {
   private constructor(dataDir: string, db: DatabaseSyncType) {
     this.path = join(dataDir, 'botmux-km.sqlite');
     this.db = db;
-    this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
+    // Opening from a daemon telemetry queue must fail fast under cross-process
+    // contention rather than blocking the Node event loop for busy_timeout.
+    // Once initialization is complete, ordinary callers keep the conventional
+    // 5s timeout; tryAppend borrows timeout=0 for the hot path.
+    this.db.exec('PRAGMA busy_timeout=0;');
     this.db.exec('PRAGMA foreign_keys=ON;');
     const mode = String((this.db.prepare('PRAGMA journal_mode=WAL').get() as any)?.journal_mode ?? '').toLowerCase();
     if (mode !== 'wal') throw new Error(`km_observation_wal_mode_not_set:${mode || 'unknown'}`);
@@ -158,6 +172,7 @@ export class ObservationStore {
     if (version > SCHEMA_VERSION) throw new Error(`km_observation_schema_newer:${version}`);
     if (version === 0) this.createFreshSchema();
     this.validateSchema();
+    this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
 
   static async open(dataDir: string): Promise<ObservationStore> {
@@ -194,6 +209,23 @@ export class ObservationStore {
       observations: Number((this.db.prepare('SELECT COUNT(*) AS count FROM observation_events').get() as any).count),
       quarantined: Number((this.db.prepare('SELECT COUNT(*) AS count FROM quarantine_events').get() as any).count),
     };
+  }
+
+  /** Nonblocking hot-path append. A competing process holding SQLite's write
+   * lock returns {busy:true}; callers retry on a timer instead of blocking the
+   * daemon event loop inside node:sqlite's synchronous busy timeout. */
+  tryAppend(input: ObservationEvent):
+    | { done: true; result: ObservationAppendResult }
+    | { done: false; busy: true } {
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      return { done: true, result: this.append(input) };
+    } catch (error) {
+      if (isSqliteBusyError(error)) return { done: false, busy: true };
+      throw error;
+    } finally {
+      this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
+    }
   }
 
   append(input: ObservationEvent): ObservationAppendResult {
