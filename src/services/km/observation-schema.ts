@@ -66,6 +66,7 @@ export const ObservationEventSchema = z.object({
     botId: nullableNonEmpty,
     sessionId: nonEmpty,
     turnId: nullableNonEmpty,
+    nativeSessionId: nullableNonEmpty,
     dispatchAttempt: z.number().int().nonnegative().nullable().optional(),
     workflowId: nullableNonEmpty,
     nodeId: nullableNonEmpty,
