@@ -147,6 +147,7 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
   { id: 'feedback', href: '#/feedback', labelKey: 'nav.feedback', manage: true, icon: <><path d="M2.2 3.2h11.6v8H8l-3.2 2.6v-2.6H2.2z" /><path d="M5 6.2h6M5 8.3h4" /></> },
+  { id: 'km', href: '#/km', labelKey: 'nav.km', manage: true, icon: <><path d="M8 1.5a6.5 6.5 0 1 0 4.6 11.1L8 8z" /><path d="M8 8l4.6 4.6A6.5 6.5 0 0 0 8 1.5z" fill="currentColor" /></> },
   {
     id: 'workflows',
     href: '#/workflows',
@@ -182,7 +183,7 @@ const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'bot-defaults'] },
-  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
+  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback', 'km'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];
 
