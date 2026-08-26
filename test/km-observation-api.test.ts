@@ -36,7 +36,7 @@ describe('KM observation dashboard API', () => {
         openStore: async () => ({
           schemaVersion: () => 1,
           pragmas: () => ({ journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 }),
-          counts: () => ({ observations: 3, quarantined: 1 }),
+          counts: () => ({ observations: 3, quarantined: 1, knowledge: 2, memory: 4 }),
           list: vi.fn(), get: vi.fn(), close,
         }),
       },
@@ -45,7 +45,7 @@ describe('KM observation dashboard API', () => {
       enabled: true,
       schemaVersion: 1,
       pragmas: { journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 },
-      counts: { observations: 3, quarantined: 1 },
+      counts: { observations: 3, quarantined: 1, knowledge: 2, memory: 4 },
     }]);
     expect(close).toHaveBeenCalledOnce();
   });
@@ -66,6 +66,34 @@ describe('KM observation dashboard API', () => {
       },
     );
     expect(list).toHaveBeenCalledWith({ limit: 100, beforeLocalSeq: 42, eventType: 'turn.completed' });
+  });
+
+  it('serves Phase 2 knowledge, memory and retrieval reads', async () => {
+    const listKnowledge = vi.fn(() => [{ knowledgeId: 'kn-1' }]);
+    const listMemory = vi.fn(() => [{ memoryId: 'mem-1' }]);
+    const retrieve = vi.fn(() => [{ id: 'kn-1', kind: 'knowledge' }]);
+    const deps = {
+      enabled: true,
+      openStore: async () => ({
+        schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+        listKnowledge, listMemory, retrieve,
+      }),
+    };
+    const knowledge = response();
+    await handleKmObservationApi({ method: 'GET' } as any, knowledge.res,
+      new URL('http://localhost/api/km/knowledge?state=approved&targetLayer=L2'), deps);
+    expect(listKnowledge).toHaveBeenCalledWith({ limit: 50, state: 'approved', targetLayer: 'L2' });
+    expect(knowledge.bodies).toEqual([{ items: [{ knowledgeId: 'kn-1' }] }]);
+
+    const memory = response();
+    await handleKmObservationApi({ method: 'GET' } as any, memory.res,
+      new URL('http://localhost/api/km/memory?state=active&scope=user&subject=u1'), deps);
+    expect(listMemory).toHaveBeenCalledWith({ limit: 50, state: 'active', scope: 'user', subject: 'u1' });
+
+    const retrieval = response();
+    await handleKmObservationApi({ method: 'GET' } as any, retrieval.res,
+      new URL('http://localhost/api/km/retrieve?q=failover&scope=user&targetLayer=L3&subject=u1'), deps);
+    expect(retrieve).toHaveBeenCalledWith({ text: 'failover', limit: 20, subject: 'u1', scopes: ['user'], targetLayers: ['L3'] });
   });
 
   it('returns one event and rejects unsupported methods', async () => {

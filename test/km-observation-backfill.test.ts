@@ -69,7 +69,7 @@ describe('KM backfill', () => {
     // Enqueue + persist through the normal queue path.
     for (const event of events) await enqueueObservation({ dataDir: dir, event });
     const store = await ObservationStore.open(dir);
-    expect(store.counts()).toEqual({ observations: 1, quarantined: 0 });
+    expect(store.counts()).toEqual({ observations: 1, quarantined: 0, knowledge: 0, memory: 0 });
     store.close();
   });
 

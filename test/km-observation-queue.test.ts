@@ -67,7 +67,7 @@ describe('KM observation queue', () => {
     expect(__testOnly_pendingObservationCount()).toBe(0);
 
     const store = await ObservationStore.open(dir);
-    expect(store.counts()).toEqual({ observations: 1, quarantined: 0 });
+    expect(store.counts()).toEqual({ observations: 1, quarantined: 0, knowledge: 0, memory: 0 });
     store.close();
   });
 

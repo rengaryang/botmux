@@ -6,9 +6,12 @@ import type { ObservationStore } from '../services/km/observation-store.js';
 export interface KmObservationApiStore {
   schemaVersion(): number;
   pragmas(): { journalMode: string; foreignKeys: number; busyTimeout: number };
-  counts(): { observations: number; quarantined: number };
+  counts(): { observations: number; quarantined: number; knowledge?: number; memory?: number };
   list(filter: Parameters<ObservationStore['list']>[0]): ReturnType<ObservationStore['list']>;
   get(eventId: string): ReturnType<ObservationStore['get']>;
+  listKnowledge?(filter: Parameters<ObservationStore['listKnowledge']>[0]): ReturnType<ObservationStore['listKnowledge']>;
+  listMemory?(filter: Parameters<ObservationStore['listMemory']>[0]): ReturnType<ObservationStore['listMemory']>;
+  retrieve?(query: Parameters<ObservationStore['retrieve']>[0]): ReturnType<ObservationStore['retrieve']>;
   close(): void;
 }
 
@@ -32,7 +35,12 @@ export async function handleKmObservationApi(
   url: URL,
   deps: KmObservationApiDeps,
 ): Promise<boolean> {
-  if (url.pathname !== '/api/km/health' && !url.pathname.startsWith('/api/km/observations')) return false;
+  const kmReadPath = url.pathname === '/api/km/health'
+    || url.pathname.startsWith('/api/km/observations')
+    || url.pathname === '/api/km/knowledge'
+    || url.pathname === '/api/km/memory'
+    || url.pathname === '/api/km/retrieve';
+  if (!kmReadPath) return false;
   if (!deps.enabled) {
     jsonRes(res, 404, { error: 'km_observation_disabled' });
     return true;
@@ -52,6 +60,36 @@ export async function handleKmObservationApi(
         pragmas: store.pragmas(),
         counts: store.counts(),
       });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/knowledge') {
+      if (!store.listKnowledge) throw new Error('km_knowledge_unavailable');
+      const limit = positiveInteger(url.searchParams.get('limit'), 50, 100);
+      const state = url.searchParams.get('state') ?? undefined;
+      const targetLayer = url.searchParams.get('targetLayer') ?? undefined;
+      jsonRes(res, 200, { items: store.listKnowledge({ limit, ...(state ? { state: state as any } : {}), ...(targetLayer ? { targetLayer: targetLayer as any } : {}) }) });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/memory') {
+      if (!store.listMemory) throw new Error('km_memory_unavailable');
+      const limit = positiveInteger(url.searchParams.get('limit'), 50, 100);
+      const state = url.searchParams.get('state') ?? undefined;
+      const scope = url.searchParams.get('scope') ?? undefined;
+      const subject = url.searchParams.get('subject') ?? undefined;
+      jsonRes(res, 200, { items: store.listMemory({ limit, ...(state ? { state: state as any } : {}), ...(scope ? { scope: scope as any } : {}), ...(subject ? { subject } : {}) }) });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/retrieve') {
+      if (!store.retrieve) throw new Error('km_retrieval_unavailable');
+      const limit = positiveInteger(url.searchParams.get('limit'), 20, 100);
+      const text = url.searchParams.get('q') ?? '';
+      const subject = url.searchParams.get('subject') ?? undefined;
+      const scopes = url.searchParams.getAll('scope') as any[];
+      const targetLayers = url.searchParams.getAll('targetLayer') as any[];
+      jsonRes(res, 200, { items: store.retrieve({ text, limit, ...(subject ? { subject } : {}), ...(scopes.length ? { scopes } : {}), ...(targetLayers.length ? { targetLayers } : {}) }) });
       return true;
     }
 
