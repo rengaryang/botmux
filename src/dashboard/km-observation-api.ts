@@ -14,6 +14,9 @@ export interface KmObservationApiStore {
   retrieve?(query: Parameters<ObservationStore['retrieve']>[0]): ReturnType<ObservationStore['retrieve']>;
   transitionKnowledge?(input: Parameters<ObservationStore['transitionKnowledge']>[0]): ReturnType<ObservationStore['transitionKnowledge']>;
   knowledgeExportDryRun?(knowledgeId: string): ReturnType<ObservationStore['knowledgeExportDryRun']>;
+  listTrace?(input: Parameters<ObservationStore['listTrace']>[0]): ReturnType<ObservationStore['listTrace']>;
+  listEvolution?(limit: number): ReturnType<ObservationStore['listEvolution']>;
+  decideProposal?(input: Parameters<ObservationStore['decideProposal']>[0]): ReturnType<ObservationStore['decideProposal']>;
   close(): void;
 }
 
@@ -42,7 +45,10 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/knowledge'
     || url.pathname === '/api/km/memory'
     || url.pathname === '/api/km/retrieve'
-    || /^\/api\/km\/knowledge\/[^/]+\/(state|export-dry-run)$/.test(url.pathname);
+    || /^\/api\/km\/knowledge\/[^/]+\/(state|export-dry-run)$/.test(url.pathname)
+    || url.pathname === '/api/km/trace'
+    || url.pathname === '/api/km/evolution/proposals'
+    || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
   if (!kmReadPath) return false;
   if (!deps.enabled) {
     jsonRes(res, 404, { error: 'km_observation_disabled' });
@@ -76,7 +82,35 @@ export async function handleKmObservationApi(
       return true;
     }
 
+    const proposalDecision = url.pathname.match(/^\/api\/km\/evolution\/proposals\/([^/]+)\/decision$/);
+    if (proposalDecision) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.decideProposal) throw new Error('km_evolution_decision_unavailable');
+      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+      const actorId = req.headers['x-km-actor-id'];
+      if (typeof actorId !== 'string' || !actorId.trim()) { jsonRes(res, 403, { error: 'reviewer_actor_required' }); return true; }
+      jsonRes(res, 200, store.decideProposal({ proposalId: decodeURIComponent(proposalDecision[1]),
+        decision: String(body.decision) as any, actorId, grade: String(body.grade) as any,
+        scope: (body.scope ?? {}) as Record<string, unknown>, riskAck: (body.riskAck ?? {}) as Record<string, unknown> }));
+      return true;
+    }
+
     if (req.method !== 'GET') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+
+    if (url.pathname === '/api/km/trace') {
+      if (!store.listTrace) throw new Error('km_trace_unavailable');
+      const type = url.searchParams.get('type')?.trim(); const id = url.searchParams.get('id')?.trim();
+      if (!type || !id) { jsonRes(res, 400, { error: 'trace_type_and_id_required' }); return true; }
+      jsonRes(res, 200, { items: store.listTrace({ type, id, limit: positiveInteger(url.searchParams.get('limit'), 100, 500) }) });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/evolution/proposals') {
+      if (!store.listEvolution) throw new Error('km_evolution_unavailable');
+      jsonRes(res, 200, { items: store.listEvolution(positiveInteger(url.searchParams.get('limit'), 50, 100)) });
+      return true;
+    }
 
     if (url.pathname === '/api/km/health') {
       jsonRes(res, 200, {
