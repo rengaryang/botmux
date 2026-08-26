@@ -92,6 +92,9 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
+import { handleKmObservationApi } from './dashboard/km-observation-api.js';
+import { isKmObservationEnabled } from './services/km/observation-queue.js';
+import { ObservationStore } from './services/km/observation-store.js';
 import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
@@ -3563,6 +3566,11 @@ const server = createServer(async (req, res) => {
       await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
       return;
     }
+
+    if (await handleKmObservationApi(req, res, url, {
+      enabled: isKmObservationEnabled(),
+      openStore: () => ObservationStore.open(config.session.dataDir),
+    })) return;
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
       if (!dashboardDevReloadEnabled()) return jsonRes(res, 404, { error: 'dev_reload_disabled' });
