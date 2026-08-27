@@ -49,9 +49,9 @@ function stableHash(value: unknown): string {
 
 function isSafeMarkdownText(value: string): boolean {
   if (/<raw_transcript>|<\/raw_transcript>/iu.test(value)) return false;
-  const normalized = value.normalize('NFKC').toLowerCase();
-  if (['password', 'passwd', 'secret', 'token', 'api_key', 'api-key'].some(key => normalized.includes(key))) return false;
-  return !SECRET_PATTERNS.some(pattern => pattern.test(value));
+  const normalized = value.normalize('NFKC');
+  if (/api[_-]?key\s*[:=]/iu.test(normalized)) return false;
+  return !SECRET_PATTERNS.some(pattern => pattern.test(normalized));
 }
 
 function normalizeRoots(roots: string[]): string[] {
