@@ -330,6 +330,48 @@ describe('KM observation dashboard API', () => {
     expect(listMemoryBackendMigrations).toHaveBeenCalledWith(100);
   });
 
+  it('serves read-only retention status and bounded report history', async () => {
+    const kmRetentionStatus = vi.fn(() => ({
+      enabled: false,
+      leaseName: 'km-retention-shadow',
+      latestPlan: {
+        policyVersion: 'km-retention-tiered-v1',
+        generatedAt: '2026-08-27T00:00:00.000Z',
+        dryRunOnly: true,
+        destructiveActionsAvailable: false,
+        domains: [{ domain: 'retrieval', table: 'retrieval_runs', tier: 'warm', retentionDays: 90, cutoff: '2026-05-29T00:00:00.000Z',
+          totalCount: 1, eligibleCount: 0, protectedCount: 1, oldestRecordAgeDays: 1, oldestEligibleAgeDays: 0, protectedReasonCounts: {}, eligibleSamples: [] }],
+        db: { dbBytes: 1, walBytes: 2, totalBytes: 3 },
+        operational: { backlog: {}, quarantine: {}, retry: {}, providerQuality: {}, retrievalQuality: {} },
+        slo: [{ key: 'km.db.total_bytes', state: 'ok', value: 3, warnAt: 1, criticalAt: 2, unit: 'bytes' }],
+        planHash: `sha256:${'a'.repeat(64)}`,
+      },
+      reports: [],
+      trend: [],
+    }));
+    const listKmRetentionReports = vi.fn(() => [{ reportId: 'kmret-1', totalEligible: 0 }]);
+    const retentionRuntimeStatus = vi.fn(async () => ({ ...kmRetentionStatus(), enabled: true }));
+    const deps = { enabled: true, retentionRuntimeStatus, openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(),
+      list: vi.fn(), get: vi.fn(), close: vi.fn(), kmRetentionStatus, listKmRetentionReports }) };
+
+    const status = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, status.res, new URL('http://localhost/api/km/retention'), deps);
+    expect(retentionRuntimeStatus).toHaveBeenCalledOnce();
+    expect(status.bodies[0]).toEqual(expect.objectContaining({
+      enabled: true,
+      latestPlan: expect.objectContaining({ dryRunOnly: true, destructiveActionsAvailable: false }),
+    }));
+
+    const reports = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, reports.res, new URL('http://localhost/api/km/retention/reports?limit=999'), deps);
+    expect(listKmRetentionReports).toHaveBeenCalledWith(100);
+    expect(reports.bodies).toEqual([{ items: [{ reportId: 'kmret-1', totalEligible: 0 }] }]);
+
+    const rejected = response();
+    await handleKmObservationApi({ method: 'POST', headers: {} } as any, rejected.res, new URL('http://localhost/api/km/retention'), deps);
+    expect(rejected.bodies).toEqual([{ error: 'method_not_allowed' }]);
+  });
+
   it('serves guarded backend migration create/backfill/compare without exposing cutover', async () => {
     const createMemoryBackendMigration = vi.fn(() => 'mmig-1');
     let migrationState = 'draft';
