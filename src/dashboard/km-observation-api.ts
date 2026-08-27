@@ -6,6 +6,13 @@ import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema } from '../servic
 import type { ObservationStore } from '../services/km/observation-store.js';
 import type { KmBackendRuntimeStatus } from '../services/km/memory-backend-runtime.js';
 import { compareMemoryBackendMigration, enqueueMemoryBackendMigrationBackfill } from '../services/km/memory-backend-migration.js';
+import {
+  createKnowledgeExportJob,
+  getKnowledgeExportJob,
+  listKnowledgeExportJobs,
+  planKnowledgeExport,
+  reviewKnowledgeExportJob,
+} from '../services/km/knowledge-export-staging.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -14,6 +21,7 @@ export interface KmObservationApiStore {
   distillationBacklogStatus?(): ReturnType<ObservationStore['distillationBacklogStatus']>;
   list(filter: Parameters<ObservationStore['list']>[0]): ReturnType<ObservationStore['list']>;
   get(eventId: string): ReturnType<ObservationStore['get']>;
+  getKnowledge?(knowledgeId: string): ReturnType<ObservationStore['getKnowledge']>;
   listKnowledge?(filter: Parameters<ObservationStore['listKnowledge']>[0]): ReturnType<ObservationStore['listKnowledge']>;
   listMemory?(filter: Parameters<ObservationStore['listMemory']>[0]): ReturnType<ObservationStore['listMemory']>;
   transitionMemory?(input: Parameters<ObservationStore['transitionMemory']>[0]): ReturnType<ObservationStore['transitionMemory']>;
@@ -57,6 +65,7 @@ export interface KmObservationApiStore {
 export interface KmObservationApiDeps {
   enabled: boolean;
   actorId?: string;
+  dataDir?: string;
   openStore(): Promise<KmObservationApiStore>;
   backendRuntimeStatus?(): Promise<KmBackendRuntimeStatus>;
 }
@@ -103,6 +112,9 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/evolution/proposals'
     || url.pathname === '/api/km/sync/sinks'
     || url.pathname === '/api/km/providers'
+    || url.pathname === '/api/km/exports'
+    || /^\/api\/km\/exports\/[^/]+$/.test(url.pathname)
+    || /^\/api\/km\/exports\/[^/]+\/review$/.test(url.pathname)
     || url.pathname === '/api/km/distillation/jobs'
     || url.pathname === '/api/km/retrieval/runs'
     || url.pathname === '/api/km/injections'
@@ -247,8 +259,37 @@ export async function handleKmObservationApi(
     const dryRun = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/export-dry-run$/);
     if (dryRun) {
       if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
-      if (!store.knowledgeExportDryRun) throw new Error('km_knowledge_export_unavailable');
-      jsonRes(res, 200, store.knowledgeExportDryRun(decodeURIComponent(dryRun[1])));
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const item = store.getKnowledge ? store.getKnowledge(decodeURIComponent(dryRun[1])) : undefined;
+      if (!item) throw new Error('km_knowledge_not_found');
+      jsonRes(res, 200, planKnowledgeExport(deps.dataDir, item));
+      return true;
+    }
+
+    if (url.pathname === '/api/km/exports' && req.method === 'POST') {
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const knowledgeId = String(body.knowledgeId ?? '').trim();
+      if (!knowledgeId) throw new KmApiError(422, 'km_knowledge_id_required');
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const item = store.getKnowledge ? store.getKnowledge(knowledgeId) : undefined;
+      if (!item) throw new Error('km_knowledge_not_found');
+      executeMutation(ctx, 201, 'knowledge.export_job_created', knowledgeId,
+        () => createKnowledgeExportJob({ dataDir: deps.dataDir!, knowledge: item, actorId: ctx.actorId, idempotencyKey: ctx.idempotencyKey }),
+        { afterHash: response => response.plan.file.contentHash });
+      return true;
+    }
+
+    const exportReview = url.pathname.match(/^\/api\/km\/exports\/([^/]+)\/review$/);
+    if (exportReview) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const decision = String(body.decision);
+      if (decision !== 'approved' && decision !== 'rejected') throw new KmApiError(422, 'km_export_review_decision_invalid');
+      executeMutation(ctx, 200, `knowledge.export_${decision}`, decodeURIComponent(exportReview[1]),
+        () => reviewKnowledgeExportJob({ dataDir: deps.dataDir!, jobId: decodeURIComponent(exportReview[1]), decision,
+          actorId: ctx.actorId, idempotencyKey: ctx.idempotencyKey, reasonCode: String(body.reasonCode ?? '') }),
+        { afterHash: response => response.manifest?.contentHash ?? response.plan.file.contentHash });
       return true;
     }
 
@@ -308,6 +349,17 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/providers') {
       if (!store.listKmProviders) throw new Error('km_providers_unavailable');
       jsonRes(res, 200, { items: store.listKmProviders() }); return true;
+    }
+    if (url.pathname === '/api/km/exports') {
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      jsonRes(res, 200, { items: listKnowledgeExportJobs(deps.dataDir) }); return true;
+    }
+    const exportStatus = url.pathname.match(/^\/api\/km\/exports\/([^/]+)$/);
+    if (exportStatus) {
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const job = getKnowledgeExportJob(deps.dataDir, decodeURIComponent(exportStatus[1]));
+      if (!job) throw new Error('km_export_job_not_found');
+      jsonRes(res, 200, job); return true;
     }
     if (url.pathname === '/api/km/distillation/jobs') {
       if (!store.listDistillationJobs) throw new Error('km_distillation_jobs_unavailable');

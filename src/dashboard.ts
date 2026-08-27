@@ -3576,6 +3576,7 @@ const server = createServer(async (req, res) => {
     if (await handleKmObservationApi(req, res, url, {
       enabled: isKmObservationEnabled(),
       actorId: requestIdentity?.userId,
+      dataDir: config.session.dataDir,
       openStore: () => ObservationStore.open(config.session.dataDir),
       backendRuntimeStatus: () => kmBackendRuntimeStatus({ dataDir: config.session.dataDir }),
     })) return;
