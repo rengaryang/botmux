@@ -2,13 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { KmPipelineProfileSchema, KmProviderDescriptorSchema, type KmPipelineProfile, type KmProviderDescriptor } from './provider-spi.js';
 import {
   ObservationEventSchema,
   type ObservationEvent,
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -110,6 +111,33 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE6_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_provider_registry (
+    provider_id TEXT NOT NULL, provider_kind TEXT NOT NULL, provider_version TEXT NOT NULL,
+    descriptor_json TEXT NOT NULL CHECK(json_valid(descriptor_json)), status TEXT NOT NULL,
+    last_health_json TEXT CHECK(last_health_json IS NULL OR json_valid(last_health_json)), updated_at TEXT NOT NULL,
+    PRIMARY KEY(provider_id,provider_version)
+  );
+  CREATE TABLE IF NOT EXISTS km_pipeline_profiles (
+    profile_id TEXT NOT NULL, revision INTEGER NOT NULL, bot_app_id TEXT NOT NULL,
+    profile_json TEXT NOT NULL CHECK(json_valid(profile_json)), profile_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('draft','shadow','active','retired')), created_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id,revision)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS km_pipeline_profiles_one_active_bot
+    ON km_pipeline_profiles(bot_app_id) WHERE state='active';
+  CREATE TABLE IF NOT EXISTS distillation_jobs (
+    job_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, source_event_id TEXT NOT NULL,
+    bot_app_id TEXT NOT NULL, profile_id TEXT NOT NULL, profile_revision INTEGER NOT NULL,
+    profile_snapshot_json TEXT NOT NULL CHECK(json_valid(profile_snapshot_json)),
+    state TEXT NOT NULL CHECK(state IN ('queued','resolving','extracting','normalizing','gating','persisted','completed','retry_wait','inconclusive','quarantined','failed','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+    claimed_at INTEGER, claim_token TEXT, last_error TEXT, output_hash TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS distillation_jobs_due ON distillation_jobs(state,next_attempt_at,created_at);
 `;
 
 const PHASE5_SCHEMA = `
@@ -477,6 +505,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 3) this.migrateToPhase3();
     if (this.schemaVersion() < 4) this.migrateToPhase4();
     if (this.schemaVersion() < 5) this.migrateToPhase5();
+    if (this.schemaVersion() < 6) this.migrateToPhase6();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -1092,6 +1121,79 @@ export class ObservationStore {
       pending: Number(row.pending), quarantined: Number(row.quarantined) }));
   }
 
+  registerKmProvider(descriptorInput: KmProviderDescriptor): void {
+    const descriptor = KmProviderDescriptorSchema.parse(descriptorInput);
+    this.db.prepare(`INSERT INTO km_provider_registry(provider_id,provider_kind,provider_version,descriptor_json,status,updated_at)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(provider_id,provider_version) DO UPDATE SET descriptor_json=excluded.descriptor_json,
+      provider_kind=excluded.provider_kind,status=excluded.status,updated_at=excluded.updated_at`)
+      .run(descriptor.id, descriptor.kind, descriptor.version, JSON.stringify(descriptor), 'validated', new Date().toISOString());
+  }
+
+  putPipelineProfile(profileInput: KmPipelineProfile, state: 'draft' | 'shadow' | 'active' = 'draft'): string {
+    const profile = KmPipelineProfileSchema.parse(profileInput);
+    const json = JSON.stringify(profile);
+    const hash = sha256(json);
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (state === 'active') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='active'`).run(profile.botAppId);
+      this.db.prepare(`INSERT INTO km_pipeline_profiles(profile_id,revision,bot_app_id,profile_json,profile_hash,state,created_at)
+        VALUES(?,?,?,?,?,?,?)`).run(profile.profileId, profile.revision, profile.botAppId, json, hash, state, now);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+    return hash;
+  }
+
+  createDistillationJob(input: { sourceEventId: string; profile: KmPipelineProfile; now?: number }): { jobId: string; created: boolean } {
+    const profile = KmPipelineProfileSchema.parse(input.profile);
+    const profileJson = JSON.stringify(profile);
+    const key = `${input.sourceEventId}|${profile.profileId}|${profile.revision}|${profile.primaryExtractor}`;
+    const jobId = `distill_${createHash('sha256').update(key).digest('hex')}`;
+    const nowMs = input.now ?? Date.now();
+    const now = new Date(nowMs).toISOString();
+    const result = this.db.prepare(`INSERT OR IGNORE INTO distillation_jobs(
+      job_id,idempotency_key,source_event_id,bot_app_id,profile_id,profile_revision,profile_snapshot_json,state,next_attempt_at,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)`).run(jobId, key, input.sourceEventId, profile.botAppId, profile.profileId, profile.revision, profileJson, nowMs, now, now);
+    return { jobId, created: Number(result.changes) === 1 };
+  }
+
+  claimDistillationJob(input: { now?: number; leaseMs?: number }): null | { jobId: string; claimToken: string; sourceEventId: string; profile: KmPipelineProfile } {
+    const now = input.now ?? Date.now();
+    const lease = Math.max(1_000, input.leaseMs ?? 60_000);
+    const token = `dclaim_${randomUUID().replaceAll('-', '')}`;
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`UPDATE distillation_jobs SET state='retry_wait',claim_token=NULL,claimed_at=NULL,last_error='claim_lease_expired',next_attempt_at=?,updated_at=?
+        WHERE claim_token IS NOT NULL AND claimed_at<? AND state NOT IN ('completed','failed','quarantined','cancelled')`)
+        .run(now, new Date(now).toISOString(), now - lease);
+      const row = this.db.prepare(`SELECT job_id FROM distillation_jobs WHERE state IN ('queued','retry_wait') AND next_attempt_at<=?
+        ORDER BY created_at,job_id LIMIT 1`).get(now) as { job_id: string } | undefined;
+      if (!row) { this.db.exec('COMMIT;'); return null; }
+      this.db.prepare(`UPDATE distillation_jobs SET state='resolving',attempts=attempts+1,claimed_at=?,claim_token=?,updated_at=? WHERE job_id=?`)
+        .run(now, token, new Date(now).toISOString(), row.job_id);
+      this.db.exec('COMMIT;');
+      const claimed = this.db.prepare(`SELECT source_event_id,profile_snapshot_json FROM distillation_jobs WHERE job_id=?`).get(row.job_id) as any;
+      return { jobId: row.job_id, claimToken: token, sourceEventId: claimed.source_event_id,
+        profile: KmPipelineProfileSchema.parse(JSON.parse(claimed.profile_snapshot_json)) };
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  finishDistillationJob(input: { jobId: string; claimToken: string; outputHash: string; state?: 'completed' | 'inconclusive' }): void {
+    const result = this.db.prepare(`UPDATE distillation_jobs SET state=?,output_hash=?,claim_token=NULL,claimed_at=NULL,updated_at=?
+      WHERE job_id=? AND claim_token=?`).run(input.state ?? 'completed', input.outputHash, new Date().toISOString(), input.jobId, input.claimToken);
+    if (Number(result.changes) !== 1) throw new Error('km_distillation_claim_lost');
+  }
+
+  failDistillationJob(input: { jobId: string; claimToken: string; error: string; retry: boolean; now?: number }): void {
+    const now = input.now ?? Date.now();
+    const row = this.db.prepare(`SELECT attempts FROM distillation_jobs WHERE job_id=? AND claim_token=?`).get(input.jobId, input.claimToken) as { attempts: number } | undefined;
+    if (!row) throw new Error('km_distillation_claim_lost');
+    const state = input.retry && row.attempts < 3 ? 'retry_wait' : 'failed';
+    const delay = Math.min(300_000, 1_000 * 2 ** Math.max(0, row.attempts - 1));
+    this.db.prepare(`UPDATE distillation_jobs SET state=?,next_attempt_at=?,claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=? WHERE job_id=?`)
+      .run(state, now + delay, input.error.slice(0, 500), new Date(now).toISOString(), input.jobId);
+  }
+
   private knowledgeFromRow(row: any): KnowledgeItem {
     return {
       knowledgeId: row.knowledge_id, state: row.state, targetLayer: row.target_layer,
@@ -1158,6 +1260,19 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase6(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 6) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE6_SCHEMA);
+      this.db.exec('PRAGMA user_version=6;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
   private migrateToPhase5(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -1205,6 +1320,9 @@ export class ObservationStore {
       'sync_sinks',
       'sync_cursors',
       'sync_quarantine',
+      'km_provider_registry',
+      'km_pipeline_profiles',
+      'distillation_jobs',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
