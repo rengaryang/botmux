@@ -34,7 +34,7 @@ describe('KM Phase 2 knowledge and memory store', () => {
     `);
     db.close();
     const store = await ObservationStore.open(dir);
-    expect(store.schemaVersion()).toBe(6);
+    expect(store.schemaVersion()).toBe(7);
     expect(store.listKnowledge({ limit: 10 })).toEqual([]);
     store.close();
   });
@@ -89,6 +89,17 @@ describe('KM Phase 2 knowledge and memory store', () => {
     store.transitionKnowledge({ knowledgeId: exportable.knowledgeId, toState: 'review_pending', reasonCode: 'ready', actorId: 'human' });
     store.transitionKnowledge({ knowledgeId: exportable.knowledgeId, toState: 'approved', reasonCode: 'approved', actorId: 'human' });
     expect(store.knowledgeExportDryRun(exportable.knowledgeId)).toEqual(expect.objectContaining({ allowed: true, requiredApprovalGrade: 'G2', risk: { mutatesWorkspace: true, automaticExecution: false } }));
+    store.close();
+  });
+
+  it('tracks multiple external backend bindings without changing the logical memory id', async () => {
+    const store = await ObservationStore.open(tempDir());
+    const memory = store.upsertMemory({ state: 'active', scope: 'user', subject: 'u1', claimKey: 'language', claimText: 'Chinese',
+      confidence: 'observed', privacyClass: 'internal', sourceRefs }).item;
+    for (const providerId of ['mem0', 'hindsight', 'openviking']) store.upsertMemoryBackendBinding({
+      memoryId: memory.memoryId, providerId, providerVersion: '1', backendRef: `${providerId}-ref`, writeState: 'active', contentHash: `sha256:${'a'.repeat(64)}`,
+    });
+    expect(store.listMemoryBackendBindings(memory.memoryId).map(item => item.providerId)).toEqual(['hindsight', 'mem0', 'openviking']);
     store.close();
   });
 
