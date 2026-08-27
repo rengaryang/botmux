@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { BackendMemoryRef, BackendMemoryWrite, MemoryBackendProvider } from './memory-backend-spi.js';
+import { classifyMemoryBackendError, type BackendMemoryRef, type BackendMemoryWrite, type MemoryBackendProvider } from './memory-backend-spi.js';
 import { ObservationStore, type MemoryBackendOutboxItem } from './observation-store.js';
 
 function sha256Json(value: unknown): string {
@@ -97,7 +97,8 @@ export async function drainMemoryBackendOutbox(input: {
         report.delivered += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        store.failMemoryBackendOutboxItem({ outboxId: item.outboxId, claimToken: claim.claimToken, error: message, retry: true,
+        const classified = classifyMemoryBackendError(error);
+        store.failMemoryBackendOutboxItem({ outboxId: item.outboxId, claimToken: claim.claimToken, error: message, retry: classified.retryable,
           maxAttempts: input.maxAttempts, now: input.now });
         const state = store.listMemoryBackendOutbox(500).find(row => row.outboxId === item.outboxId)?.status;
         if (state === 'quarantined') report.quarantined += 1; else report.retried += 1;

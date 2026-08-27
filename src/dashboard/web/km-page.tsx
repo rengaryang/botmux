@@ -38,7 +38,16 @@ type BackendRuntime = {
   enabled: boolean;
   leaseName: string;
   outbox: { total: number; pending: number; inflight: number; failed: number; delivered: number; quarantined: number; oldestPendingAgeMs: number };
-  providers: Array<{ providerId: string; endpoint: string; enabled: boolean; status: string; reason?: string }>;
+  providers: Array<{
+    providerId: string;
+    endpoint: string;
+    enabled: boolean;
+    status: string;
+    reason?: string;
+    descriptor?: { contractVersion?: number; protocolVersion?: string; transport?: string; capabilities?: Record<string, boolean> };
+    healthRequest?: { method: string; path: string; network: string };
+    endpointPolicy?: { mode: string; reason?: string };
+  }>;
 };
 type BackendOutboxItem = { outboxId: string; memoryId: string; providerId: string; operation: string; status: string; attempts: number; lastError?: string; updatedAt: string };
 type BackendMigration = { migrationId: string; botAppId: string; state: string; checkpoint?: string; stats: Record<string, unknown>; updatedAt: string };
@@ -570,7 +579,12 @@ function KmPage(): React.JSX.Element {
         <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>只保存 endpoint 与 credential reference；不保存密钥，不发网络请求，realTransportEnabled 固定为 false。</p>
         <div className="feedback-deliveries">
           {providerConfigs.map(config => <div key={config.providerId}><code>{config.providerId}</code><span>{config.endpoint}</span><span>{config.credentialRef} · {config.timeoutMs}ms</span><b>{config.enabled ? 'configured' : 'disabled'} / transport off <button onClick={() => void checkProvider(config.providerId)}>检查</button></b></div>)}
-          {backendRuntime?.providers.map(provider => <div key={`runtime-${provider.providerId}`}><code>runtime</code><span>{provider.providerId} · {provider.endpoint}</span><span>{provider.reason ?? 'mock-only gate checked'}</span><b>{provider.status}</b></div>)}
+          {backendRuntime?.providers.map(provider => {
+            const caps = provider.descriptor?.capabilities ? Object.entries(provider.descriptor.capabilities).filter(([, enabled]) => enabled).map(([key]) => key).slice(0, 4).join(', ') : '—';
+            const contract = provider.descriptor ? `contract v${provider.descriptor.contractVersion ?? '—'} · ${provider.descriptor.protocolVersion ?? provider.descriptor.transport ?? '—'}` : 'descriptor unavailable';
+            const health = provider.healthRequest ? `${provider.healthRequest.method} ${provider.healthRequest.path} · ${provider.healthRequest.network}` : 'health descriptor unavailable';
+            return <div key={`runtime-${provider.providerId}`}><code>runtime</code><span>{provider.providerId} · {provider.endpoint}</span><span>{provider.reason ?? provider.endpointPolicy?.reason ?? contract} · {health} · {caps}</span><b>{provider.status}</b></div>;
+          })}
           {configAudit.map(item => <div key={item.auditId}><code>audit</code><span>{item.action} · {item.targetRef}</span><span>{item.actorId}</span><b>{item.createdAt}</b></div>)}
         </div>
       </section>

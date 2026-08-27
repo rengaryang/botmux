@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import {
   createMemoryBackendProvider,
+  evaluateMemoryBackendEndpointPolicy,
   InMemoryMemoryBackendTransport,
+  memoryBackendContractDescriptors,
   type MemoryBackendFactoryResult,
 } from './memory-backend-factory.js';
-import type { MemoryBackendProvider } from './memory-backend-spi.js';
+import type { BackendHealthRequestDescription, MemoryBackendDescriptor, MemoryBackendProvider } from './memory-backend-spi.js';
 import { drainMemoryBackendOutbox, type MemoryBackendOutboxWorkerReport } from './memory-backend-outbox-worker.js';
 import { ObservationStore, type MemoryBackendOutboxRow, type MemoryItem } from './observation-store.js';
 import type { KmMemoryProviderConfig, KmPipelineProfile } from './provider-spi.js';
@@ -29,16 +31,6 @@ export function isKmBackendWorkerEnabled(env: NodeJS.ProcessEnv = process.env): 
   return envOn('BOTMUX_KM_BACKEND_WORKER_ENABLED', env);
 }
 
-function isExplicitMockEndpoint(endpoint: string): boolean {
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol === 'mock:' || url.protocol === 'inmemory:') return true;
-  } catch {
-    return false;
-  }
-  return false;
-}
-
 function runtimeConfig(config: KmMemoryProviderConfig): KmMemoryProviderConfig {
   return {
     providerId: config.providerId,
@@ -56,6 +48,9 @@ export interface KmBackendProviderRuntimeStatus {
   enabled: boolean;
   status: MemoryBackendFactoryResult['status'] | 'unsafe_endpoint';
   reason?: string;
+  descriptor?: MemoryBackendDescriptor;
+  healthRequest?: BackendHealthRequestDescription;
+  endpointPolicy?: MemoryBackendFactoryResult['endpointPolicy'];
 }
 
 export interface KmBackendRuntimeStatus {
@@ -172,19 +167,30 @@ export function createKmMemoryBackendProviders(input: {
   const providers = new Map<string, MemoryBackendProvider>();
   const statuses: KmBackendProviderRuntimeStatus[] = [];
   const transport = input.transport ?? new InMemoryMemoryBackendTransport();
+  const contracts = new Map(memoryBackendContractDescriptors().map(item => [item.id, item as unknown as MemoryBackendDescriptor & { health?: BackendHealthRequestDescription }]));
   for (const config of input.configs) {
     const safeConfig = runtimeConfig(config);
+    const contract = contracts.get(safeConfig.providerId);
     if (!safeConfig.enabled) {
-      statuses.push({ providerId: safeConfig.providerId, endpoint: safeConfig.endpoint, enabled: false, status: 'disabled' });
+      statuses.push({
+        providerId: safeConfig.providerId,
+        endpoint: safeConfig.endpoint,
+        enabled: false,
+        status: 'disabled',
+        ...(contract ? { descriptor: contract, ...(contract.health ? { healthRequest: contract.health } : {}) } : {}),
+      });
       continue;
     }
-    if (!isExplicitMockEndpoint(safeConfig.endpoint)) {
+    const endpointPolicy = evaluateMemoryBackendEndpointPolicy(safeConfig.endpoint);
+    if (!endpointPolicy.ok) {
       statuses.push({
         providerId: safeConfig.providerId,
         endpoint: safeConfig.endpoint,
         enabled: safeConfig.enabled,
         status: 'unsafe_endpoint',
         reason: 'km_memory_backend_requires_explicit_mock_or_inmemory_endpoint',
+        endpointPolicy,
+        ...(contract ? { descriptor: contract, ...(contract.health ? { healthRequest: contract.health } : {}) } : {}),
       });
       continue;
     }
@@ -200,6 +206,8 @@ export function createKmMemoryBackendProviders(input: {
       endpoint: config.endpoint,
       enabled: config.enabled,
       status: result.status,
+      ...(result.provider ? { descriptor: result.provider.descriptor, ...(result.provider.describeHealthRequest ? { healthRequest: result.provider.describeHealthRequest() } : {}) } : {}),
+      ...(result.endpointPolicy ? { endpointPolicy: result.endpointPolicy } : {}),
       ...(result.credential && !result.credential.ok ? { reason: result.credential.reason } : {}),
     });
     if (result.provider) providers.set(result.provider.descriptor.id, result.provider);
@@ -310,5 +318,5 @@ export function kmBackendWorkerStartupDelayMs(idx: number): number {
   return 3_000 + Math.max(0, idx) * 750;
 }
 
-export const __testOnly_isExplicitMockEndpoint = isExplicitMockEndpoint;
+export const __testOnly_isExplicitMockEndpoint = (endpoint: string) => evaluateMemoryBackendEndpointPolicy(endpoint).ok;
 export const __testOnly_summarizeOutbox = summarizeOutbox;
