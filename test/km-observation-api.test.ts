@@ -1,6 +1,10 @@
 import { Readable } from 'node:stream';
+import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { handleKmObservationApi } from '../src/dashboard/km-observation-api.js';
+import type { KnowledgeItem } from '../src/services/km/observation-store.js';
 
 function response() {
   const bodies: unknown[] = [];
@@ -9,6 +13,26 @@ function response() {
     end: vi.fn(value => bodies.push(JSON.parse(String(value)))),
   } as any;
   return { res, bodies };
+}
+
+function knowledge(overrides: Partial<KnowledgeItem> = {}): KnowledgeItem {
+  const now = '2026-08-27T00:00:00.000Z';
+  return {
+    knowledgeId: 'kn-api',
+    state: 'approved',
+    targetLayer: 'L3',
+    category: 'skill',
+    title: 'Skill route',
+    claimKey: 'skill.route',
+    claimText: 'Route explicit export requests through the KM exporter.',
+    confidence: 'observed',
+    freshness: 'fresh',
+    privacyClass: 'internal',
+    sourceRefs: [{ kind: 'api', ref: 'evt-1' }],
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
 }
 
 describe('KM observation dashboard API', () => {
@@ -131,6 +155,62 @@ describe('KM observation dashboard API', () => {
       targetRef: 'mem-1',
     }), expect.any(Function));
     expect(result.bodies).toEqual([{ memoryId: 'mem-1', state: 'active' }]);
+  });
+
+  it('serves KM export dry-run, create, review and status without formal destination writes', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-km-export-api-'));
+    const getKnowledge = vi.fn(() => knowledge());
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const deps = {
+      enabled: true,
+      actorId: 'reviewer-1',
+      dataDir,
+      openStore: async () => ({
+        schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+        getKnowledge, executeKmMutation,
+      }),
+    };
+
+    const dryRun = response();
+    await handleKmObservationApi({ method: 'POST', headers: {} } as any, dryRun.res,
+      new URL('http://localhost/api/km/knowledge/kn-api/export-dry-run'), deps);
+    expect(dryRun.bodies[0]).toMatchObject({
+      knowledgeId: 'kn-api',
+      allowed: true,
+      destination: { layer: 'L3', root: 'l3-skills', writeMode: 'staging-only' },
+      risk: { mutatesFormalDestination: false, stagingOnly: true, automaticExecution: false },
+    });
+
+    const create = response();
+    const createReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ knowledgeId: 'kn-api' }))]), {
+      method: 'POST',
+      headers: { 'idempotency-key': 'export-create-1' },
+    });
+    await handleKmObservationApi(createReq as any, create.res, new URL('http://localhost/api/km/exports'), deps);
+    expect(create.res.writeHead).toHaveBeenCalledWith(201, expect.anything());
+    const created = create.bodies[0] as any;
+    expect(created.state).toBe('review_pending');
+    expect(executeKmMutation).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'knowledge.export_job_created',
+      targetRef: 'kn-api',
+    }), expect.any(Function));
+    expect(() => statSync(join(dataDir, 'knowledge', created.plan.file.relativePath))).toThrow();
+
+    const review = response();
+    const reviewReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ decision: 'approved', reasonCode: 'reviewed' }))]), {
+      method: 'POST',
+      headers: { 'idempotency-key': 'export-review-1' },
+    });
+    await handleKmObservationApi(reviewReq as any, review.res, new URL(`http://localhost/api/km/exports/${created.jobId}/review`), deps);
+    expect(review.bodies[0]).toMatchObject({ jobId: created.jobId, state: 'staged' });
+    const staged = readFileSync(join(dataDir, 'km-export-staging', 'staged', created.plan.file.relativePath), 'utf8');
+    expect(staged).toContain('Route explicit export requests through the KM exporter.');
+    expect(() => statSync(join(dataDir, 'knowledge', created.plan.file.relativePath))).toThrow();
+
+    const status = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, status.res,
+      new URL(`http://localhost/api/km/exports/${created.jobId}`), deps);
+    expect(status.bodies[0]).toMatchObject({ jobId: created.jobId, state: 'staged' });
   });
 
   it('serves trace/evolution reads and enforces approval grade through the store', async () => {

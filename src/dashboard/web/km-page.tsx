@@ -13,6 +13,12 @@ type Health = {
 };
 
 type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; title: string; confidence: string; freshness: string };
+type KnowledgeExportJob = {
+  jobId: string;
+  state: string;
+  plan: { knowledgeId: string; targetLayer: string; allowed: boolean; destination: { relativePath: string; writeMode: string }; reasonCodes: string[]; diff: { status: string; lines: string[] } };
+  manifest?: { contentHash: string; stagedFile?: string };
+};
 type MemoryItem = { memoryId: string; state: string; scope: string; subject: string; claimKey: string; confidence: string };
 type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; targetId: string; passCount: number; warnCount: number; failCount: number };
 type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
@@ -91,6 +97,7 @@ function KmPage(): React.JSX.Element {
   const [notice, setNotice] = useState('');
   const [typeFilter, setTypeFilter] = useState<string>('');
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
+  const [exportJobs, setExportJobs] = useState<KnowledgeExportJob[]>([]);
   const [memory, setMemory] = useState<MemoryItem[]>([]);
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
   const [proposals, setProposals] = useState<EvolutionProposal[]>([]);
@@ -117,10 +124,11 @@ function KmPage(): React.JSX.Element {
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality] = await Promise.all([
+      const [h, list, knowledgeList, exportList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
+        getJson<{ items: KnowledgeExportJob[] }>('/api/km/exports'),
         getJson<{ items: MemoryItem[] }>('/api/km/memory?limit=20'),
         getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
         getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
@@ -141,6 +149,7 @@ function KmPage(): React.JSX.Element {
       setHealth(h);
       setEvents(list.items);
       setKnowledge(knowledgeList.items);
+      setExportJobs(exportList.items);
       setMemory(memoryList.items);
       setEvalRuns(evalList.items);
       setProposals(proposalList.items);
@@ -186,6 +195,25 @@ function KmPage(): React.JSX.Element {
     try {
       await mutateJson(`/api/km/memory/${encodeURIComponent(item.memoryId)}/state`, 'PATCH', { toState: state, reasonCode });
       setNotice(`Memory 已切换为 ${state}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const createExportJob = async (item: KnowledgeItem) => {
+    if (!window.confirm(`确认为 ${item.title} 创建 KM 导出审核单？`)) return;
+    try {
+      await mutateJson('/api/km/exports', 'POST', { knowledgeId: item.knowledgeId });
+      setNotice('导出审核单已创建');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const reviewExportJob = async (job: KnowledgeExportJob, decision: 'approved' | 'rejected') => {
+    if (!window.confirm(`确认${decision === 'approved' ? '批准并写入 staging outbox' : '拒绝'} ${job.jobId}？`)) return;
+    try {
+      await mutateJson(`/api/km/exports/${encodeURIComponent(job.jobId)}/review`, 'POST', {
+        decision,
+        reasonCode: decision === 'approved' ? 'manual_review_approved' : 'manual_review_rejected',
+      });
+      setNotice(decision === 'approved' ? '已写入 staging outbox，未修改正式知识目录' : '导出审核单已拒绝');
       await load();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
@@ -256,7 +284,9 @@ function KmPage(): React.JSX.Element {
       <section className="panel">
         <h2>Knowledge / Memory Review</h2>
         <div className="feedback-deliveries">
-          {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}</b></div>)}
+          {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}{' '}
+            {item.state === 'approved' && item.targetLayer !== 'reviewed-only' && item.freshness === 'fresh' && <button onClick={() => void createExportJob(item)}>Stage Export</button>}
+          </b></div>)}
           {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}{' '}
             {(item.state === 'proposed' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'expired') && <button onClick={() => void changeMemoryState(item, 'active', 'review_approved')}>Approve</button>}{' '}
             {item.state === 'proposed' && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_rejected')}>Reject</button>}{' '}
@@ -265,6 +295,17 @@ function KmPage(): React.JSX.Element {
           </b></div>)}
           {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
           {knowledge.length + memory.length + policyDecisions.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Knowledge Export Staging</h2>
+        <div className="feedback-deliveries">
+          {exportJobs.map(job => <div key={job.jobId}><code>{job.plan.targetLayer}</code><span>{job.plan.destination.relativePath}</span><span>{job.plan.diff.status} · {job.plan.reasonCodes.join(', ') || 'ready'}</span><b>{job.state}{' '}
+            {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'approved')}>Approve</button>}{' '}
+            {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'rejected')}>Reject</button>}
+          </b></div>)}
+          {exportJobs.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无导出审核单。</p>}
         </div>
       </section>
 
