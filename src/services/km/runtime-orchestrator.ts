@@ -19,6 +19,8 @@ import {
 } from './prompt-memory.js';
 import { federatedMemoryRetrieveWithTelemetry } from './memory-backend-coordinator.js';
 import type { MemoryBackendProvider } from './memory-backend-spi.js';
+import { resolveRetrievalScopeSubjects, visibleScopes } from './retrieval-quality.js';
+import type { MemoryScope, RetrievalQualityCounters } from './observation-store.js';
 
 function envOn(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
   return ['1', 'true', 'yes'].includes(env[name]?.trim().toLowerCase() ?? '');
@@ -32,6 +34,22 @@ export function isKmEffectiveModeAuthorized(env = process.env): boolean { return
 
 function parseBotAllowlist(value: string | undefined): string[] {
   return (value ?? '').split(/[,\s]+/u).map(item => item.trim()).filter(Boolean);
+}
+
+function scopeVisible(scope: MemoryScope | undefined, subject: string | undefined, subjects: Partial<Record<MemoryScope, string>>): boolean {
+  if (!scope || !subject) return false;
+  return subjects[scope] === subject;
+}
+
+function mergeRetrievalMetrics(base: RetrievalQualityCounters, extra: Partial<RetrievalQualityCounters>): RetrievalQualityCounters {
+  return {
+    directHitCount: base.directHitCount + (extra.directHitCount ?? 0),
+    normalizedHitCount: base.normalizedHitCount + (extra.normalizedHitCount ?? 0),
+    noHitCount: base.noHitCount + (extra.noHitCount ?? 0),
+    filteredScopeCount: base.filteredScopeCount + (extra.filteredScopeCount ?? 0),
+    filteredPrivacyCount: base.filteredPrivacyCount + (extra.filteredPrivacyCount ?? 0),
+    filteredStateCount: base.filteredStateCount + (extra.filteredStateCount ?? 0),
+  };
 }
 
 export function defaultShadowProfile(botAppId: string, cliId = 'pi', model?: string): KmPipelineProfile {
@@ -152,6 +170,7 @@ export async function drainDistillationJobs(input: { dataDir: string; cliId?: st
 
 export async function runRetrievalShadow(input: {
   dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string;
+  projectId?: string; skillName?: string; environmentId?: string; teamId?: string; workspaceId?: string;
   providers?: MemoryBackendProvider[]; env?: NodeJS.ProcessEnv; providerTimeoutMs?: number;
 }): Promise<void> {
   if (!isKmRetrievalShadowEnabled(input.env)) return;
@@ -159,31 +178,38 @@ export async function runRetrievalShadow(input: {
   try {
     const profile = store.getEffectivePipelineProfile(input.botAppId);
     if (profile?.injectionMode === 'off') return;
-    const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'],
-      subjects: { ...(input.userId ? { user: input.userId } : {}), bot: input.botAppId }, limit: 50 });
-    const candidates: PromptMemoryCandidate[] = raw.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
+    const subjects = resolveRetrievalScopeSubjects(input);
+    const local = store.retrieveWithMetrics({ text: input.queryText, scopes: visibleScopes(subjects), subjects, limit: 50 });
+    const candidates: PromptMemoryCandidate[] = local.items.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
       providerIds: ['sqlite'] }));
     const warnings: string[] = [];
     if (isKmFederatedRetrievalEnabled(input.env) && input.providers?.length) {
       const remote = await federatedMemoryRetrieveWithTelemetry({ providers: input.providers,
-        query: { text: input.queryText, scopes: ['user', 'bot'], subject: input.userId, limit: 50, botAppId: input.botAppId },
+        query: { text: input.queryText, scopes: visibleScopes(subjects), subject: input.userId, subjects, limit: 50, botAppId: input.botAppId },
         limit: 50, timeoutMs: input.providerTimeoutMs });
       warnings.push(...remote.warnings.map(warning => `federated_${warning}`));
-      for (const item of remote.items) candidates.push({ id: item.memoryId ?? `${item.providerId}:${item.backendRef}`, kind: 'memory',
+      let filteredRemoteScope = 0;
+      for (const item of remote.items) {
+        if (!scopeVisible(item.scope, item.subject, subjects)) { filteredRemoteScope += 1; continue; }
+        candidates.push({ id: item.memoryId ?? `${item.providerId}:${item.backendRef}`, kind: 'memory',
         title: item.metadata?.title ? String(item.metadata.title) : item.backendRef, text: item.text, score: item.fusedScore,
         sourceRefs: [{ kind: 'memory-backend', ref: item.backendRef, providers: item.providers }], privacyClass: 'internal',
         freshness: 'fresh', state: 'active', scope: item.scope ?? 'user', subject: item.subject ?? input.userId,
         providerIds: item.providers });
+      }
+      local.metrics = mergeRetrievalMetrics(local.metrics, { filteredScopeCount: filteredRemoteScope });
     } else if (input.providers?.length) {
       warnings.push('federated_retrieval_gate_disabled');
     }
     // This runtime path remains fail-closed in Shadow even if a stored profile
     // requests canary/active; live prompt mutation requires a separate gate.
     const plan = planPromptMemory(candidates, { botAppId: input.botAppId, userId: input.userId, mode: 'shadow',
-      promptTokenBudget: profile?.budgets.promptTokens ?? 1_800 });
+      projectId: input.projectId, skillName: input.skillName, environmentId: input.environmentId, teamId: input.teamId,
+      workspaceId: input.workspaceId, promptTokenBudget: profile?.budgets.promptTokens ?? 1_800 });
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
       queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: 'shadow',
       candidateCount: candidates.length, eligibleCount: plan.eligible.length, latencyMs: Date.now() - started,
+      metrics: local.metrics,
       warnings: [...(profile && profile.injectionMode !== 'shadow' ? [`configured_mode_${profile.injectionMode}_forced_shadow`] : []), ...warnings],
       results: [...plan.eligible.map(item => ({ itemId: item.id, itemKind: item.kind, providerIds: item.providerIds ?? [], score: item.score, eligible: true })),
         ...plan.filtered.map(value => ({ itemId: value.item.id, itemKind: value.item.kind, providerIds: value.item.providerIds ?? [], score: value.item.score, eligible: false, filterReason: value.reason }))] });
@@ -195,6 +221,7 @@ export async function runRetrievalShadow(input: {
 
 export async function composePromptMemoryForTurn(input: {
   dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string; promptContent: string;
+  projectId?: string; skillName?: string; environmentId?: string; teamId?: string; workspaceId?: string;
   env?: NodeJS.ProcessEnv; providers?: MemoryBackendProvider[]; providerTimeoutMs?: number;
 }): Promise<{ promptContent: string; injected: boolean; reason?: string }> {
   const env = input.env ?? process.env;
@@ -205,9 +232,9 @@ export async function composePromptMemoryForTurn(input: {
   try {
     const profile = store.getEffectivePipelineProfile(input.botAppId);
     const requestedMode = (profile?.injectionMode ?? 'shadow') as PromptMemoryMode;
-    const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'],
-      subjects: { ...(input.userId ? { user: input.userId } : {}), bot: input.botAppId }, limit: 50 });
-    const candidates: PromptMemoryCandidate[] = raw.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
+    const subjects = resolveRetrievalScopeSubjects(input);
+    const local = store.retrieveWithMetrics({ text: input.queryText, scopes: visibleScopes(subjects), subjects, limit: 50 });
+    const candidates: PromptMemoryCandidate[] = local.items.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
       providerIds: ['sqlite'] }));
     const warnings: string[] = [];
     if (isKmFederatedRetrievalEnabled(input.env) && input.providers?.length) {
@@ -218,6 +245,11 @@ export async function composePromptMemoryForTurn(input: {
     const composed = composeLivePromptMemory(input.promptContent, candidates, {
       botAppId: input.botAppId,
       userId: input.userId,
+      projectId: input.projectId,
+      skillName: input.skillName,
+      environmentId: input.environmentId,
+      teamId: input.teamId,
+      workspaceId: input.workspaceId,
       requestedMode,
       effectiveModeAuthorized: isKmEffectiveModeAuthorized(env),
       liveInjectionEnabled: isKmLiveInjectionEnabled(env),
@@ -227,6 +259,7 @@ export async function composePromptMemoryForTurn(input: {
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
       queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: composed.plan.effectiveMode,
       candidateCount: candidates.length, eligibleCount: composed.plan.eligible.length, latencyMs: Date.now() - started,
+      metrics: local.metrics,
       warnings,
       results: [...composed.plan.eligible.map(item => ({ itemId: item.id, itemKind: item.kind, providerIds: item.providerIds ?? [], score: item.score, eligible: true })),
         ...composed.plan.filtered.map(value => ({ itemId: value.item.id, itemKind: value.item.kind, providerIds: value.item.providerIds ?? [], score: value.item.score, eligible: false, filterReason: value.reason }))] });

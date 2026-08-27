@@ -32,7 +32,7 @@ describe('KM provider SPI and durable distillation', () => {
 
   it('persists provider/profile and claims a snapshot-stable job idempotently', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(13);
+    expect(store.schemaVersion()).toBe(14);
     store.registerKmProvider({ id: 'botmux-cli:pi:default', kind: 'extractor', version: '1', contractVersion: 1,
       capabilities: ['strict-json'], execution: 'botmux-cli', deterministic: false, supportsShadow: true, maxBatchSize: 1 });
     expect(store.putPipelineProfile(profile, 'active')).toMatch(/^sha256:/);
@@ -64,7 +64,10 @@ describe('KM provider SPI and durable distillation', () => {
     expect(store.executeKmMutation(mutation, () => { throw new Error('must_not_run'); })).toEqual({ statusCode: 201, response: { ok: true }, replayed: true });
     expect(() => store.executeKmMutation({ ...mutation, requestHash: `sha256:${'d'.repeat(64)}` }, () => ({ ok: false }))).toThrow(/idempotency_conflict/);
     expect(store.listKmConfigAudit(10)).toEqual([expect.objectContaining({ actorId: 'u1', action: 'profile.created' })]);
-    expect(store.retrievalQualitySummary()).toEqual({ runs: 0, zeroHits: 0, candidates: 0, eligible: 0, avgLatencyMs: 0 });
+    expect(store.retrievalQualitySummary()).toEqual({
+      runs: 0, zeroHits: 0, candidates: 0, eligible: 0, directHits: 0, normalizedHits: 0,
+      noHits: 0, filteredScope: 0, filteredPrivacy: 0, filteredState: 0, avgLatencyMs: 0,
+    });
     expect(store.retrievalRetentionPreview('2026-01-01T00:00:00.000Z')).toEqual({ cutoff: '2026-01-01T00:00:00.000Z', eligibleRuns: 0 });
     store.close();
   });

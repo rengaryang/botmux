@@ -9,8 +9,9 @@ import {
   type ObservationEvent,
   type ObservationEventType,
 } from './observation-schema.js';
+import { normalizeRetrievalQuery, scoreNormalizedQuery } from './retrieval-quality.js';
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -120,7 +121,13 @@ const PHASE9_SCHEMA = `
     retrieval_run_id TEXT PRIMARY KEY, bot_app_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT,
     query_hash TEXT NOT NULL, mode TEXT NOT NULL CHECK(mode IN ('off','shadow','canary','active')),
     candidate_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
-    warnings_json TEXT NOT NULL CHECK(json_valid(warnings_json)), created_at TEXT NOT NULL
+    warnings_json TEXT NOT NULL CHECK(json_valid(warnings_json)), created_at TEXT NOT NULL,
+    direct_hit_count INTEGER NOT NULL DEFAULT 0,
+    normalized_hit_count INTEGER NOT NULL DEFAULT 0,
+    no_hit_count INTEGER NOT NULL DEFAULT 0,
+    filtered_scope_count INTEGER NOT NULL DEFAULT 0,
+    filtered_privacy_count INTEGER NOT NULL DEFAULT 0,
+    filtered_state_count INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS retrieval_results (
     retrieval_run_id TEXT NOT NULL REFERENCES retrieval_runs(retrieval_run_id) ON DELETE CASCADE,
@@ -511,6 +518,15 @@ export interface RetrievalQuery {
   limit: number;
 }
 
+export interface RetrievalQualityCounters {
+  directHitCount: number;
+  normalizedHitCount: number;
+  noHitCount: number;
+  filteredScopeCount: number;
+  filteredPrivacyCount: number;
+  filteredStateCount: number;
+}
+
 export interface RetrievalItem {
   id: string;
   kind: 'knowledge' | 'memory';
@@ -522,6 +538,19 @@ export interface RetrievalItem {
   freshness: 'fresh' | 'stale' | 'purged' | 'unknown';
   scope?: MemoryScope;
   subject?: string;
+  matchKind?: 'direct' | 'normalized';
+  matchedGroups?: number;
+}
+
+export interface RetrievalResultSet {
+  items: RetrievalItem[];
+  metrics: RetrievalQualityCounters;
+}
+
+function retrievalExpectedSubject(input: RetrievalQuery, scope: MemoryScope): string | undefined {
+  if (input.subjects) return input.subjects[scope];
+  if (input.subject && input.scopes?.length === 1 && input.scopes[0] === scope) return input.subject;
+  return undefined;
 }
 
 export type ApprovalGrade = 'G0' | 'G1' | 'G2' | 'G3' | 'G4';
@@ -762,6 +791,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 11) this.migrateToPhase11();
     if (this.schemaVersion() < 12) this.migrateToPhase12();
     if (this.schemaVersion() < 13) this.migrateToPhase13();
+    if (this.schemaVersion() < 14) this.migrateToPhase14();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -1342,15 +1372,19 @@ export class ObservationStore {
   recordRetrievalAudit(input: {
     botAppId: string; sessionId: string; turnId?: string; queryHash: string;
     mode: 'off' | 'shadow' | 'canary' | 'active'; candidateCount: number; eligibleCount: number;
-    latencyMs: number; warnings: string[];
+    latencyMs: number; warnings: string[]; metrics?: Partial<RetrievalQualityCounters>;
     results: Array<{ itemId: string; itemKind: string; providerIds: string[]; score: number; eligible: boolean; filterReason?: string }>;
   }): string {
     const id = `retr_${randomUUID().replaceAll('-', '')}`; const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE;');
     try {
-      this.db.prepare(`INSERT INTO retrieval_runs(retrieval_run_id,bot_app_id,session_id,turn_id,query_hash,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.botAppId, input.sessionId, input.turnId ?? null, input.queryHash, input.mode,
-        input.candidateCount, input.eligibleCount, input.latencyMs, JSON.stringify(input.warnings), now);
+      const metrics = input.metrics ?? {};
+      this.db.prepare(`INSERT INTO retrieval_runs(retrieval_run_id,bot_app_id,session_id,turn_id,query_hash,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at,
+          direct_hit_count,normalized_hit_count,no_hit_count,filtered_scope_count,filtered_privacy_count,filtered_state_count)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.botAppId, input.sessionId, input.turnId ?? null, input.queryHash, input.mode,
+        input.candidateCount, input.eligibleCount, input.latencyMs, JSON.stringify(input.warnings), now,
+        metrics.directHitCount ?? 0, metrics.normalizedHitCount ?? 0, metrics.noHitCount ?? 0, metrics.filteredScopeCount ?? 0,
+        metrics.filteredPrivacyCount ?? 0, metrics.filteredStateCount ?? 0);
       const insert = this.db.prepare(`INSERT INTO retrieval_results(retrieval_run_id,item_id,item_kind,provider_ids_json,score,eligible,filter_reason)
         VALUES(?,?,?,?,?,?,?)`);
       for (const result of input.results) insert.run(id, result.itemId, result.itemKind, JSON.stringify(result.providerIds), result.score,
@@ -1428,37 +1462,51 @@ export class ObservationStore {
   }
 
   retrieve(input: RetrievalQuery): RetrievalItem[] {
+    return this.retrieveWithMetrics(input).items;
+  }
+
+  retrieveWithMetrics(input: RetrievalQuery): RetrievalResultSet {
     const limit = Math.max(1, Math.min(input.limit, 100));
-    const terms = input.text.toLowerCase().split(/\s+/u).map(term => term.trim()).filter(Boolean);
-    const score = (text: string): number => terms.length === 0
-      ? 1
-      : terms.reduce((sum, term) => sum + (text.toLowerCase().includes(term) ? 1 : 0), 0) / terms.length;
+    const query = normalizeRetrievalQuery(input.text);
     const items: RetrievalItem[] = [];
+    const metrics: RetrievalQualityCounters = {
+      directHitCount: 0,
+      normalizedHitCount: 0,
+      noHitCount: 0,
+      filteredScopeCount: 0,
+      filteredPrivacyCount: 0,
+      filteredStateCount: 0,
+    };
 
-    for (const item of this.listKnowledge({ limit: 500, state: 'approved' })) {
-      if (input.targetLayers?.length && !input.targetLayers.includes(item.targetLayer)) continue;
-      if (item.freshness === 'stale' || item.freshness === 'purged') continue;
-      const itemScore = score(`${item.title} ${item.claimKey} ${item.claimText}`);
-      if (terms.length && itemScore === 0) continue;
+    for (const item of this.listKnowledge({ limit: 500 })) {
+      if (item.state !== 'approved') { metrics.filteredStateCount += 1; continue; }
+      if (input.targetLayers?.length && !input.targetLayers.includes(item.targetLayer)) { metrics.filteredScopeCount += 1; continue; }
+      if (item.freshness === 'stale' || item.freshness === 'purged') { metrics.filteredStateCount += 1; continue; }
+      if (item.privacyClass === 'sensitive' || item.privacyClass === 'secret-reference-only') { metrics.filteredPrivacyCount += 1; continue; }
+      const scored = scoreNormalizedQuery(query, `${item.title} ${item.claimKey} ${item.claimText}`);
+      if (query.groups.length && scored.score === 0) { metrics.noHitCount += 1; continue; }
+      if (scored.matchKind === 'normalized') metrics.normalizedHitCount += 1; else metrics.directHitCount += 1;
       items.push({ id: item.knowledgeId, kind: 'knowledge', title: item.title, text: item.claimText,
-        score: itemScore, sourceRefs: item.sourceRefs, privacyClass: item.privacyClass, freshness: item.freshness });
+        score: scored.score, sourceRefs: item.sourceRefs, privacyClass: item.privacyClass, freshness: item.freshness,
+        matchKind: scored.matchKind, matchedGroups: scored.matchedGroups });
     }
 
-    for (const item of this.listMemory({ limit: 500, state: 'active' })) {
-      if (input.scopes?.length && !input.scopes.includes(item.scope)) continue;
-      if (input.subjects) {
-        const expectedSubject = input.subjects[item.scope];
-        if (!expectedSubject || expectedSubject !== item.subject) continue;
-      }
-      if (input.subject && input.subject !== item.subject) continue;
-      if (item.ttlExpiresAt && Date.parse(item.ttlExpiresAt) <= Date.now()) continue;
-      const itemScore = score(`${item.claimKey} ${item.claimText}`);
-      if (terms.length && itemScore === 0) continue;
+    for (const item of this.listMemory({ limit: 500 })) {
+      if (input.scopes && !input.scopes.includes(item.scope)) { metrics.filteredScopeCount += 1; continue; }
+      const expectedSubject = retrievalExpectedSubject(input, item.scope);
+      if (!expectedSubject || expectedSubject !== item.subject) { metrics.filteredScopeCount += 1; continue; }
+      if (item.state !== 'active') { metrics.filteredStateCount += 1; continue; }
+      if (item.ttlExpiresAt && Date.parse(item.ttlExpiresAt) <= Date.now()) { metrics.filteredStateCount += 1; continue; }
+      if (item.privacyClass === 'sensitive' || item.privacyClass === 'secret-reference-only') { metrics.filteredPrivacyCount += 1; continue; }
+      const scored = scoreNormalizedQuery(query, `${item.claimKey} ${item.claimText}`);
+      if (query.groups.length && scored.score === 0) { metrics.noHitCount += 1; continue; }
+      if (scored.matchKind === 'normalized') metrics.normalizedHitCount += 1; else metrics.directHitCount += 1;
       items.push({ id: item.memoryId, kind: 'memory', title: item.claimKey, text: item.claimText,
-        score: itemScore, sourceRefs: item.sourceRefs, privacyClass: item.privacyClass, freshness: 'fresh',
-        scope: item.scope, subject: item.subject });
+        score: scored.score, sourceRefs: item.sourceRefs, privacyClass: item.privacyClass, freshness: 'fresh',
+        scope: item.scope, subject: item.subject, matchKind: scored.matchKind, matchedGroups: scored.matchedGroups });
     }
-    return items.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
+    return { items: items.sort((a, b) => b.score - a.score || (b.matchedGroups ?? 0) - (a.matchedGroups ?? 0) || a.id.localeCompare(b.id)).slice(0, limit),
+      metrics };
   }
 
   addTraceEdge(input: TraceEdgeInput): { edgeId: string; created: boolean } {
@@ -1872,11 +1920,15 @@ export class ObservationStore {
   }
 
   listRetrievalAudits(limit: number): Array<Record<string, unknown>> {
-    return (this.db.prepare(`SELECT retrieval_run_id,bot_app_id,session_id,turn_id,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at
+    return (this.db.prepare(`SELECT retrieval_run_id,bot_app_id,session_id,turn_id,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at,
+        direct_hit_count,normalized_hit_count,no_hit_count,filtered_scope_count,filtered_privacy_count,filtered_state_count
       FROM retrieval_runs ORDER BY created_at DESC,retrieval_run_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 500))) as any[])
       .map(row => ({ retrievalRunId: row.retrieval_run_id, botAppId: row.bot_app_id, sessionId: row.session_id,
         ...(row.turn_id ? { turnId: row.turn_id } : {}), mode: row.mode, candidateCount: row.candidate_count,
-        eligibleCount: row.eligible_count, latencyMs: row.latency_ms, warnings: JSON.parse(row.warnings_json), createdAt: row.created_at }));
+        eligibleCount: row.eligible_count, latencyMs: row.latency_ms, warnings: JSON.parse(row.warnings_json),
+        directHitCount: Number(row.direct_hit_count ?? 0), normalizedHitCount: Number(row.normalized_hit_count ?? 0), noHitCount: Number(row.no_hit_count ?? 0),
+        filteredScopeCount: Number(row.filtered_scope_count ?? 0), filteredPrivacyCount: Number(row.filtered_privacy_count ?? 0),
+        filteredStateCount: Number(row.filtered_state_count ?? 0), createdAt: row.created_at }));
   }
 
   listInjectionSnapshots(limit: number): Array<Record<string, unknown>> {
@@ -1893,9 +1945,13 @@ export class ObservationStore {
     const row = this.db.prepare(`SELECT COUNT(*) runs,
       SUM(CASE WHEN candidate_count=0 THEN 1 ELSE 0 END) zero_hits,
       SUM(candidate_count) candidates,SUM(eligible_count) eligible,
+      SUM(direct_hit_count) direct_hits,SUM(normalized_hit_count) normalized_hits,SUM(no_hit_count) no_hits,
+      SUM(filtered_scope_count) filtered_scope,SUM(filtered_privacy_count) filtered_privacy,SUM(filtered_state_count) filtered_state,
       COALESCE(AVG(latency_ms),0) avg_latency_ms FROM retrieval_runs`).get() as any;
     return { runs: Number(row.runs ?? 0), zeroHits: Number(row.zero_hits ?? 0), candidates: Number(row.candidates ?? 0),
-      eligible: Number(row.eligible ?? 0), avgLatencyMs: Math.round(Number(row.avg_latency_ms ?? 0)) };
+      eligible: Number(row.eligible ?? 0), directHits: Number(row.direct_hits ?? 0), normalizedHits: Number(row.normalized_hits ?? 0), noHits: Number(row.no_hits ?? 0),
+      filteredScope: Number(row.filtered_scope ?? 0), filteredPrivacy: Number(row.filtered_privacy ?? 0),
+      filteredState: Number(row.filtered_state ?? 0), avgLatencyMs: Math.round(Number(row.avg_latency_ms ?? 0)) };
   }
 
   retrievalRetentionPreview(cutoffIso: string): { cutoff: string; eligibleRuns: number } {
@@ -2018,6 +2074,23 @@ export class ObservationStore {
       if (!columns.has('effective_mode')) this.db.exec('ALTER TABLE prompt_injection_snapshots ADD COLUMN effective_mode TEXT;');
       this.db.exec(PHASE13_SCHEMA);
       this.db.exec('PRAGMA user_version=13;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  private migrateToPhase14(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 14) { this.db.exec('COMMIT;'); return; }
+      const columns = new Set((this.db.prepare('PRAGMA table_info(retrieval_runs)').all() as Array<{ name: string }>).map(row => row.name));
+      const add = (name: string, sql: string) => { if (!columns.has(name)) this.db.exec(sql); };
+      add('direct_hit_count', 'ALTER TABLE retrieval_runs ADD COLUMN direct_hit_count INTEGER NOT NULL DEFAULT 0;');
+      add('normalized_hit_count', 'ALTER TABLE retrieval_runs ADD COLUMN normalized_hit_count INTEGER NOT NULL DEFAULT 0;');
+      add('no_hit_count', 'ALTER TABLE retrieval_runs ADD COLUMN no_hit_count INTEGER NOT NULL DEFAULT 0;');
+      add('filtered_scope_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_scope_count INTEGER NOT NULL DEFAULT 0;');
+      add('filtered_privacy_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_privacy_count INTEGER NOT NULL DEFAULT 0;');
+      add('filtered_state_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_state_count INTEGER NOT NULL DEFAULT 0;');
+      this.db.exec('PRAGMA user_version=14;');
       this.db.exec('COMMIT;');
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }

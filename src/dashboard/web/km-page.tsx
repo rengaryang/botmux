@@ -25,7 +25,19 @@ type PipelineProfile = { profile: { profileId: string; revision: number; botAppI
 type ProviderConfig = { providerId: 'mem0' | 'hindsight' | 'openviking'; endpoint: string; credentialRef: string; enabled: boolean; realTransportEnabled: false; timeoutMs: number; updatedAt: string };
 type MemoryPolicyDecision = { decisionId: string; sourceEventId: string; memoryId?: string; policyVersion: string; disposition: string; reasonCodes: string[]; evidence: { claimKey?: string; subject?: string }; createdAt: string };
 type ConfigAudit = { auditId: string; actorId: string; action: string; targetRef: string; createdAt: string };
-type RetrievalQuality = { runs: number; zeroHits: number; candidates: number; eligible: number; avgLatencyMs: number };
+type RetrievalQuality = {
+  runs: number;
+  zeroHits: number;
+  candidates: number;
+  eligible: number;
+  directHits: number;
+  normalizedHits: number;
+  noHits: number;
+  filteredScope: number;
+  filteredPrivacy: number;
+  filteredState: number;
+  avgLatencyMs: number;
+};
 
 type ObservationEvent = {
   eventId: string;
@@ -196,6 +208,12 @@ function KmPage(): React.JSX.Element {
         <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
         <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
         <article><span>Retrieval 零命中</span><strong>{retrievalQuality ? `${retrievalQuality.zeroHits}/${retrievalQuality.runs}` : '—'}</strong></article>
+        <article><span>Retrieval 直接命中</span><strong>{retrievalQuality?.directHits ?? '—'}</strong></article>
+        <article><span>Retrieval 归一命中</span><strong>{retrievalQuality?.normalizedHits ?? '—'}</strong></article>
+        <article><span>Retrieval 未匹配</span><strong>{retrievalQuality?.noHits ?? '—'}</strong></article>
+        <article><span>Retrieval Scope 过滤</span><strong>{retrievalQuality?.filteredScope ?? '—'}</strong></article>
+        <article><span>Retrieval 隐私过滤</span><strong>{retrievalQuality?.filteredPrivacy ?? '—'}</strong></article>
+        <article><span>Retrieval 状态过滤</span><strong>{retrievalQuality?.filteredState ?? '—'}</strong></article>
         <article><span>Retrieval 均延迟</span><strong>{retrievalQuality ? `${retrievalQuality.avgLatencyMs}ms` : '—'}</strong></article>
       </section>
 

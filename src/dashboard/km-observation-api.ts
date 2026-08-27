@@ -16,6 +16,7 @@ export interface KmObservationApiStore {
   listMemory?(filter: Parameters<ObservationStore['listMemory']>[0]): ReturnType<ObservationStore['listMemory']>;
   transitionMemory?(input: Parameters<ObservationStore['transitionMemory']>[0]): ReturnType<ObservationStore['transitionMemory']>;
   retrieve?(query: Parameters<ObservationStore['retrieve']>[0]): ReturnType<ObservationStore['retrieve']>;
+  retrieveWithMetrics?(query: Parameters<ObservationStore['retrieveWithMetrics']>[0]): ReturnType<ObservationStore['retrieveWithMetrics']>;
   transitionKnowledge?(input: Parameters<ObservationStore['transitionKnowledge']>[0]): ReturnType<ObservationStore['transitionKnowledge']>;
   knowledgeExportDryRun?(knowledgeId: string): ReturnType<ObservationStore['knowledgeExportDryRun']>;
   listTrace?(input: Parameters<ObservationStore['listTrace']>[0]): ReturnType<ObservationStore['listTrace']>;
@@ -290,13 +291,15 @@ export async function handleKmObservationApi(
     }
 
     if (url.pathname === '/api/km/retrieve') {
-      if (!store.retrieve) throw new Error('km_retrieval_unavailable');
+      if (!store.retrieve && !store.retrieveWithMetrics) throw new Error('km_retrieval_unavailable');
       const limit = positiveInteger(url.searchParams.get('limit'), 20, 100);
       const text = url.searchParams.get('q') ?? '';
       const subject = url.searchParams.get('subject') ?? undefined;
       const scopes = url.searchParams.getAll('scope') as any[];
       const targetLayers = url.searchParams.getAll('targetLayer') as any[];
-      jsonRes(res, 200, { items: store.retrieve({ text, limit, ...(subject ? { subject } : {}), ...(scopes.length ? { scopes } : {}), ...(targetLayers.length ? { targetLayers } : {}) }) });
+      const query = { text, limit, ...(subject ? { subject } : {}), ...(scopes.length ? { scopes } : {}), ...(targetLayers.length ? { targetLayers } : {}) };
+      if (store.retrieveWithMetrics) jsonRes(res, 200, store.retrieveWithMetrics(query));
+      else jsonRes(res, 200, { items: store.retrieve!(query) });
       return true;
     }
 
