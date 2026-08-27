@@ -22028,7 +22028,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       .catch(error => logger.warn(`[km-distillation-recovery] ${error instanceof Error ? error.message : String(error)}`))
       .finally(() => { kmDistillationDraining = false; });
   };
-  drainKmDistillation();
+  // Startup jitter avoids migration stampedes; the durable SQLite lease in
+  // drainDistillationJobs elects one owner and allows failover across daemons.
+  const kmRecoveryStartupTimer = setTimeout(drainKmDistillation, 2_000 + idx * 750);
+  kmRecoveryStartupTimer.unref?.();
   const kmDistillationRecoveryTimer = setInterval(drainKmDistillation, 30_000);
   kmDistillationRecoveryTimer.unref?.();
 
@@ -22895,6 +22898,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
+    if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
     clearInterval(kmDistillationRecoveryTimer);
     clearInterval(docCommentPollTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
@@ -23126,6 +23130,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   process.on('exit', () => {
     setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
+    if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
     clearInterval(kmDistillationRecoveryTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);

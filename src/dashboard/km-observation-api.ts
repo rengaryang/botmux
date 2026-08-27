@@ -37,6 +37,7 @@ export interface KmObservationApiStore {
     { statusCode: number; response: T; replayed: boolean };
   listKmConfigAudit?(limit: number): ReturnType<ObservationStore['listKmConfigAudit']>;
   listMemoryPolicyDecisions?(limit: number): ReturnType<ObservationStore['listMemoryPolicyDecisions']>;
+  retrievalQualitySummary?(): ReturnType<ObservationStore['retrievalQualitySummary']>;
   close(): void;
 }
 
@@ -94,6 +95,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/provider-configs'
     || url.pathname === '/api/km/config-audit'
     || url.pathname === '/api/km/memory-policy-decisions'
+    || url.pathname === '/api/km/retrieval/quality'
     || /^\/api\/km\/provider-configs\/[^/]+\/health$/.test(url.pathname)
     || /^\/api\/km\/profiles\/[^/]+\/\d+\/state$/.test(url.pathname)
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
@@ -128,7 +130,8 @@ export async function handleKmObservationApi(
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
       const state = String(body.state); if (!['draft','shadow','retired'].includes(state)) throw new KmApiError(422, 'km_profile_mode_not_open');
       executeMutation(ctx, 200, 'profile.state_changed', `${decodeURIComponent(profileState[1])}@${profileState[2]}`,
-        () => store!.setPipelineProfileState!({ profileId: decodeURIComponent(profileState[1]), revision: Number(profileState[2]), state: state as any })); return true;
+        () => store!.setPipelineProfileState!({ profileId: decodeURIComponent(profileState[1]), revision: Number(profileState[2]),
+          state: state as any, expectedHash: typeof body.expectedHash === 'string' ? body.expectedHash : undefined })); return true;
     }
 
     if (url.pathname === '/api/km/profiles' && req.method === 'POST') {
@@ -187,6 +190,10 @@ export async function handleKmObservationApi(
       return true;
     }
 
+    if (url.pathname === '/api/km/retrieval/quality') {
+      if (!store.retrievalQualitySummary) throw new Error('km_retrieval_quality_unavailable');
+      jsonRes(res, 200, store.retrievalQualitySummary()); return true;
+    }
     if (url.pathname === '/api/km/config-audit') {
       if (!store.listKmConfigAudit) throw new Error('km_config_audit_unavailable');
       jsonRes(res, 200, { items: store.listKmConfigAudit(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;

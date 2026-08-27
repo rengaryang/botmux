@@ -25,6 +25,7 @@ type PipelineProfile = { profile: { profileId: string; revision: number; botAppI
 type ProviderConfig = { providerId: 'mem0' | 'hindsight' | 'openviking'; endpoint: string; credentialRef: string; enabled: boolean; realTransportEnabled: false; timeoutMs: number; updatedAt: string };
 type MemoryPolicyDecision = { decisionId: string; sourceEventId: string; memoryId?: string; policyVersion: string; disposition: string; reasonCodes: string[]; evidence: { claimKey?: string; subject?: string }; createdAt: string };
 type ConfigAudit = { auditId: string; actorId: string; action: string; targetRef: string; createdAt: string };
+type RetrievalQuality = { runs: number; zeroHits: number; candidates: number; eligible: number; avgLatencyMs: number };
 
 type ObservationEvent = {
   eventId: string;
@@ -66,6 +67,7 @@ function KmPage(): React.JSX.Element {
   const [health, setHealth] = useState<Health>();
   const [events, setEvents] = useState<ObservationEvent[]>([]);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [typeFilter, setTypeFilter] = useState<string>('');
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
   const [memory, setMemory] = useState<MemoryItem[]>([]);
@@ -83,6 +85,7 @@ function KmPage(): React.JSX.Element {
   const [providerConfigs, setProviderConfigs] = useState<ProviderConfig[]>([]);
   const [policyDecisions, setPolicyDecisions] = useState<MemoryPolicyDecision[]>([]);
   const [configAudit, setConfigAudit] = useState<ConfigAudit[]>([]);
+  const [retrievalQuality, setRetrievalQuality] = useState<RetrievalQuality>();
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
@@ -90,7 +93,7 @@ function KmPage(): React.JSX.Element {
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, policyDecisionList, configAuditList] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, policyDecisionList, configAuditList, quality] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -106,6 +109,7 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: ProviderConfig[] }>('/api/km/provider-configs'),
         getJson<{ items: MemoryPolicyDecision[] }>('/api/km/memory-policy-decisions?limit=20'),
         getJson<{ items: ConfigAudit[] }>('/api/km/config-audit?limit=20'),
+        getJson<RetrievalQuality>('/api/km/retrieval/quality'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -116,7 +120,7 @@ function KmPage(): React.JSX.Element {
       setSyncStatus(syncList.items);
       setProviders(providerList.items); setJobs(jobList.items); setRetrievals(retrievalList.items); setInjections(injectionList.items);
       setProfiles(profileList.items); setProviderConfigs(providerConfigList.items);
-      setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items);
+      setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items); setRetrievalQuality(quality);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -140,20 +144,22 @@ function KmPage(): React.JSX.Element {
         memoryBackends: { writePolicy: 'primary-mirror', primary: profileForm.primary,
           mirrors: profileForm.mirrors.split(',').map(value => value.trim()).filter(Boolean) }, injectionMode: profileForm.injectionMode,
         budgets: { sourceBytes: 262144, sourceTokens: 32000, outputClaims: 20, promptTokens: profileForm.promptTokens } };
-      await mutateJson('/api/km/profiles', 'POST', { profile, state: 'draft' }); await load();
+      await mutateJson('/api/km/profiles', 'POST', { profile, state: 'draft' }); setNotice('Profile Draft 已保存'); await load();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const changeProfileState = async (entry: PipelineProfile, state: string) => {
-    try { await mutateJson(`/api/km/profiles/${encodeURIComponent(entry.profile.profileId)}/${entry.profile.revision}/state`, 'PATCH', { state }); await load(); }
+    if (!window.confirm(`确认将 ${entry.profile.profileId}@${entry.profile.revision} 从 ${entry.state} 切换为 ${state}？`)) return;
+    try { await mutateJson(`/api/km/profiles/${encodeURIComponent(entry.profile.profileId)}/${entry.profile.revision}/state`, 'PATCH',
+      { state, expectedHash: entry.profileHash }); setNotice(`Profile 已切换为 ${state}`); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const saveProvider = async () => {
-    try { await mutateJson('/api/km/provider-configs', 'PUT', { ...providerForm, realTransportEnabled: false }); await load(); }
+    try { await mutateJson('/api/km/provider-configs', 'PUT', { ...providerForm, realTransportEnabled: false }); setNotice('Provider 配置已保存，真实 transport 仍关闭'); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const checkProvider = async (providerId: string) => {
     try { const result = await mutateJson<Record<string, unknown>>(`/api/km/provider-configs/${encodeURIComponent(providerId)}/health`, 'POST', {});
-      setError(`配置检查：${providerId} = ${String(result.status)}（未发网络请求）`); }
+      setNotice(`配置检查：${providerId} = ${String(result.status)}（未发网络请求）`); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
 
@@ -169,6 +175,7 @@ function KmPage(): React.JSX.Element {
         </div>
       </header>
       {error && <p className="error-banner">{error}</p>}
+      {notice && <p style={{ color: 'var(--success, #248a3d)' }}>{notice}</p>}
 
       <section className="feedback-kpis">
         <article><span>观测事件</span><strong>{health?.counts.observations ?? '—'}</strong></article>
@@ -180,6 +187,8 @@ function KmPage(): React.JSX.Element {
         <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
         <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
         <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
+        <article><span>Retrieval 零命中</span><strong>{retrievalQuality ? `${retrievalQuality.zeroHits}/${retrievalQuality.runs}` : '—'}</strong></article>
+        <article><span>Retrieval 均延迟</span><strong>{retrievalQuality ? `${retrievalQuality.avgLatencyMs}ms` : '—'}</strong></article>
       </section>
 
       <section className="panel">

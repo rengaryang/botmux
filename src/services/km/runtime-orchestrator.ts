@@ -114,15 +114,25 @@ export async function runOneDistillationJob(input: { dataDir: string; cliId?: st
   } finally { store.close(); }
 }
 
-export async function drainDistillationJobs(input: { dataDir: string; cliId?: string; model?: string; piBin?: string; maxJobs?: number }): Promise<number> {
+export async function drainDistillationJobs(input: { dataDir: string; cliId?: string; model?: string; piBin?: string; maxJobs?: number; holderId?: string }): Promise<number> {
   if (!isKmAutoDistillationEnabled()) return 0;
+  const holderId = input.holderId ?? `pid:${process.pid}`; const leaseStore = await ObservationStore.open(input.dataDir);
+  let acquired = false;
+  try { acquired = leaseStore.acquireRuntimeLease({ leaseName: 'distillation-recovery', holderId, ttlMs: 45_000 }); }
+  finally { leaseStore.close(); }
+  if (!acquired) return 0;
   const max = Math.max(1, Math.min(input.maxJobs ?? 10, 100)); let processed = 0;
-  while (processed < max) {
-    const result = await runOneDistillationJob(input);
-    if (result === 'idle') break;
-    processed += 1;
+  try {
+    while (processed < max) {
+      const result = await runOneDistillationJob(input);
+      if (result === 'idle') break;
+      processed += 1;
+    }
+    return processed;
+  } finally {
+    const releaseStore = await ObservationStore.open(input.dataDir);
+    try { releaseStore.releaseRuntimeLease({ leaseName: 'distillation-recovery', holderId }); } finally { releaseStore.close(); }
   }
-  return processed;
 }
 
 export async function runRetrievalShadow(input: { dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string }): Promise<void> {
