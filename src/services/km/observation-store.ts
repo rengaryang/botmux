@@ -1,15 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { KmPipelineProfileSchema, KmProviderDescriptorSchema, type KmPipelineProfile, type KmProviderDescriptor } from './provider-spi.js';
+import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema, KmProviderDescriptorSchema, type KmMemoryProviderConfig, type KmPipelineProfile, type KmProviderDescriptor } from './provider-spi.js';
 import {
   ObservationEventSchema,
   type ObservationEvent,
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -150,6 +150,13 @@ const PHASE8_SCHEMA = `
     migration_id TEXT PRIMARY KEY, bot_app_id TEXT NOT NULL, from_profile_json TEXT NOT NULL CHECK(json_valid(from_profile_json)),
     to_profile_json TEXT NOT NULL CHECK(json_valid(to_profile_json)), state TEXT NOT NULL CHECK(state IN ('draft','backfilling','comparing','ready','cutover','rolled_back','failed')),
     checkpoint TEXT, stats_json TEXT NOT NULL CHECK(json_valid(stats_json)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
+`;
+
+const PHASE10_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_memory_provider_configs (
+    provider_id TEXT PRIMARY KEY, config_json TEXT NOT NULL CHECK(json_valid(config_json)),
+    config_hash TEXT NOT NULL, updated_at TEXT NOT NULL
   );
 `;
 
@@ -566,6 +573,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 7) this.migrateToPhase7();
     if (this.schemaVersion() < 8) this.migrateToPhase8();
     if (this.schemaVersion() < 9) this.migrateToPhase9();
+    if (this.schemaVersion() < 10) this.migrateToPhase10();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -1286,6 +1294,60 @@ export class ObservationStore {
     return hash;
   }
 
+  listPipelineProfiles(botAppId?: string): Array<Record<string, unknown>> {
+    const rows = (botAppId
+      ? this.db.prepare(`SELECT * FROM km_pipeline_profiles WHERE bot_app_id=? ORDER BY created_at DESC`).all(botAppId)
+      : this.db.prepare(`SELECT * FROM km_pipeline_profiles ORDER BY created_at DESC`).all()) as any[];
+    return rows.map(row => ({ profile: KmPipelineProfileSchema.parse(JSON.parse(row.profile_json)), profileHash: row.profile_hash,
+      state: row.state, createdAt: row.created_at }));
+  }
+
+  setPipelineProfileState(input: { profileId: string; revision: number; state: 'draft' | 'shadow' | 'active' | 'retired' }): Record<string, unknown> {
+    const row = this.db.prepare(`SELECT bot_app_id FROM km_pipeline_profiles WHERE profile_id=? AND revision=?`).get(input.profileId, input.revision) as any;
+    if (!row) throw new Error('km_pipeline_profile_not_found');
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (input.state === 'active') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='active'`).run(row.bot_app_id);
+      this.db.prepare(`UPDATE km_pipeline_profiles SET state=? WHERE profile_id=? AND revision=?`).run(input.state, input.profileId, input.revision);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+    return this.listPipelineProfiles(row.bot_app_id).find(value => (value.profile as KmPipelineProfile).profileId === input.profileId
+      && (value.profile as KmPipelineProfile).revision === input.revision)!;
+  }
+
+  getEffectivePipelineProfile(botAppId: string): KmPipelineProfile | undefined {
+    const row = this.db.prepare(`SELECT profile_json FROM km_pipeline_profiles WHERE bot_app_id=? AND state IN ('active','shadow')
+      ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1`).get(botAppId) as any;
+    return row ? KmPipelineProfileSchema.parse(JSON.parse(row.profile_json)) : undefined;
+  }
+
+  putMemoryProviderConfig(input: KmMemoryProviderConfig): string {
+    const config = KmMemoryProviderConfigSchema.parse(input);
+    const json = JSON.stringify(config); const hash = sha256(json);
+    this.db.prepare(`INSERT INTO km_memory_provider_configs(provider_id,config_json,config_hash,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(provider_id) DO UPDATE SET config_json=excluded.config_json,config_hash=excluded.config_hash,updated_at=excluded.updated_at`)
+      .run(config.providerId, json, hash, new Date().toISOString());
+    return hash;
+  }
+
+  listMemoryProviderConfigs(): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT provider_id,config_json,config_hash,updated_at FROM km_memory_provider_configs ORDER BY provider_id`).all() as any[])
+      .map(row => { const config = KmMemoryProviderConfigSchema.parse(JSON.parse(row.config_json)); return {
+        ...config, credentialRef: config.credentialRef.replace(/^(env|file):(.+)$/, (_m, kind) => `${kind}:***`),
+        configHash: row.config_hash, updatedAt: row.updated_at,
+      }; });
+  }
+
+  memoryProviderConfigurationHealth(providerId: string, env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+    const row = this.db.prepare(`SELECT config_json,updated_at FROM km_memory_provider_configs WHERE provider_id=?`).get(providerId) as any;
+    if (!row) throw new Error('km_memory_provider_config_not_found');
+    const config = KmMemoryProviderConfigSchema.parse(JSON.parse(row.config_json));
+    const [kind, value] = config.credentialRef.split(':', 2);
+    const credentialAvailable = kind === 'env' ? Boolean(env[value]?.trim()) : kind === 'file' ? existsSync(value) : false;
+    return { providerId: config.providerId, status: !config.enabled ? 'disabled' : credentialAvailable ? 'configuration_ready' : 'credential_missing',
+      endpointValid: true, credentialAvailable, transportChecked: false, realTransportEnabled: false, updatedAt: row.updated_at };
+  }
+
   createDistillationJob(input: { sourceEventId: string; profile: KmPipelineProfile; evidenceContext?: Record<string, unknown>; now?: number }): { jobId: string; created: boolean } {
     const profile = KmPipelineProfileSchema.parse(input.profile);
     const profileJson = JSON.stringify(profile);
@@ -1434,6 +1496,16 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase10(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 10) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE10_SCHEMA);
+      this.db.exec('PRAGMA user_version=10;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
   private migrateToPhase9(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -1542,6 +1614,7 @@ export class ObservationStore {
       'retrieval_runs',
       'retrieval_results',
       'prompt_injection_snapshots',
+      'km_memory_provider_configs',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

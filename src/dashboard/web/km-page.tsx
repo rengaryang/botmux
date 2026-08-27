@@ -18,6 +18,8 @@ type ProviderStatus = { providerId: string; kind: string; version: string; statu
 type DistillationJob = { jobId: string; state: string; botAppId: string; profileId: string; attempts: number; lastError?: string };
 type RetrievalAudit = { retrievalRunId: string; botAppId: string; mode: string; candidateCount: number; eligibleCount: number; latencyMs: number };
 type InjectionSnapshot = { snapshotId: string; botAppId: string; mode: string; disposition: string; itemIds: string[]; promptBytes: number };
+type PipelineProfile = { profile: { profileId: string; revision: number; botAppId: string; injectionMode: 'off' | 'shadow' | 'canary' | 'active'; memoryBackends: { writePolicy: string; primary: string; mirrors: string[] }; budgets: { promptTokens: number } }; state: string; profileHash: string; createdAt: string };
+type ProviderConfig = { providerId: 'mem0' | 'hindsight' | 'openviking'; endpoint: string; credentialRef: string; enabled: boolean; realTransportEnabled: false; timeoutMs: number; updatedAt: string };
 
 type ObservationEvent = {
   eventId: string;
@@ -35,6 +37,13 @@ const FUNNEL_STAGES = ['skill.manifest.resolved', 'skill.invoked', 'skill.comple
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(path);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<T>;
+}
+
+async function mutateJson<T>(path: string, method: 'POST' | 'PUT' | 'PATCH', body: unknown): Promise<T> {
+  const response = await fetch(path, { method, headers: { 'content-type': 'application/json',
+    'x-km-actor-id': 'dashboard-user', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;
 }
@@ -65,11 +74,16 @@ function KmPage(): React.JSX.Element {
   const [jobs, setJobs] = useState<DistillationJob[]>([]);
   const [retrievals, setRetrievals] = useState<RetrievalAudit[]>([]);
   const [injections, setInjections] = useState<InjectionSnapshot[]>([]);
+  const [profiles, setProfiles] = useState<PipelineProfile[]>([]);
+  const [providerConfigs, setProviderConfigs] = useState<ProviderConfig[]>([]);
+  const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
+    primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
+  const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -81,6 +95,8 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: DistillationJob[] }>('/api/km/distillation/jobs?limit=20'),
         getJson<{ items: RetrievalAudit[] }>('/api/km/retrieval/runs?limit=20'),
         getJson<{ items: InjectionSnapshot[] }>('/api/km/injections?limit=20'),
+        getJson<{ items: PipelineProfile[] }>('/api/km/profiles'),
+        getJson<{ items: ProviderConfig[] }>('/api/km/provider-configs'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -90,6 +106,7 @@ function KmPage(): React.JSX.Element {
       setProposals(proposalList.items);
       setSyncStatus(syncList.items);
       setProviders(providerList.items); setJobs(jobList.items); setRetrievals(retrievalList.items); setInjections(injectionList.items);
+      setProfiles(profileList.items); setProviderConfigs(providerConfigList.items);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -103,6 +120,31 @@ function KmPage(): React.JSX.Element {
       const result = await getJson<{ items: TraceEdge[] }>(`/api/km/trace?type=${encodeURIComponent(traceType)}&id=${encodeURIComponent(traceId)}&limit=100`);
       setTraceEdges(result.items);
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+
+  const saveProfile = async () => {
+    try {
+      const profile = { schemaVersion: 1, profileId: profileForm.profileId || `bot-${profileForm.botAppId}`, revision: profileForm.revision,
+        botAppId: profileForm.botAppId, sourceProvider: 'observation-source-v1', windowProvider: 'bounded-transcript-window-v1',
+        primaryExtractor: 'builtin.rules-v1', shadowExtractors: [], knowledgeRouter: 'builtin.layer-router-v1', memoryPolicy: 'safe-auto-activation-v1',
+        memoryBackends: { writePolicy: 'primary-mirror', primary: profileForm.primary,
+          mirrors: profileForm.mirrors.split(',').map(value => value.trim()).filter(Boolean) }, injectionMode: profileForm.injectionMode,
+        budgets: { sourceBytes: 262144, sourceTokens: 32000, outputClaims: 20, promptTokens: profileForm.promptTokens } };
+      await mutateJson('/api/km/profiles', 'POST', { profile, state: 'draft' }); await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const changeProfileState = async (entry: PipelineProfile, state: string) => {
+    try { await mutateJson(`/api/km/profiles/${encodeURIComponent(entry.profile.profileId)}/${entry.profile.revision}/state`, 'PATCH', { state }); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const saveProvider = async () => {
+    try { await mutateJson('/api/km/provider-configs', 'PUT', { ...providerForm, realTransportEnabled: false }); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const checkProvider = async (providerId: string) => {
+    try { const result = await mutateJson<Record<string, unknown>>(`/api/km/provider-configs/${encodeURIComponent(providerId)}/health`, 'POST', {});
+      setError(`配置检查：${providerId} = ${String(result.status)}（未发网络请求）`); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
 
   const funnel = funnelCounts(events);
@@ -163,6 +205,45 @@ function KmPage(): React.JSX.Element {
           {evalRuns.map(run => <div key={run.evalRunId}><code>{run.evaluatorName}</code><span>{run.targetType}:{run.targetId}</span><span>pass {run.passCount} · warn {run.warnCount}</span><b>fail {run.failCount}</b></div>)}
           {proposals.map(proposal => <div key={proposal.proposalId}><code>{proposal.proposalType}</code><span>{proposal.summary}</span><span>{proposal.targetRef}</span><b>{proposal.approvalGrade} · {proposal.state}</b></div>)}
           {traceEdges.length + evalRuns.length + proposals.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Trace、Eval 或 Evolution 数据。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Memory Settings（真实 Transport 默认禁用）</h2>
+        <h3>Bot Pipeline Profile</h3>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+          <input value={profileForm.botAppId} onChange={e => setProfileForm({ ...profileForm, botAppId: e.target.value })} placeholder="Bot App ID" />
+          <input value={profileForm.profileId} onChange={e => setProfileForm({ ...profileForm, profileId: e.target.value })} placeholder="Profile ID（可选）" />
+          <input type="number" min="1" value={profileForm.revision} onChange={e => setProfileForm({ ...profileForm, revision: Number(e.target.value) })} title="Revision" />
+          <select value={profileForm.injectionMode} onChange={e => setProfileForm({ ...profileForm, injectionMode: e.target.value as typeof profileForm.injectionMode })}>
+            <option value="off">off</option><option value="shadow">shadow</option><option value="canary">canary</option><option value="active">active</option>
+          </select>
+          <input value={profileForm.primary} onChange={e => setProfileForm({ ...profileForm, primary: e.target.value })} placeholder="Primary backend" />
+          <input value={profileForm.mirrors} onChange={e => setProfileForm({ ...profileForm, mirrors: e.target.value })} placeholder="Mirrors，逗号分隔" />
+          <input type="number" min="1" max="8000" value={profileForm.promptTokens} onChange={e => setProfileForm({ ...profileForm, promptTokens: Number(e.target.value) })} title="Prompt token budget" />
+          <button disabled={!profileForm.botAppId.trim()} onClick={() => void saveProfile()}>保存 Draft</button>
+        </div>
+        <div className="feedback-deliveries">
+          {profiles.map(entry => <div key={`${entry.profile.profileId}@${entry.profile.revision}`}><code>{entry.state}</code>
+            <span>{entry.profile.botAppId} · {entry.profile.profileId}@{entry.profile.revision}</span>
+            <span>{entry.profile.memoryBackends.primary} + {entry.profile.memoryBackends.mirrors.join(', ')} · {entry.profile.injectionMode}</span>
+            <b><button onClick={() => void changeProfileState(entry, 'shadow')}>Shadow</button>{' '}<button onClick={() => void changeProfileState(entry, 'active')}>Activate</button>{' '}<button onClick={() => void changeProfileState(entry, 'retired')}>Retire</button></b>
+          </div>)}
+        </div>
+        <h3>External Provider Connection</h3>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+          <select value={providerForm.providerId} onChange={e => setProviderForm({ ...providerForm, providerId: e.target.value as ProviderConfig['providerId'] })}>
+            <option value="mem0">Mem0</option><option value="hindsight">Hindsight</option><option value="openviking">OpenViking</option>
+          </select>
+          <input value={providerForm.endpoint} onChange={e => setProviderForm({ ...providerForm, endpoint: e.target.value })} placeholder="https://endpoint" />
+          <input value={providerForm.credentialRef} onChange={e => setProviderForm({ ...providerForm, credentialRef: e.target.value })} placeholder="env:API_KEY" />
+          <input type="number" min="100" max="30000" value={providerForm.timeoutMs} onChange={e => setProviderForm({ ...providerForm, timeoutMs: Number(e.target.value) })} title="Timeout ms" />
+          <label><input type="checkbox" checked={providerForm.enabled} onChange={e => setProviderForm({ ...providerForm, enabled: e.target.checked })} /> Enabled</label>
+          <button disabled={!providerForm.endpoint.trim()} onClick={() => void saveProvider()}>保存连接配置</button>
+        </div>
+        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>只保存 endpoint 与 credential reference；不保存密钥，不发网络请求，realTransportEnabled 固定为 false。</p>
+        <div className="feedback-deliveries">
+          {providerConfigs.map(config => <div key={config.providerId}><code>{config.providerId}</code><span>{config.endpoint}</span><span>{config.credentialRef} · {config.timeoutMs}ms</span><b>{config.enabled ? 'configured' : 'disabled'} / transport off <button onClick={() => void checkProvider(config.providerId)}>检查</button></b></div>)}
         </div>
       </section>
 

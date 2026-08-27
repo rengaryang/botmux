@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { jsonRes } from './http.js';
 import { ObservationEventTypeSchema } from '../services/km/observation-schema.js';
+import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema } from '../services/km/provider-spi.js';
 import type { ObservationStore } from '../services/km/observation-store.js';
 
 export interface KmObservationApiStore {
@@ -23,12 +24,28 @@ export interface KmObservationApiStore {
   listDistillationJobs?(limit: number): ReturnType<ObservationStore['listDistillationJobs']>;
   listRetrievalAudits?(limit: number): ReturnType<ObservationStore['listRetrievalAudits']>;
   listInjectionSnapshots?(limit: number): ReturnType<ObservationStore['listInjectionSnapshots']>;
+  listPipelineProfiles?(botAppId?: string): ReturnType<ObservationStore['listPipelineProfiles']>;
+  putPipelineProfile?(profile: Parameters<ObservationStore['putPipelineProfile']>[0], state?: Parameters<ObservationStore['putPipelineProfile']>[1]): ReturnType<ObservationStore['putPipelineProfile']>;
+  setPipelineProfileState?(input: Parameters<ObservationStore['setPipelineProfileState']>[0]): ReturnType<ObservationStore['setPipelineProfileState']>;
+  listMemoryProviderConfigs?(): ReturnType<ObservationStore['listMemoryProviderConfigs']>;
+  putMemoryProviderConfig?(input: Parameters<ObservationStore['putMemoryProviderConfig']>[0]): ReturnType<ObservationStore['putMemoryProviderConfig']>;
+  memoryProviderConfigurationHealth?(providerId: string): ReturnType<ObservationStore['memoryProviderConfigurationHealth']>;
   close(): void;
 }
 
 export interface KmObservationApiDeps {
   enabled: boolean;
   openStore(): Promise<KmObservationApiStore>;
+}
+
+async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+}
+
+function requireMutationHeaders(req: IncomingMessage): void {
+  if (typeof req.headers['x-km-actor-id'] !== 'string' || !req.headers['x-km-actor-id']!.trim()) throw new Error('reviewer_actor_required');
+  if (typeof req.headers['idempotency-key'] !== 'string' || !req.headers['idempotency-key']!.trim()) throw new Error('idempotency_key_required');
 }
 
 function positiveInteger(raw: string | null, fallback: number, max: number): number {
@@ -60,6 +77,10 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/distillation/jobs'
     || url.pathname === '/api/km/retrieval/runs'
     || url.pathname === '/api/km/injections'
+    || url.pathname === '/api/km/profiles'
+    || url.pathname === '/api/km/provider-configs'
+    || /^\/api\/km\/provider-configs\/[^/]+\/health$/.test(url.pathname)
+    || /^\/api\/km\/profiles\/[^/]+\/\d+\/state$/.test(url.pathname)
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
   if (!kmReadPath) return false;
   if (!deps.enabled) {
@@ -69,6 +90,36 @@ export async function handleKmObservationApi(
   let store: KmObservationApiStore | undefined;
   try {
     store = await deps.openStore();
+    const providerHealth = url.pathname.match(/^\/api\/km\/provider-configs\/([^/]+)\/health$/);
+    if (providerHealth) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.memoryProviderConfigurationHealth) throw new Error('km_provider_configs_unavailable');
+      requireMutationHeaders(req);
+      jsonRes(res, 200, store.memoryProviderConfigurationHealth(decodeURIComponent(providerHealth[1]))); return true;
+    }
+
+    const profileState = url.pathname.match(/^\/api\/km\/profiles\/([^/]+)\/(\d+)\/state$/);
+    if (profileState) {
+      if (req.method !== 'PATCH') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.setPipelineProfileState) throw new Error('km_profiles_unavailable');
+      requireMutationHeaders(req); const body = await readBody(req);
+      jsonRes(res, 200, store.setPipelineProfileState({ profileId: decodeURIComponent(profileState[1]), revision: Number(profileState[2]),
+        state: String(body.state) as 'draft' | 'shadow' | 'active' | 'retired' })); return true;
+    }
+
+    if (url.pathname === '/api/km/profiles' && req.method === 'POST') {
+      if (!store.putPipelineProfile) throw new Error('km_profiles_unavailable');
+      requireMutationHeaders(req); const body = await readBody(req);
+      const profile = KmPipelineProfileSchema.parse(body.profile); const state = String(body.state ?? 'draft') as 'draft' | 'shadow' | 'active';
+      const profileHash = store.putPipelineProfile(profile, state); jsonRes(res, 201, { profile, state, profileHash }); return true;
+    }
+
+    if (url.pathname === '/api/km/provider-configs' && req.method === 'PUT') {
+      if (!store.putMemoryProviderConfig) throw new Error('km_provider_configs_unavailable');
+      requireMutationHeaders(req); const config = KmMemoryProviderConfigSchema.parse(await readBody(req));
+      jsonRes(res, 200, { providerId: config.providerId, configHash: store.putMemoryProviderConfig(config), realTransportEnabled: false }); return true;
+    }
+
     const transition = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/state$/);
     if (transition) {
       if (req.method !== 'PATCH') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
@@ -118,6 +169,14 @@ export async function handleKmObservationApi(
       return true;
     }
 
+    if (url.pathname === '/api/km/profiles') {
+      if (!store.listPipelineProfiles) throw new Error('km_profiles_unavailable');
+      jsonRes(res, 200, { items: store.listPipelineProfiles(url.searchParams.get('botAppId') ?? undefined) }); return true;
+    }
+    if (url.pathname === '/api/km/provider-configs') {
+      if (!store.listMemoryProviderConfigs) throw new Error('km_provider_configs_unavailable');
+      jsonRes(res, 200, { items: store.listMemoryProviderConfigs() }); return true;
+    }
     if (url.pathname === '/api/km/providers') {
       if (!store.listKmProviders) throw new Error('km_providers_unavailable');
       jsonRes(res, 200, { items: store.listKmProviders() }); return true;

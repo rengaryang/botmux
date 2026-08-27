@@ -25,15 +25,24 @@ describe('KM provider SPI and durable distillation', () => {
     expect(KmProviderDescriptorSchema.parse({ id: 'mem0', kind: 'memory-backend', version: '1', contractVersion: 1,
       capabilities: ['put', 'retrieve'], execution: 'service', deterministic: false, supportsShadow: true, maxBatchSize: 50 }).id).toBe('mem0');
     expect(KmPipelineProfileSchema.parse(profile).botAppId).toBe('bot-1');
+    expect(() => KmProviderDescriptorSchema.parse({})).toThrow();
     expect(() => KmPipelineProfileSchema.parse({ ...profile, shadowExtractors: [profile.primaryExtractor] })).toThrow(/primary cannot also be shadow/);
   });
 
   it('persists provider/profile and claims a snapshot-stable job idempotently', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(9);
+    expect(store.schemaVersion()).toBe(10);
     store.registerKmProvider({ id: 'botmux-cli:pi:default', kind: 'extractor', version: '1', contractVersion: 1,
       capabilities: ['strict-json'], execution: 'botmux-cli', deterministic: false, supportsShadow: true, maxBatchSize: 1 });
     expect(store.putPipelineProfile(profile, 'active')).toMatch(/^sha256:/);
+    expect(store.listPipelineProfiles('bot-1')).toEqual([expect.objectContaining({ state: 'active', profile })]);
+    expect(store.getEffectivePipelineProfile('bot-1')).toEqual(profile);
+    store.putMemoryProviderConfig({ providerId: 'mem0', endpoint: 'https://memory.example.test', credentialRef: 'env:MEM0_API_KEY',
+      enabled: true, realTransportEnabled: false, timeoutMs: 5000 });
+    expect(store.listMemoryProviderConfigs()).toEqual([expect.objectContaining({ providerId: 'mem0', credentialRef: 'env:***',
+      enabled: true, realTransportEnabled: false })]);
+    expect(store.memoryProviderConfigurationHealth('mem0', {})).toEqual(expect.objectContaining({ status: 'credential_missing',
+      transportChecked: false, realTransportEnabled: false }));
     const first = store.createDistillationJob({ sourceEventId: 'evt-1', profile, now: 1000 });
     expect(first.created).toBe(true);
     expect(store.createDistillationJob({ sourceEventId: 'evt-1', profile, now: 1000 })).toEqual({ jobId: first.jobId, created: false });
@@ -42,6 +51,7 @@ describe('KM provider SPI and durable distillation', () => {
     expect(claimed?.profile).toEqual(profile);
     store.finishDistillationJob({ jobId: first.jobId, claimToken: claimed!.claimToken, outputHash: `sha256:${'a'.repeat(64)}` });
     expect(store.claimDistillationJob({ now: 1000 })).toBeNull();
+    expect(store.setPipelineProfileState({ profileId: 'default', revision: 1, state: 'retired' })).toEqual(expect.objectContaining({ state: 'retired' }));
     store.close();
   });
 
