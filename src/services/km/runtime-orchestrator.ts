@@ -11,6 +11,8 @@ import { runCliDistillation } from './cli-distillation-runner.js';
 import { decideSafeMemoryActivation } from './safe-memory-policy.js';
 import { extractAttributedUserEvidence, extractExplicitPreferences } from './preference-extractor.js';
 import { planPromptMemory, retrievalQueryHash, type PromptMemoryCandidate } from './prompt-memory.js';
+import { federatedMemoryRetrieveWithTelemetry } from './memory-backend-coordinator.js';
+import type { MemoryBackendProvider } from './memory-backend-spi.js';
 
 function envOn(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
   return ['1', 'true', 'yes'].includes(env[name]?.trim().toLowerCase() ?? '');
@@ -18,6 +20,7 @@ function envOn(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
 export function isKmAutoDistillationEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_AUTO_DISTILLATION_ENABLED', env); }
 export function isKmPiShadowEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_PI_SHADOW_ENABLED', env); }
 export function isKmRetrievalShadowEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED', env); }
+export function isKmFederatedRetrievalEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_FEDERATED_RETRIEVAL_ENABLED', env); }
 
 export function defaultShadowProfile(botAppId: string, cliId = 'pi', model?: string): KmPipelineProfile {
   return {
@@ -135,8 +138,11 @@ export async function drainDistillationJobs(input: { dataDir: string; cliId?: st
   }
 }
 
-export async function runRetrievalShadow(input: { dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string }): Promise<void> {
-  if (!isKmRetrievalShadowEnabled()) return;
+export async function runRetrievalShadow(input: {
+  dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string;
+  providers?: MemoryBackendProvider[]; env?: NodeJS.ProcessEnv; providerTimeoutMs?: number;
+}): Promise<void> {
+  if (!isKmRetrievalShadowEnabled(input.env)) return;
   const started = Date.now(); const store = await ObservationStore.open(input.dataDir);
   try {
     const profile = store.getEffectivePipelineProfile(input.botAppId);
@@ -144,6 +150,20 @@ export async function runRetrievalShadow(input: { dataDir: string; botAppId: str
     const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'], subject: input.userId, limit: 50 });
     const candidates: PromptMemoryCandidate[] = raw.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
       ...(item.kind === 'memory' ? { scope: 'user', subject: input.userId } : {}), providerIds: ['sqlite'] }));
+    const warnings: string[] = [];
+    if (isKmFederatedRetrievalEnabled(input.env) && input.providers?.length) {
+      const remote = await federatedMemoryRetrieveWithTelemetry({ providers: input.providers,
+        query: { text: input.queryText, scopes: ['user', 'bot'], subject: input.userId, limit: 50, botAppId: input.botAppId },
+        limit: 50, timeoutMs: input.providerTimeoutMs });
+      warnings.push(...remote.warnings.map(warning => `federated_${warning}`));
+      for (const item of remote.items) candidates.push({ id: item.memoryId ?? `${item.providerId}:${item.backendRef}`, kind: 'memory',
+        title: item.metadata?.title ? String(item.metadata.title) : item.backendRef, text: item.text, score: item.fusedScore,
+        sourceRefs: [{ kind: 'memory-backend', ref: item.backendRef, providers: item.providers }], privacyClass: 'internal',
+        freshness: 'fresh', state: 'active', scope: item.scope ?? 'user', subject: item.subject ?? input.userId,
+        providerIds: item.providers });
+    } else if (input.providers?.length) {
+      warnings.push('federated_retrieval_gate_disabled');
+    }
     // This runtime path remains fail-closed in Shadow even if a stored profile
     // requests canary/active; live prompt mutation requires a separate gate.
     const plan = planPromptMemory(candidates, { botAppId: input.botAppId, userId: input.userId, mode: 'shadow',
@@ -151,7 +171,7 @@ export async function runRetrievalShadow(input: { dataDir: string; botAppId: str
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
       queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: 'shadow',
       candidateCount: candidates.length, eligibleCount: plan.eligible.length, latencyMs: Date.now() - started,
-      warnings: profile && profile.injectionMode !== 'shadow' ? [`configured_mode_${profile.injectionMode}_forced_shadow`] : [],
+      warnings: [...(profile && profile.injectionMode !== 'shadow' ? [`configured_mode_${profile.injectionMode}_forced_shadow`] : []), ...warnings],
       results: [...plan.eligible.map(item => ({ itemId: item.id, itemKind: item.kind, providerIds: item.providerIds ?? [], score: item.score, eligible: true })),
         ...plan.filtered.map(value => ({ itemId: value.item.id, itemKind: value.item.kind, providerIds: value.item.providerIds ?? [], score: value.item.score, eligible: false, filterReason: value.reason }))] });
     store.recordPromptInjectionSnapshot({ retrievalRunId: runId, botAppId: input.botAppId, mode: 'shadow', disposition: plan.disposition,

@@ -41,9 +41,54 @@ export async function writeMemoryToBackends(input: {
 export async function federatedMemoryRetrieve(input: {
   providers: MemoryBackendProvider[]; query: BackendMemoryQuery; limit: number;
 }): Promise<Array<BackendMemoryResult & { fusedScore: number; providers: string[] }>> {
+  return (await federatedMemoryRetrieveWithTelemetry(input)).items;
+}
+
+export interface FederatedMemoryRetrievalTelemetry {
+  providerId: string;
+  status: 'ok' | 'failed' | 'timeout';
+  latencyMs: number;
+  itemCount: number;
+  error?: string;
+}
+
+export interface FederatedMemoryRetrievalReport {
+  items: Array<BackendMemoryResult & { fusedScore: number; providers: string[] }>;
+  telemetry: FederatedMemoryRetrievalTelemetry[];
+  warnings: string[];
+  partialFailure: boolean;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`km_memory_backend_timeout:${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function federatedMemoryRetrieveWithTelemetry(input: {
+  providers: MemoryBackendProvider[]; query: BackendMemoryQuery; limit: number; timeoutMs?: number;
+}): Promise<FederatedMemoryRetrievalReport> {
+  const timeoutMs = Math.max(100, Math.min(input.timeoutMs ?? 2_000, 30_000));
   const batches = await Promise.all(input.providers.map(async provider => {
-    try { return { providerId: provider.descriptor.id, items: await provider.retrieve(input.query) }; }
-    catch { return { providerId: provider.descriptor.id, items: [] }; }
+    const started = Date.now();
+    try {
+      const items = await withTimeout(provider.retrieve(input.query), timeoutMs, provider.descriptor.id);
+      return { providerId: provider.descriptor.id, items, telemetry: { providerId: provider.descriptor.id, status: 'ok' as const,
+        latencyMs: Date.now() - started, itemCount: items.length } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.includes('km_memory_backend_timeout') ? 'timeout' as const : 'failed' as const;
+      return { providerId: provider.descriptor.id, items: [], telemetry: { providerId: provider.descriptor.id, status,
+        latencyMs: Date.now() - started, itemCount: 0, error: message } };
+    }
   }));
   const merged = new Map<string, BackendMemoryResult & { fusedScore: number; providers: string[] }>();
   for (const batch of batches) {
@@ -57,5 +102,12 @@ export async function federatedMemoryRetrieve(input: {
       } else merged.set(key, { ...item, fusedScore: score, providers: [batch.providerId] });
     });
   }
-  return [...merged.values()].sort((a, b) => b.fusedScore - a.fusedScore || a.text.localeCompare(b.text)).slice(0, input.limit);
+  const telemetry = batches.map(batch => batch.telemetry);
+  const warnings = telemetry.filter(item => item.status !== 'ok').map(item => `${item.providerId}:${item.status}`);
+  return {
+    items: [...merged.values()].sort((a, b) => b.fusedScore - a.fusedScore || a.text.localeCompare(b.text)).slice(0, input.limit),
+    telemetry,
+    warnings,
+    partialFailure: warnings.length > 0,
+  };
 }
