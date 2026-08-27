@@ -34,7 +34,7 @@ describe('KM Phase 2 knowledge and memory store', () => {
     `);
     db.close();
     const store = await ObservationStore.open(dir);
-    expect(store.schemaVersion()).toBe(13);
+    expect(store.schemaVersion()).toBe(14);
     expect(store.listKnowledge({ limit: 10 })).toEqual([]);
     store.close();
   });
@@ -176,7 +176,7 @@ describe('KM Phase 2 knowledge and memory store', () => {
       state: 'active', scope: 'user', subject: 'u2', claimKey: 'expired', claimText: 'Old failover preference.',
       confidence: 'observed', privacyClass: 'internal', sourceRefs, ttlExpiresAt: '2020-01-01T00:00:00.000Z',
     });
-    const results = store.retrieve({ text: 'failover', scopes: ['user'], targetLayers: ['L3'], limit: 10 });
+    const results = store.retrieve({ text: 'failover', scopes: ['user'], subject: 'u1', targetLayers: ['L3'], limit: 10 });
     expect(results.map(result => result.kind)).toEqual(['knowledge', 'memory']);
     expect(results.every(result => result.sourceRefs.length > 0)).toBe(true);
     store.close();

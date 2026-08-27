@@ -74,12 +74,13 @@ describe('KM observation dashboard API', () => {
   it('serves Phase 2 knowledge, memory and retrieval reads', async () => {
     const listKnowledge = vi.fn(() => [{ knowledgeId: 'kn-1' }]);
     const listMemory = vi.fn(() => [{ memoryId: 'mem-1' }]);
-    const retrieve = vi.fn(() => [{ id: 'kn-1', kind: 'knowledge' }]);
+    const retrieveWithMetrics = vi.fn(() => ({ items: [{ id: 'kn-1', kind: 'knowledge' }], metrics: { directHitCount: 1, normalizedHitCount: 0,
+      noHitCount: 2, filteredScopeCount: 3, filteredPrivacyCount: 4, filteredStateCount: 5 } }));
     const deps = {
       enabled: true,
       openStore: async () => ({
         schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
-        listKnowledge, listMemory, retrieve,
+        listKnowledge, listMemory, retrieveWithMetrics,
       }),
     };
     const knowledge = response();
@@ -96,7 +97,9 @@ describe('KM observation dashboard API', () => {
     const retrieval = response();
     await handleKmObservationApi({ method: 'GET' } as any, retrieval.res,
       new URL('http://localhost/api/km/retrieve?q=failover&scope=user&targetLayer=L3&subject=u1'), deps);
-    expect(retrieve).toHaveBeenCalledWith({ text: 'failover', limit: 20, subject: 'u1', scopes: ['user'], targetLayers: ['L3'] });
+    expect(retrieveWithMetrics).toHaveBeenCalledWith({ text: 'failover', limit: 20, subject: 'u1', scopes: ['user'], targetLayers: ['L3'] });
+    expect(retrieval.bodies).toEqual([{ items: [{ id: 'kn-1', kind: 'knowledge' }], metrics: { directHitCount: 1, normalizedHitCount: 0,
+      noHitCount: 2, filteredScopeCount: 3, filteredPrivacyCount: 4, filteredStateCount: 5 } }]);
   });
 
   it('serves guarded memory review state transitions', async () => {

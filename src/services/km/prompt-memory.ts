@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { MemoryScope, RetrievalItem } from './observation-store.js';
+import { resolveRetrievalScopeSubjects, type RetrievalVisibilityContext } from './retrieval-quality.js';
 
 export type PromptMemoryMode = 'off' | 'shadow' | 'canary' | 'active';
 export type PromptMemoryDisposition = 'off' | 'would_inject' | 'injected' | 'skipped';
@@ -34,6 +35,7 @@ export interface PromptMemoryCandidate extends RetrievalItem {
 }
 export interface PromptMemoryContext {
   botAppId: string; userId?: string; projectId?: string; skillName?: string;
+  environmentId?: string; teamId?: string; workspaceId?: string;
   now?: Date; mode: PromptMemoryMode; canaryBotIds?: string[]; promptTokenBudget: number; promptByteBudget?: number;
 }
 export interface PromptMemoryPlan {
@@ -73,6 +75,9 @@ export interface LivePromptMemoryContext {
   userId?: string;
   projectId?: string;
   skillName?: string;
+  environmentId?: string;
+  teamId?: string;
+  workspaceId?: string;
   now?: Date;
   requestedMode: PromptMemoryMode;
   effectiveModeAuthorized: boolean;
@@ -90,11 +95,8 @@ export interface PromptMemoryComposition {
 
 function scopeEligible(item: PromptMemoryCandidate, ctx: PromptMemoryContext): boolean {
   if (!item.scope) return true;
-  if (item.scope === 'user') return Boolean(ctx.userId && item.subject === ctx.userId);
-  if (item.scope === 'bot') return item.subject === ctx.botAppId;
-  if (item.scope === 'project') return Boolean(ctx.projectId && item.subject === ctx.projectId);
-  if (item.scope === 'skill') return Boolean(ctx.skillName && item.subject === ctx.skillName);
-  return false; // environment/team/workspace need an explicit future visibility resolver
+  const subjects = resolveRetrievalScopeSubjects(ctx satisfies RetrievalVisibilityContext);
+  return Boolean(subjects[item.scope] && subjects[item.scope] === item.subject);
 }
 function xml(value: string): string { return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;'); }
 function approxTokens(value: string): number { return Math.ceil(Buffer.byteLength(value, 'utf8') / 4); }
@@ -201,7 +203,8 @@ export function composeLivePromptMemory(
     canaryBotIds: ctx.canaryBotIds,
   });
   const shadowPlan = planPromptMemory(candidates, { botAppId: ctx.botAppId, userId: ctx.userId, projectId: ctx.projectId, skillName: ctx.skillName,
-    now: ctx.now, mode: readiness.effectiveMode === 'off' ? 'off' : 'shadow', canaryBotIds: [], promptTokenBudget: ctx.promptTokenBudget,
+    environmentId: ctx.environmentId, teamId: ctx.teamId, workspaceId: ctx.workspaceId, now: ctx.now,
+    mode: readiness.effectiveMode === 'off' ? 'off' : 'shadow', canaryBotIds: [], promptTokenBudget: ctx.promptTokenBudget,
     promptByteBudget: ctx.promptByteBudget });
   if (!readiness.allowed) {
     return {
@@ -216,7 +219,8 @@ export function composeLivePromptMemory(
     };
   }
   const plan = planPromptMemory(candidates, { botAppId: ctx.botAppId, userId: ctx.userId, projectId: ctx.projectId, skillName: ctx.skillName,
-    now: ctx.now, mode: readiness.effectiveMode, canaryBotIds: ctx.canaryBotIds, promptTokenBudget: ctx.promptTokenBudget,
+    environmentId: ctx.environmentId, teamId: ctx.teamId, workspaceId: ctx.workspaceId, now: ctx.now,
+    mode: readiness.effectiveMode, canaryBotIds: ctx.canaryBotIds, promptTokenBudget: ctx.promptTokenBudget,
     promptByteBudget: ctx.promptByteBudget });
   if (plan.disposition !== 'injected') return { content, mutated: false, plan: { ...plan, requestedMode: ctx.requestedMode, effectiveMode: readiness.effectiveMode } };
   return { content: `${plan.prompt}\n\n${content}`, mutated: true,
