@@ -87,6 +87,16 @@ type RetentionStatus = {
   reports: Array<{ reportId: string; completedAt: string; totalEligible: number; worstSloState: string; reportHash: string }>;
   trend: Array<{ reportId: string; completedAt: string; totalEligible: number; worstSloState: string; dbBytes: number; walBytes: number }>;
 };
+type GoldenCase = {
+  caseId: string; revision: number; state: string; title: string; queryRedacted: string; expectedClaims: Array<{ claimKey: string; claimTextHash: string }>;
+  contentHash: string; createdBy: string; reviewedBy: string; updatedAt: string;
+};
+type ShadowComparison = {
+  comparisonId: string; caseId: string; revision: number;
+  metrics: { claimOverlap: number; rulesUnique: number; piUnique: number; routingDisagreement: number; evidenceCoverage: number; privacyBlocks: number; schemaFailures: number; falsePositiveLabels: number; falseNegativeLabels: number };
+  latency: Record<string, unknown>; cost: Record<string, unknown>; createdAt: string;
+};
+type ShadowReadiness = { ready: boolean; reasonCodes: string[]; metrics?: Record<string, number>; createdAt?: string };
 
 type ObservationEvent = {
   eventId: string;
@@ -152,6 +162,10 @@ function KmPage(): React.JSX.Element {
   const [configAudit, setConfigAudit] = useState<ConfigAudit[]>([]);
   const [retrievalQuality, setRetrievalQuality] = useState<RetrievalQuality>();
   const [retention, setRetention] = useState<RetentionStatus>();
+  const [goldenCases, setGoldenCases] = useState<GoldenCase[]>([]);
+  const [shadowComparisons, setShadowComparisons] = useState<ShadowComparison[]>([]);
+  const [shadowReadiness, setShadowReadiness] = useState<ShadowReadiness>();
+  const [goldenForm, setGoldenForm] = useState({ title: '', queryRedacted: '', claimKey: '', claimTextHash: `sha256:${'0'.repeat(64)}` });
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
@@ -159,7 +173,7 @@ function KmPage(): React.JSX.Element {
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, exportList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus] = await Promise.all([
+      const [h, list, knowledgeList, exportList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -181,6 +195,9 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: ConfigAudit[] }>('/api/km/config-audit?limit=20'),
         getJson<RetrievalQuality>('/api/km/retrieval/quality'),
         getJson<RetentionStatus>('/api/km/retention'),
+        getJson<{ items: GoldenCase[] }>('/api/km/golden-cases?limit=20'),
+        getJson<{ items: ShadowComparison[] }>('/api/km/shadow-comparisons?limit=20'),
+        getJson<ShadowReadiness>('/api/km/shadow-readiness'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -195,6 +212,7 @@ function KmPage(): React.JSX.Element {
       setBackendRuntime(backendRuntimeStatus); setBackendOutbox(backendOutboxList.items); setBackendMigrations(backendMigrationList.items);
       setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items); setRetrievalQuality(quality);
       setRetention(retentionStatus);
+      setGoldenCases(goldenList.items); setShadowComparisons(comparisonList.items); setShadowReadiness(readiness);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -261,6 +279,49 @@ function KmPage(): React.JSX.Element {
   const checkProvider = async (providerId: string) => {
     try { const result = await mutateJson<Record<string, unknown>>(`/api/km/provider-configs/${encodeURIComponent(providerId)}/health`, 'POST', {});
       setNotice(`配置检查：${providerId} = ${String(result.status)}（未发网络请求）`); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const createGoldenCase = async () => {
+    try {
+      await mutateJson('/api/km/golden-cases', 'POST', {
+        title: goldenForm.title,
+        queryRedacted: goldenForm.queryRedacted,
+        expectedClaims: [{ claimKey: goldenForm.claimKey, claimTextHash: goldenForm.claimTextHash }],
+        sourceRefs: [{ kind: 'reviewed-distillation-example', ref: `dashboard:${Date.now()}` }],
+        provenance: { explicitlyReviewed: true, redactionStatus: 'redacted', source: 'dashboard-manual' },
+      });
+      setNotice('Golden case 已保存为 reviewed revision');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const compareGoldenCase = async (item: GoldenCase) => {
+    try {
+      await mutateJson('/api/km/shadow-comparisons', 'POST', {
+        caseId: item.caseId,
+        revision: item.revision,
+        rulesClaims: item.expectedClaims.map(claim => ({ claimKey: claim.claimKey, route: 'rules', evidenceRefs: [{ kind: 'golden-case', ref: `${item.caseId}@${item.revision}` }] })),
+        piClaims: [],
+        latency: { rulesMs: 0, piMs: 0, source: 'stored-summary-only' },
+        cost: { externalCalls: 0, piInvoked: false },
+      });
+      setNotice('已基于本地存储摘要记录 comparison，未调用 Pi 或外部网络');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const labelComparison = async (item: ShadowComparison, label: 'false_positive' | 'false_negative') => {
+    try {
+      await mutateJson(`/api/km/shadow-comparisons/${encodeURIComponent(item.comparisonId)}/labels`, 'POST', {
+        claimKey: label === 'false_positive' ? 'review.false_positive' : 'review.false_negative',
+        extractor: label === 'false_positive' ? 'pi' : 'rules',
+        label,
+        reasonCode: 'dashboard_review',
+      });
+      setNotice(`Shadow label 已记录：${label}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const refreshReadiness = async () => {
+    try { await mutateJson('/api/km/shadow-readiness', 'POST', { thresholds: { minReviewedCases: 1, minComparisons: 1 } }); setNotice('Readiness report 已生成'); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
 
@@ -334,6 +395,9 @@ function KmPage(): React.JSX.Element {
           </div>)}
           {!retention && <p style={{ color: 'var(--text-dim)' }}>Retention 状态暂不可用。</p>}
         </div>
+        <article><span>Golden Cases</span><strong>{goldenCases.length}</strong></article>
+        <article><span>Shadow 对比</span><strong>{shadowComparisons.length}</strong></article>
+        <article><span>Readiness</span><strong>{shadowReadiness?.ready ? 'ready' : 'blocked'}</strong></article>
       </section>
 
       <section className="panel">
@@ -364,6 +428,25 @@ function KmPage(): React.JSX.Element {
           </b></div>)}
           {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
           {knowledge.length + memory.length + policyDecisions.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Golden Set / Pi Shadow Quality</h2>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+          <input value={goldenForm.title} onChange={e => setGoldenForm({ ...goldenForm, title: e.target.value })} placeholder="Golden case title" />
+          <input value={goldenForm.queryRedacted} onChange={e => setGoldenForm({ ...goldenForm, queryRedacted: e.target.value })} placeholder="Redacted query" />
+          <input value={goldenForm.claimKey} onChange={e => setGoldenForm({ ...goldenForm, claimKey: e.target.value })} placeholder="Expected claim key" />
+          <input value={goldenForm.claimTextHash} onChange={e => setGoldenForm({ ...goldenForm, claimTextHash: e.target.value })} placeholder="sha256:..." />
+          <button disabled={!goldenForm.title.trim() || !goldenForm.queryRedacted.trim() || !goldenForm.claimKey.trim()} onClick={() => void createGoldenCase()}>保存 Golden</button>
+          <button onClick={() => void refreshReadiness()}>生成 Readiness</button>
+        </div>
+        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>Golden set 只接受显式 review/redacted 输入；Shadow quality 只读取本地已存摘要，默认关闭且不调用 Pi/LLM/网络。</p>
+        <div className="feedback-deliveries">
+          {goldenCases.map(item => <div key={`${item.caseId}@${item.revision}`}><code>{item.state}</code><span>{item.title}</span><span>{item.caseId}@{item.revision} · {item.expectedClaims.length} claims</span><b><button onClick={() => void compareGoldenCase(item)}>Compare</button></b></div>)}
+          {shadowComparisons.map(item => <div key={item.comparisonId}><code>compare</code><span>{item.caseId}@{item.revision}</span><span>overlap {item.metrics.claimOverlap} · rules {item.metrics.rulesUnique} · pi {item.metrics.piUnique} · evidence {Math.round(item.metrics.evidenceCoverage * 100)}%</span><b>FP {item.metrics.falsePositiveLabels} / FN {item.metrics.falseNegativeLabels} <button onClick={() => void labelComparison(item, 'false_positive')}>FP</button> <button onClick={() => void labelComparison(item, 'false_negative')}>FN</button></b></div>)}
+          {shadowReadiness && <div><code>readiness</code><span>{shadowReadiness.reasonCodes.join(', ') || 'thresholds_passed'}</span><span>{JSON.stringify(shadowReadiness.metrics ?? {})}</span><b>{shadowReadiness.ready ? 'ready' : 'not ready'}</b></div>}
+          {goldenCases.length + shadowComparisons.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Golden case 或 Shadow comparison。</p>}
         </div>
       </section>
 

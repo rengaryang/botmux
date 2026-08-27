@@ -62,6 +62,15 @@ export interface KmObservationApiStore {
   evalEvolutionStatus?(): ReturnType<ObservationStore['evalEvolutionStatus']>;
   kmRetentionStatus?(input?: Parameters<ObservationStore['kmRetentionStatus']>[0]): ReturnType<ObservationStore['kmRetentionStatus']>;
   listKmRetentionReports?(limit: number): ReturnType<ObservationStore['listKmRetentionReports']>;
+  upsertGoldenCase?(input: Parameters<ObservationStore['upsertGoldenCase']>[0]): ReturnType<ObservationStore['upsertGoldenCase']>;
+  listGoldenCases?(input: Parameters<ObservationStore['listGoldenCases']>[0]): ReturnType<ObservationStore['listGoldenCases']>;
+  retireGoldenCase?(input: Parameters<ObservationStore['retireGoldenCase']>[0]): ReturnType<ObservationStore['retireGoldenCase']>;
+  recordShadowComparison?(input: Parameters<ObservationStore['recordShadowComparison']>[0]): ReturnType<ObservationStore['recordShadowComparison']>;
+  listShadowComparisons?(input: Parameters<ObservationStore['listShadowComparisons']>[0]): ReturnType<ObservationStore['listShadowComparisons']>;
+  addShadowReviewLabel?(input: Parameters<ObservationStore['addShadowReviewLabel']>[0]): ReturnType<ObservationStore['addShadowReviewLabel']>;
+  listShadowReviewLabels?(limit: number): ReturnType<ObservationStore['listShadowReviewLabels']>;
+  shadowReadinessReport?(input?: Parameters<ObservationStore['shadowReadinessReport']>[0]): ReturnType<ObservationStore['shadowReadinessReport']>;
+  shadowReadinessReportLatest?(): ReturnType<ObservationStore['shadowReadinessReportLatest']>;
   close(): void;
 }
 
@@ -132,6 +141,12 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/retrieval/quality'
     || url.pathname === '/api/km/retention'
     || url.pathname === '/api/km/retention/reports'
+    || url.pathname === '/api/km/golden-cases'
+    || /^\/api\/km\/golden-cases\/[^/]+\/retire$/.test(url.pathname)
+    || url.pathname === '/api/km/shadow-comparisons'
+    || /^\/api\/km\/shadow-comparisons\/[^/]+\/labels$/.test(url.pathname)
+    || url.pathname === '/api/km/shadow-labels'
+    || url.pathname === '/api/km/shadow-readiness'
     || /^\/api\/km\/provider-configs\/[^/]+\/health$/.test(url.pathname)
     || /^\/api\/km\/backend-migrations\/[^/]+\/(backfill|compare)$/.test(url.pathname)
     || /^\/api\/km\/profiles\/[^/]+\/\d+\/state$/.test(url.pathname)
@@ -310,6 +325,70 @@ export async function handleKmObservationApi(
         riskAck: (body.riskAck ?? {}) as Record<string, unknown> })); return true;
     }
 
+    if (url.pathname === '/api/km/golden-cases' && req.method === 'POST') {
+      if (!store.upsertGoldenCase) throw new Error('km_golden_cases_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 201, 'golden.created', String(body.caseId ?? body.title ?? 'golden'), () => store!.upsertGoldenCase!({
+        caseId: typeof body.caseId === 'string' ? body.caseId : undefined,
+        title: String(body.title ?? ''),
+        queryRedacted: String(body.queryRedacted ?? ''),
+        expectedClaims: Array.isArray(body.expectedClaims) ? body.expectedClaims as any : [],
+        sourceRefs: Array.isArray(body.sourceRefs) ? body.sourceRefs : [],
+        provenance: typeof body.provenance === 'object' && body.provenance !== null ? body.provenance as Record<string, unknown> : {},
+        privacyClass: body.privacyClass === 'public-to-team' ? 'public-to-team' : 'internal',
+        actorId: ctx.actorId,
+      }), { afterHash: response => response.item.contentHash }); return true;
+    }
+
+    const goldenRetire = url.pathname.match(/^\/api\/km\/golden-cases\/([^/]+)\/retire$/);
+    if (goldenRetire) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.retireGoldenCase) throw new Error('km_golden_cases_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'golden.retired', decodeURIComponent(goldenRetire[1]), () => store!.retireGoldenCase!({
+        caseId: decodeURIComponent(goldenRetire[1]),
+        revision: typeof body.revision === 'number' ? body.revision : undefined,
+        actorId: ctx.actorId,
+        reasonCode: String(body.reasonCode ?? 'review_retired'),
+      }), { afterHash: response => response.contentHash }); return true;
+    }
+
+    if (url.pathname === '/api/km/shadow-comparisons' && req.method === 'POST') {
+      if (!store.recordShadowComparison) throw new Error('km_shadow_comparisons_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 201, 'shadow_comparison.recorded', String(body.caseId ?? 'comparison'), () => store!.recordShadowComparison!({
+        caseId: String(body.caseId ?? ''),
+        revision: typeof body.revision === 'number' ? body.revision : undefined,
+        rulesClaims: Array.isArray(body.rulesClaims) ? body.rulesClaims as any : [],
+        piClaims: Array.isArray(body.piClaims) ? body.piClaims as any : [],
+        latency: typeof body.latency === 'object' && body.latency !== null ? body.latency as Record<string, unknown> : {},
+        cost: typeof body.cost === 'object' && body.cost !== null ? body.cost as Record<string, unknown> : {},
+      }), { afterHash: response => response.item.comparisonId }); return true;
+    }
+
+    const comparisonLabels = url.pathname.match(/^\/api\/km\/shadow-comparisons\/([^/]+)\/labels$/);
+    if (comparisonLabels) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.addShadowReviewLabel) throw new Error('km_shadow_labels_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 201, 'shadow_label.created', decodeURIComponent(comparisonLabels[1]), () => store!.addShadowReviewLabel!({
+        comparisonId: decodeURIComponent(comparisonLabels[1]),
+        claimKey: String(body.claimKey ?? ''),
+        extractor: String(body.extractor ?? '') as any,
+        label: String(body.label ?? '') as any,
+        actorId: ctx.actorId,
+        reasonCode: String(body.reasonCode ?? 'manual_review'),
+      })); return true;
+    }
+
+    if (url.pathname === '/api/km/shadow-readiness' && req.method === 'POST') {
+      if (!store.shadowReadinessReport) throw new Error('km_shadow_readiness_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'shadow_readiness.reported', 'shadow-quality', () => store!.shadowReadinessReport!({
+        thresholds: typeof body.thresholds === 'object' && body.thresholds !== null ? body.thresholds as Record<string, number> : undefined,
+      }), { afterHash: response => response.windowHash }); return true;
+    }
+
     if (req.method !== 'GET') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
 
     if (url.pathname === '/api/km/trace') {
@@ -335,6 +414,26 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/retention/reports') {
       if (!store.listKmRetentionReports) throw new Error('km_retention_unavailable');
       jsonRes(res, 200, { items: store.listKmRetentionReports(positiveInteger(url.searchParams.get('limit'), 30, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/golden-cases') {
+      if (!store.listGoldenCases) throw new Error('km_golden_cases_unavailable');
+      const state = url.searchParams.get('state') ?? undefined;
+      jsonRes(res, 200, { items: store.listGoldenCases({ limit: positiveInteger(url.searchParams.get('limit'), 50, 100),
+        ...(state ? { state: state as any } : {}) }) }); return true;
+    }
+    if (url.pathname === '/api/km/shadow-comparisons') {
+      if (!store.listShadowComparisons) throw new Error('km_shadow_comparisons_unavailable');
+      const caseId = url.searchParams.get('caseId') ?? undefined;
+      jsonRes(res, 200, { items: store.listShadowComparisons({ limit: positiveInteger(url.searchParams.get('limit'), 50, 100),
+        ...(caseId ? { caseId } : {}) }) }); return true;
+    }
+    if (url.pathname === '/api/km/shadow-labels') {
+      if (!store.listShadowReviewLabels) throw new Error('km_shadow_labels_unavailable');
+      jsonRes(res, 200, { items: store.listShadowReviewLabels(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/shadow-readiness') {
+      if (!store.shadowReadinessReportLatest) throw new Error('km_shadow_readiness_unavailable');
+      jsonRes(res, 200, store.shadowReadinessReportLatest() ?? { ready: false, reasonCodes: ['no_readiness_report'] }); return true;
     }
     if (url.pathname === '/api/km/config-audit') {
       if (!store.listKmConfigAudit) throw new Error('km_config_audit_unavailable');

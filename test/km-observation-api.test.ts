@@ -304,6 +304,71 @@ describe('KM observation dashboard API', () => {
     expect(executeKmMutation).toHaveBeenCalledTimes(2);
   });
 
+  it('serves golden cases, local shadow comparisons, review labels, and readiness behind mutation guard', async () => {
+    const upsertGoldenCase = vi.fn(() => ({ item: { caseId: 'gold-1', revision: 1, contentHash: `sha256:${'a'.repeat(64)}` }, created: true }));
+    const listGoldenCases = vi.fn(() => [{ caseId: 'gold-1', revision: 1, state: 'reviewed' }]);
+    const retireGoldenCase = vi.fn(() => ({ caseId: 'gold-1', revision: 1, state: 'retired', contentHash: `sha256:${'b'.repeat(64)}` }));
+    const recordShadowComparison = vi.fn(() => ({ item: { comparisonId: 'cmp-1', metrics: { claimOverlap: 1 } }, created: true }));
+    const listShadowComparisons = vi.fn(() => [{ comparisonId: 'cmp-1' }]);
+    const addShadowReviewLabel = vi.fn(() => ({ labelId: 'label-1', created: true }));
+    const listShadowReviewLabels = vi.fn(() => [{ labelId: 'label-1' }]);
+    const shadowReadinessReport = vi.fn(() => ({ ready: false, windowHash: `sha256:${'c'.repeat(64)}`, reasonCodes: ['insufficient_shadow_comparisons'] }));
+    const shadowReadinessReportLatest = vi.fn(() => ({ ready: false, reasonCodes: ['no_readiness_report'] }));
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const deps = { enabled: true, actorId: 'reviewer', openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(),
+      list: vi.fn(), get: vi.fn(), close: vi.fn(), upsertGoldenCase, listGoldenCases, retireGoldenCase, recordShadowComparison,
+      listShadowComparisons, addShadowReviewLabel, listShadowReviewLabels, shadowReadinessReport, shadowReadinessReportLatest, executeKmMutation }) };
+
+    const createGoldenReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      title: 'case', queryRedacted: 'redacted', expectedClaims: [{ claimKey: 'k', claimTextHash: `sha256:${'d'.repeat(64)}` }],
+      sourceRefs: [{ kind: 'example', ref: 'e1' }], provenance: { explicitlyReviewed: true, redactionStatus: 'redacted' },
+    }))]), { method: 'POST', headers: { 'idempotency-key': 'gold-create' } });
+    const createGolden = response();
+    await handleKmObservationApi(createGoldenReq as any, createGolden.res, new URL('http://localhost/api/km/golden-cases'), deps);
+    expect(upsertGoldenCase).toHaveBeenCalledWith(expect.objectContaining({ actorId: 'reviewer', queryRedacted: 'redacted' }));
+    expect(createGolden.res.writeHead).toHaveBeenCalledWith(201, expect.anything());
+
+    const listGolden = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, listGolden.res, new URL('http://localhost/api/km/golden-cases?state=reviewed'), deps);
+    expect(listGoldenCases).toHaveBeenCalledWith({ limit: 50, state: 'reviewed' });
+
+    const retireReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ revision: 1, reasonCode: 'obsolete' }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'gold-retire' } });
+    const retire = response();
+    await handleKmObservationApi(retireReq as any, retire.res, new URL('http://localhost/api/km/golden-cases/gold-1/retire'), deps);
+    expect(retireGoldenCase).toHaveBeenCalledWith({ caseId: 'gold-1', revision: 1, actorId: 'reviewer', reasonCode: 'obsolete' });
+
+    const comparisonReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ caseId: 'gold-1', rulesClaims: [{ claimKey: 'k' }], piClaims: [] }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'cmp-create' } });
+    const comparison = response();
+    await handleKmObservationApi(comparisonReq as any, comparison.res, new URL('http://localhost/api/km/shadow-comparisons'), deps);
+    expect(recordShadowComparison).toHaveBeenCalledWith(expect.objectContaining({ caseId: 'gold-1', rulesClaims: [{ claimKey: 'k' }], piClaims: [] }));
+
+    const labels = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, labels.res, new URL('http://localhost/api/km/shadow-labels?limit=999'), deps);
+    expect(listShadowReviewLabels).toHaveBeenCalledWith(100);
+
+    const labelReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ claimKey: 'k', extractor: 'pi', label: 'false_positive', reasonCode: 'bad' }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'label-create' } });
+    const label = response();
+    await handleKmObservationApi(labelReq as any, label.res, new URL('http://localhost/api/km/shadow-comparisons/cmp-1/labels'), deps);
+    expect(addShadowReviewLabel).toHaveBeenCalledWith({ comparisonId: 'cmp-1', claimKey: 'k', extractor: 'pi', label: 'false_positive', actorId: 'reviewer', reasonCode: 'bad' });
+
+    const readinessReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ thresholds: { minComparisons: 1 } }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'ready-create' } });
+    const readiness = response();
+    await handleKmObservationApi(readinessReq as any, readiness.res, new URL('http://localhost/api/km/shadow-readiness'), deps);
+    expect(shadowReadinessReport).toHaveBeenCalledWith({ thresholds: { minComparisons: 1 } });
+
+    const comparisonList = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, comparisonList.res, new URL('http://localhost/api/km/shadow-comparisons?caseId=gold-1'), deps);
+    expect(listShadowComparisons).toHaveBeenCalledWith({ limit: 50, caseId: 'gold-1' });
+    const readinessLatest = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, readinessLatest.res, new URL('http://localhost/api/km/shadow-readiness'), deps);
+    expect(shadowReadinessReportLatest).toHaveBeenCalledOnce();
+    expect(executeKmMutation).toHaveBeenCalledTimes(5);
+  });
+
   it('serves backend runtime status and backend outbox/migration reads', async () => {
     const listMemoryBackendOutbox = vi.fn(() => [{ outboxId: 'mout-1', status: 'pending' }]);
     const listMemoryBackendMigrations = vi.fn(() => [{ migrationId: 'mmig-1', state: 'draft' }]);
