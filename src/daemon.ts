@@ -93,6 +93,7 @@ import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.j
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
+import { enqueueAutomaticDistillation, runOneDistillationJob, runRetrievalShadow } from './services/km/runtime-orchestrator.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -23732,6 +23733,13 @@ async function handleThreadReplyAdmitted(
     : initialCodexAppMessageContext + initialCodexAppApplicationContext
       + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
+  const kmShadowSession = activeSessions.get(sessionKey(anchor, larkAppId));
+  if (kmShadowSession) {
+    void runRetrievalShadow({ dataDir: config.session.dataDir, botAppId: larkAppId,
+      sessionId: kmShadowSession.session.sessionId, turnId: parsed.messageId,
+      userId: senderOpenIdForPrefix, queryText: parsed.content })
+      .catch(error => logger.warn(`[km-retrieval-shadow] ${error instanceof Error ? error.message : String(error)}`));
+  }
   let rewrittenCodexAppMessageContext: string | undefined;
   if (!prepared) {
     const existingHookSession = activeSessions.get(runtimeSessionKey);
@@ -27313,9 +27321,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ),
           onPersisted: payload => {
             if (!payload || !isKmObservationEnabled()) return;
+            const observation = observationFromTurnCompletion(payload);
             void enqueueObservation({
               dataDir: config.session.dataDir,
-              event: observationFromTurnCompletion(payload),
+              event: observation,
+              onResult: result => {
+                if (result.status === 'quarantined') return;
+                const botConfig = getBot(ds.larkAppId).config;
+                void enqueueAutomaticDistillation({ dataDir: config.session.dataDir, event: observation,
+                  cliId: ds.session.cliId ?? botConfig.cliId, model: ds.session.model ?? botConfig.model,
+                  cliSessionId: ds.session.cliSessionId, cwd: ds.session.workingDir ?? ds.workingDir })
+                  .then(() => runOneDistillationJob({ dataDir: config.session.dataDir, cliId: ds.session.cliId ?? botConfig.cliId,
+                    model: ds.session.model ?? botConfig.model }))
+                  .catch(error => logger.warn(`[km-distillation] ${error instanceof Error ? error.message : String(error)}`));
+              },
               onError: error => logger.warn(
                 `[km-observation] turn persistence failed turn=${terminal.turnId.slice(0, 12)}: `
                 + `${error instanceof Error ? error.message : String(error)}`,

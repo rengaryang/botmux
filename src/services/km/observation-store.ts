@@ -114,6 +114,7 @@ const FRESH_SCHEMA = `
 `;
 
 const PHASE9_SCHEMA = `
+  ALTER TABLE distillation_jobs ADD COLUMN evidence_context_json TEXT NOT NULL DEFAULT '{}';
   CREATE TABLE IF NOT EXISTS retrieval_runs (
     retrieval_run_id TEXT PRIMARY KEY, bot_app_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT,
     query_hash TEXT NOT NULL, mode TEXT NOT NULL CHECK(mode IN ('off','shadow','canary','active')),
@@ -1285,7 +1286,7 @@ export class ObservationStore {
     return hash;
   }
 
-  createDistillationJob(input: { sourceEventId: string; profile: KmPipelineProfile; now?: number }): { jobId: string; created: boolean } {
+  createDistillationJob(input: { sourceEventId: string; profile: KmPipelineProfile; evidenceContext?: Record<string, unknown>; now?: number }): { jobId: string; created: boolean } {
     const profile = KmPipelineProfileSchema.parse(input.profile);
     const profileJson = JSON.stringify(profile);
     const key = `${input.sourceEventId}|${profile.profileId}|${profile.revision}|${profile.primaryExtractor}`;
@@ -1293,12 +1294,13 @@ export class ObservationStore {
     const nowMs = input.now ?? Date.now();
     const now = new Date(nowMs).toISOString();
     const result = this.db.prepare(`INSERT OR IGNORE INTO distillation_jobs(
-      job_id,idempotency_key,source_event_id,bot_app_id,profile_id,profile_revision,profile_snapshot_json,state,next_attempt_at,created_at,updated_at
-    ) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)`).run(jobId, key, input.sourceEventId, profile.botAppId, profile.profileId, profile.revision, profileJson, nowMs, now, now);
+      job_id,idempotency_key,source_event_id,bot_app_id,profile_id,profile_revision,profile_snapshot_json,evidence_context_json,state,next_attempt_at,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,'queued',?,?,?)`).run(jobId, key, input.sourceEventId, profile.botAppId, profile.profileId, profile.revision,
+      profileJson, JSON.stringify(input.evidenceContext ?? {}), nowMs, now, now);
     return { jobId, created: Number(result.changes) === 1 };
   }
 
-  claimDistillationJob(input: { now?: number; leaseMs?: number }): null | { jobId: string; claimToken: string; sourceEventId: string; profile: KmPipelineProfile } {
+  claimDistillationJob(input: { now?: number; leaseMs?: number }): null | { jobId: string; claimToken: string; sourceEventId: string; profile: KmPipelineProfile; evidenceContext: Record<string, unknown> } {
     const now = input.now ?? Date.now();
     const lease = Math.max(1_000, input.leaseMs ?? 60_000);
     const token = `dclaim_${randomUUID().replaceAll('-', '')}`;
@@ -1313,9 +1315,9 @@ export class ObservationStore {
       this.db.prepare(`UPDATE distillation_jobs SET state='resolving',attempts=attempts+1,claimed_at=?,claim_token=?,updated_at=? WHERE job_id=?`)
         .run(now, token, new Date(now).toISOString(), row.job_id);
       this.db.exec('COMMIT;');
-      const claimed = this.db.prepare(`SELECT source_event_id,profile_snapshot_json FROM distillation_jobs WHERE job_id=?`).get(row.job_id) as any;
+      const claimed = this.db.prepare(`SELECT source_event_id,profile_snapshot_json,evidence_context_json FROM distillation_jobs WHERE job_id=?`).get(row.job_id) as any;
       return { jobId: row.job_id, claimToken: token, sourceEventId: claimed.source_event_id,
-        profile: KmPipelineProfileSchema.parse(JSON.parse(claimed.profile_snapshot_json)) };
+        profile: KmPipelineProfileSchema.parse(JSON.parse(claimed.profile_snapshot_json)), evidenceContext: JSON.parse(claimed.evidence_context_json ?? '{}') };
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
