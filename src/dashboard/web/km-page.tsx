@@ -14,6 +14,10 @@ type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; t
 type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
 type TraceEdge = { edgeId: string; fromType: string; fromId: string; toType: string; toId: string; edgeType: string };
 type SyncStatus = { sinkId: string; endpointRef: string; enabled: boolean; status: string; pending: number; quarantined: number; lastLocalSeq: number; lastAckAt?: string };
+type ProviderStatus = { providerId: string; kind: string; version: string; status: string };
+type DistillationJob = { jobId: string; state: string; botAppId: string; profileId: string; attempts: number; lastError?: string };
+type RetrievalAudit = { retrievalRunId: string; botAppId: string; mode: string; candidateCount: number; eligibleCount: number; latencyMs: number };
+type InjectionSnapshot = { snapshotId: string; botAppId: string; mode: string; disposition: string; itemIds: string[]; promptBytes: number };
 
 type ObservationEvent = {
   eventId: string;
@@ -57,11 +61,15 @@ function KmPage(): React.JSX.Element {
   const [traceId, setTraceId] = useState('');
   const [traceEdges, setTraceEdges] = useState<TraceEdge[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus[]>([]);
+  const [providers, setProviders] = useState<ProviderStatus[]>([]);
+  const [jobs, setJobs] = useState<DistillationJob[]>([]);
+  const [retrievals, setRetrievals] = useState<RetrievalAudit[]>([]);
+  const [injections, setInjections] = useState<InjectionSnapshot[]>([]);
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -69,6 +77,10 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
         getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
         getJson<{ items: SyncStatus[] }>('/api/km/sync/sinks'),
+        getJson<{ items: ProviderStatus[] }>('/api/km/providers'),
+        getJson<{ items: DistillationJob[] }>('/api/km/distillation/jobs?limit=20'),
+        getJson<{ items: RetrievalAudit[] }>('/api/km/retrieval/runs?limit=20'),
+        getJson<{ items: InjectionSnapshot[] }>('/api/km/injections?limit=20'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -77,6 +89,7 @@ function KmPage(): React.JSX.Element {
       setEvalRuns(evalList.items);
       setProposals(proposalList.items);
       setSyncStatus(syncList.items);
+      setProviders(providerList.items); setJobs(jobList.items); setRetrievals(retrievalList.items); setInjections(injectionList.items);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -150,6 +163,17 @@ function KmPage(): React.JSX.Element {
           {evalRuns.map(run => <div key={run.evalRunId}><code>{run.evaluatorName}</code><span>{run.targetType}:{run.targetId}</span><span>pass {run.passCount} · warn {run.warnCount}</span><b>fail {run.failCount}</b></div>)}
           {proposals.map(proposal => <div key={proposal.proposalId}><code>{proposal.proposalType}</code><span>{proposal.summary}</span><span>{proposal.targetRef}</span><b>{proposal.approvalGrade} · {proposal.state}</b></div>)}
           {traceEdges.length + evalRuns.length + proposals.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Trace、Eval 或 Evolution 数据。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Providers / Distillation / Retrieval Shadow</h2>
+        <div className="feedback-deliveries">
+          {providers.map(provider => <div key={`${provider.providerId}@${provider.version}`}><code>{provider.kind}</code><span>{provider.providerId}</span><span>v{provider.version}</span><b>{provider.status}</b></div>)}
+          {jobs.map(job => <div key={job.jobId}><code>distill</code><span>{job.profileId} · {job.botAppId}</span><span>attempt {job.attempts}</span><b>{job.state}</b></div>)}
+          {retrievals.map(run => <div key={run.retrievalRunId}><code>retrieve</code><span>{run.botAppId} · {run.mode}</span><span>{run.candidateCount} → {run.eligibleCount}</span><b>{run.latencyMs}ms</b></div>)}
+          {injections.map(item => <div key={item.snapshotId}><code>inject</code><span>{item.botAppId} · {item.mode}</span><span>{item.itemIds.length} items · {item.promptBytes} bytes</span><b>{item.disposition}</b></div>)}
+          {providers.length + jobs.length + retrievals.length + injections.length === 0 && <p style={{ color: 'var(--text-dim)' }}>自动蒸馏和检索影子尚未启用。</p>}
         </div>
       </section>
 

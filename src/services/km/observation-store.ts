@@ -1337,6 +1337,37 @@ export class ObservationStore {
       .run(state, now + delay, input.error.slice(0, 500), new Date(now).toISOString(), input.jobId);
   }
 
+  listKmProviders(): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT provider_id,provider_kind,provider_version,status,last_health_json,updated_at FROM km_provider_registry ORDER BY provider_kind,provider_id`).all() as any[])
+      .map(row => ({ providerId: row.provider_id, kind: row.provider_kind, version: row.provider_version, status: row.status,
+        ...(row.last_health_json ? { health: JSON.parse(row.last_health_json) } : {}), updatedAt: row.updated_at }));
+  }
+
+  listDistillationJobs(limit: number): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT job_id,source_event_id,bot_app_id,profile_id,profile_revision,state,attempts,next_attempt_at,last_error,output_hash,created_at,updated_at
+      FROM distillation_jobs ORDER BY created_at DESC,job_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 500))) as any[])
+      .map(row => ({ jobId: row.job_id, sourceEventId: row.source_event_id, botAppId: row.bot_app_id,
+        profileId: row.profile_id, profileRevision: row.profile_revision, state: row.state, attempts: row.attempts,
+        nextAttemptAt: row.next_attempt_at, ...(row.last_error ? { lastError: row.last_error } : {}),
+        ...(row.output_hash ? { outputHash: row.output_hash } : {}), createdAt: row.created_at, updatedAt: row.updated_at }));
+  }
+
+  listRetrievalAudits(limit: number): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT retrieval_run_id,bot_app_id,session_id,turn_id,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at
+      FROM retrieval_runs ORDER BY created_at DESC,retrieval_run_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 500))) as any[])
+      .map(row => ({ retrievalRunId: row.retrieval_run_id, botAppId: row.bot_app_id, sessionId: row.session_id,
+        ...(row.turn_id ? { turnId: row.turn_id } : {}), mode: row.mode, candidateCount: row.candidate_count,
+        eligibleCount: row.eligible_count, latencyMs: row.latency_ms, warnings: JSON.parse(row.warnings_json), createdAt: row.created_at }));
+  }
+
+  listInjectionSnapshots(limit: number): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT snapshot_id,retrieval_run_id,bot_app_id,mode,disposition,item_ids_json,prompt_bytes,reason,created_at
+      FROM prompt_injection_snapshots ORDER BY created_at DESC,snapshot_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 500))) as any[])
+      .map(row => ({ snapshotId: row.snapshot_id, retrievalRunId: row.retrieval_run_id, botAppId: row.bot_app_id,
+        mode: row.mode, disposition: row.disposition, itemIds: JSON.parse(row.item_ids_json), promptBytes: row.prompt_bytes,
+        ...(row.reason ? { reason: row.reason } : {}), createdAt: row.created_at }));
+  }
+
   private knowledgeFromRow(row: any): KnowledgeItem {
     return {
       knowledgeId: row.knowledge_id, state: row.state, targetLayer: row.target_layer,
