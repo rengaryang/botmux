@@ -9,7 +9,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -111,6 +111,27 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE9_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS retrieval_runs (
+    retrieval_run_id TEXT PRIMARY KEY, bot_app_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT,
+    query_hash TEXT NOT NULL, mode TEXT NOT NULL CHECK(mode IN ('off','shadow','canary','active')),
+    candidate_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
+    warnings_json TEXT NOT NULL CHECK(json_valid(warnings_json)), created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS retrieval_results (
+    retrieval_run_id TEXT NOT NULL REFERENCES retrieval_runs(retrieval_run_id) ON DELETE CASCADE,
+    item_id TEXT NOT NULL, item_kind TEXT NOT NULL, provider_ids_json TEXT NOT NULL CHECK(json_valid(provider_ids_json)),
+    score REAL NOT NULL, eligible INTEGER NOT NULL CHECK(eligible IN (0,1)), filter_reason TEXT,
+    PRIMARY KEY(retrieval_run_id,item_id,item_kind)
+  );
+  CREATE TABLE IF NOT EXISTS prompt_injection_snapshots (
+    snapshot_id TEXT PRIMARY KEY, retrieval_run_id TEXT NOT NULL REFERENCES retrieval_runs(retrieval_run_id) ON DELETE CASCADE,
+    bot_app_id TEXT NOT NULL, mode TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN ('off','would_inject','injected','skipped')),
+    item_ids_json TEXT NOT NULL CHECK(json_valid(item_ids_json)), prompt_hash TEXT, prompt_bytes INTEGER NOT NULL,
+    reason TEXT, created_at TEXT NOT NULL
+  );
 `;
 
 const PHASE8_SCHEMA = `
@@ -543,6 +564,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 6) this.migrateToPhase6();
     if (this.schemaVersion() < 7) this.migrateToPhase7();
     if (this.schemaVersion() < 8) this.migrateToPhase8();
+    if (this.schemaVersion() < 9) this.migrateToPhase9();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -953,6 +975,39 @@ export class ObservationStore {
       .run(input.toState, input.checkpoint ?? null, JSON.stringify(input.stats ?? {}), new Date().toISOString(), input.migrationId);
   }
 
+  recordRetrievalAudit(input: {
+    botAppId: string; sessionId: string; turnId?: string; queryHash: string;
+    mode: 'off' | 'shadow' | 'canary' | 'active'; candidateCount: number; eligibleCount: number;
+    latencyMs: number; warnings: string[];
+    results: Array<{ itemId: string; itemKind: string; providerIds: string[]; score: number; eligible: boolean; filterReason?: string }>;
+  }): string {
+    const id = `retr_${randomUUID().replaceAll('-', '')}`; const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`INSERT INTO retrieval_runs(retrieval_run_id,bot_app_id,session_id,turn_id,query_hash,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.botAppId, input.sessionId, input.turnId ?? null, input.queryHash, input.mode,
+        input.candidateCount, input.eligibleCount, input.latencyMs, JSON.stringify(input.warnings), now);
+      const insert = this.db.prepare(`INSERT INTO retrieval_results(retrieval_run_id,item_id,item_kind,provider_ids_json,score,eligible,filter_reason)
+        VALUES(?,?,?,?,?,?,?)`);
+      for (const result of input.results) insert.run(id, result.itemId, result.itemKind, JSON.stringify(result.providerIds), result.score,
+        result.eligible ? 1 : 0, result.filterReason ?? null);
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+    return id;
+  }
+
+  recordPromptInjectionSnapshot(input: {
+    retrievalRunId: string; botAppId: string; mode: string;
+    disposition: 'off' | 'would_inject' | 'injected' | 'skipped'; itemIds: string[];
+    prompt?: string; reason?: string;
+  }): string {
+    const id = `inject_${randomUUID().replaceAll('-', '')}`; const prompt = input.prompt ?? '';
+    this.db.prepare(`INSERT INTO prompt_injection_snapshots(snapshot_id,retrieval_run_id,bot_app_id,mode,disposition,item_ids_json,prompt_hash,prompt_bytes,reason,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, input.retrievalRunId, input.botAppId, input.mode, input.disposition,
+      JSON.stringify(input.itemIds), prompt ? sha256(prompt) : null, Buffer.byteLength(prompt), input.reason ?? null, new Date().toISOString());
+    return id;
+  }
+
   getMemory(memoryId: string): MemoryItem | null {
     const row = this.db.prepare('SELECT * FROM memory_items WHERE memory_id=?').get(memoryId) as any;
     return row ? this.memoryFromRow(row) : null;
@@ -1346,6 +1401,19 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase9(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 9) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE9_SCHEMA);
+      this.db.exec('PRAGMA user_version=9;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
   private migrateToPhase8(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -1438,6 +1506,9 @@ export class ObservationStore {
       'memory_backend_bindings',
       'memory_backend_outbox',
       'memory_backend_migrations',
+      'retrieval_runs',
+      'retrieval_results',
+      'prompt_injection_snapshots',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
