@@ -9,7 +9,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -111,6 +111,17 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE7_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS memory_backend_bindings (
+    memory_id TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL, provider_version TEXT NOT NULL, backend_ref TEXT,
+    write_state TEXT NOT NULL CHECK(write_state IN ('pending','active','failed','revoked','shadow')),
+    content_hash TEXT NOT NULL, last_verified_at TEXT, last_error TEXT, updated_at TEXT NOT NULL,
+    PRIMARY KEY(memory_id,provider_id)
+  );
+  CREATE INDEX IF NOT EXISTS memory_backend_bindings_provider ON memory_backend_bindings(provider_id,write_state,updated_at);
 `;
 
 const PHASE6_SCHEMA = `
@@ -364,6 +375,12 @@ export interface MemoryItem {
   updatedAt: string;
 }
 
+export interface MemoryBackendBinding {
+  memoryId: string; providerId: string; providerVersion: string; backendRef?: string;
+  writeState: 'pending' | 'active' | 'failed' | 'revoked' | 'shadow';
+  contentHash: string; lastVerifiedAt?: string; lastError?: string; updatedAt: string;
+}
+
 export interface MemoryUpsertInput {
   memoryId?: string;
   state?: 'proposed' | 'active';
@@ -506,6 +523,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 4) this.migrateToPhase4();
     if (this.schemaVersion() < 5) this.migrateToPhase5();
     if (this.schemaVersion() < 6) this.migrateToPhase6();
+    if (this.schemaVersion() < 7) this.migrateToPhase7();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -865,6 +883,27 @@ export class ObservationStore {
       throw error;
     }
     return { item: this.getMemory(memoryId)!, created: true, conflicted: false };
+  }
+
+  upsertMemoryBackendBinding(input: Omit<MemoryBackendBinding, 'updatedAt'>): MemoryBackendBinding {
+    if (!this.getMemory(input.memoryId)) throw new Error('km_memory_not_found');
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO memory_backend_bindings(
+      memory_id,provider_id,provider_version,backend_ref,write_state,content_hash,last_verified_at,last_error,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(memory_id,provider_id) DO UPDATE SET
+      provider_version=excluded.provider_version,backend_ref=excluded.backend_ref,write_state=excluded.write_state,
+      content_hash=excluded.content_hash,last_verified_at=excluded.last_verified_at,last_error=excluded.last_error,updated_at=excluded.updated_at`)
+      .run(input.memoryId, requireText(input.providerId, 'memory_provider_id'), requireText(input.providerVersion, 'memory_provider_version'),
+        input.backendRef ?? null, input.writeState, input.contentHash, input.lastVerifiedAt ?? null, input.lastError ?? null, now);
+    return this.listMemoryBackendBindings(input.memoryId).find(item => item.providerId === input.providerId)!;
+  }
+
+  listMemoryBackendBindings(memoryId: string): MemoryBackendBinding[] {
+    const rows = this.db.prepare(`SELECT * FROM memory_backend_bindings WHERE memory_id=? ORDER BY provider_id`).all(memoryId) as any[];
+    return rows.map(row => ({ memoryId: row.memory_id, providerId: row.provider_id, providerVersion: row.provider_version,
+      ...(row.backend_ref ? { backendRef: row.backend_ref } : {}), writeState: row.write_state, contentHash: row.content_hash,
+      ...(row.last_verified_at ? { lastVerifiedAt: row.last_verified_at } : {}), ...(row.last_error ? { lastError: row.last_error } : {}),
+      updatedAt: row.updated_at }));
   }
 
   getMemory(memoryId: string): MemoryItem | null {
@@ -1260,6 +1299,19 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase7(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 7) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE7_SCHEMA);
+      this.db.exec('PRAGMA user_version=7;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
   private migrateToPhase6(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -1323,6 +1375,7 @@ export class ObservationStore {
       'km_provider_registry',
       'km_pipeline_profiles',
       'distillation_jobs',
+      'memory_backend_bindings',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
