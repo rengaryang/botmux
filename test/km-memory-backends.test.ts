@@ -62,7 +62,7 @@ describe('pluggable memory backends', () => {
   it('keeps real transport disabled and allows only mock/in-memory provider wiring', async () => {
     const transport = new InMemoryMemoryBackendTransport();
     const result = createMemoryBackendProvider({
-      config: { providerId: 'mem0', endpoint: 'https://mem0.example.test', credentialRef: 'env:MEM0_TOKEN', enabled: true, realTransportEnabled: false, timeoutMs: 500 },
+      config: { providerId: 'mem0', endpoint: 'mock://mem0', credentialRef: 'env:MEM0_TOKEN', enabled: true, realTransportEnabled: false, timeoutMs: 500 },
       env: { MEM0_TOKEN: 'token' } as any,
       transport,
     });
@@ -70,9 +70,13 @@ describe('pluggable memory backends', () => {
     await expect(result.provider!.put(write)).resolves.toEqual(expect.objectContaining({ providerId: 'mem0', backendRef: 'mem0:mem-1' }));
     await expect(new DisabledRealTransport().request({ providerId: 'mem0', operation: 'health', payload: {} })).rejects.toThrow(/real_transport_disabled/);
     expect(createMemoryBackendProvider({
-      config: { providerId: 'mem0', endpoint: 'https://mem0.example.test', credentialRef: 'env:MEM0_TOKEN', enabled: true, realTransportEnabled: false, timeoutMs: 500 },
+      config: { providerId: 'mem0', endpoint: 'mock://mem0', credentialRef: 'env:MEM0_TOKEN', enabled: true, realTransportEnabled: false, timeoutMs: 500 },
       env: {} as any,
     })).toEqual(expect.objectContaining({ status: 'credential_missing' }));
+    expect(createMemoryBackendProvider({
+      config: { providerId: 'mem0', endpoint: 'https://mem0.example.test', credentialRef: 'env:MEM0_TOKEN', enabled: true, realTransportEnabled: false, timeoutMs: 500 },
+      env: { MEM0_TOKEN: 'token' } as any,
+    })).toEqual(expect.objectContaining({ status: 'unsafe_endpoint' }));
   });
 
   it('resolves env and file credentials without permitting paths outside the secret dir', () => {

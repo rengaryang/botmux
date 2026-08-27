@@ -11,6 +11,14 @@ describe('KM live prompt-memory daemon boundary', () => {
     expect(daemonSource).not.toContain('runRetrievalShadow');
   });
 
+  it('starts backend outbox runtime only behind explicit observation and worker gates', () => {
+    expect(daemonSource).toContain('runKmBackendWorkerOnce');
+    expect(daemonSource.match(/runKmBackendWorkerOnce\(/g)).toHaveLength(1);
+    const gate = 'if (kmBackendWorkerRunning || !isKmObservationEnabled() || !isKmBackendWorkerEnabled()) return;';
+    expect(daemonSource).toContain(gate);
+    expect(daemonSource).toContain('clearInterval(kmBackendWorkerTimer)');
+  });
+
   it('composes before ordinary prompt builders and after command early returns', () => {
     const helper = daemonSource.indexOf('const composePromptMemoryAtBoundary');
     const call = daemonSource.indexOf('await composePromptMemoryAtBoundary(ds)');

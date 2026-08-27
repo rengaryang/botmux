@@ -4,6 +4,8 @@ import { jsonRes } from './http.js';
 import { ObservationEventTypeSchema } from '../services/km/observation-schema.js';
 import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema } from '../services/km/provider-spi.js';
 import type { ObservationStore } from '../services/km/observation-store.js';
+import type { KmBackendRuntimeStatus } from '../services/km/memory-backend-runtime.js';
+import { compareMemoryBackendMigration, enqueueMemoryBackendMigrationBackfill } from '../services/km/memory-backend-migration.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -34,6 +36,14 @@ export interface KmObservationApiStore {
   listMemoryProviderConfigs?(): ReturnType<ObservationStore['listMemoryProviderConfigs']>;
   putMemoryProviderConfig?(input: Parameters<ObservationStore['putMemoryProviderConfig']>[0]): ReturnType<ObservationStore['putMemoryProviderConfig']>;
   memoryProviderConfigurationHealth?(providerId: string): ReturnType<ObservationStore['memoryProviderConfigurationHealth']>;
+  listMemoryBackendOutbox?(limit: number): ReturnType<ObservationStore['listMemoryBackendOutbox']>;
+  listMemoryBackendMigrations?(limit: number): ReturnType<ObservationStore['listMemoryBackendMigrations']>;
+  createMemoryBackendMigration?(input: Parameters<ObservationStore['createMemoryBackendMigration']>[0]): ReturnType<ObservationStore['createMemoryBackendMigration']>;
+  getMemoryBackendMigration?(migrationId: string): ReturnType<ObservationStore['getMemoryBackendMigration']>;
+  transitionMemoryBackendMigration?(input: Parameters<ObservationStore['transitionMemoryBackendMigration']>[0]): ReturnType<ObservationStore['transitionMemoryBackendMigration']>;
+  listMemoryForBackendMigration?(input: Parameters<ObservationStore['listMemoryForBackendMigration']>[0]): ReturnType<ObservationStore['listMemoryForBackendMigration']>;
+  enqueueMemoryBackendOperation?(input: Parameters<ObservationStore['enqueueMemoryBackendOperation']>[0]): ReturnType<ObservationStore['enqueueMemoryBackendOperation']>;
+  compareMemoryBackendBindings?(input: Parameters<ObservationStore['compareMemoryBackendBindings']>[0]): ReturnType<ObservationStore['compareMemoryBackendBindings']>;
   executeKmMutation?<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string; statusCode: number;
     action: string; targetRef: string; beforeHash?: string; afterHash?: (response: T) => string | undefined }, operation: () => T):
     { statusCode: number; response: T; replayed: boolean };
@@ -48,6 +58,7 @@ export interface KmObservationApiDeps {
   enabled: boolean;
   actorId?: string;
   openStore(): Promise<KmObservationApiStore>;
+  backendRuntimeStatus?(): Promise<KmBackendRuntimeStatus>;
 }
 
 class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -97,10 +108,14 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/injections'
     || url.pathname === '/api/km/profiles'
     || url.pathname === '/api/km/provider-configs'
+    || url.pathname === '/api/km/backend-runtime'
+    || url.pathname === '/api/km/backend-outbox'
+    || url.pathname === '/api/km/backend-migrations'
     || url.pathname === '/api/km/config-audit'
     || url.pathname === '/api/km/memory-policy-decisions'
     || url.pathname === '/api/km/retrieval/quality'
     || /^\/api\/km\/provider-configs\/[^/]+\/health$/.test(url.pathname)
+    || /^\/api\/km\/backend-migrations\/[^/]+\/(backfill|compare)$/.test(url.pathname)
     || /^\/api\/km\/profiles\/[^/]+\/\d+\/state$/.test(url.pathname)
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
   if (!kmReadPath) return false;
@@ -153,6 +168,59 @@ export async function handleKmObservationApi(
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw); const config = KmMemoryProviderConfigSchema.parse(body);
       executeMutation(ctx, 200, 'provider.configured', config.providerId, () => ({ providerId: config.providerId,
         configHash: store!.putMemoryProviderConfig!(config), realTransportEnabled: false }), { afterHash: response => response.configHash }); return true;
+    }
+
+    if (url.pathname === '/api/km/backend-migrations' && req.method === 'POST') {
+      if (!store.createMemoryBackendMigration) throw new Error('km_memory_migrations_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const botAppId = String(body.botAppId ?? '').trim();
+      const fromProfile = (body.fromProfile ?? {}) as Record<string, unknown>;
+      const toProfile = (body.toProfile ?? {}) as Record<string, unknown>;
+      if (!botAppId) throw new KmApiError(422, 'km_memory_migration_bot_required');
+      executeMutation(ctx, 201, 'memory_backend_migration.created', botAppId, () => ({
+        migrationId: store!.createMemoryBackendMigration!({ botAppId, fromProfile, toProfile }),
+        state: 'draft',
+        automaticCutover: false,
+      })); return true;
+    }
+
+    const migrationBackfill = url.pathname.match(/^\/api\/km\/backend-migrations\/([^/]+)\/backfill$/);
+    if (migrationBackfill) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.getMemoryBackendMigration || !store.transitionMemoryBackendMigration
+        || !store.listMemoryForBackendMigration || !store.enqueueMemoryBackendOperation) throw new Error('km_memory_migrations_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const toProviderId = String(body.toProviderId ?? '').trim();
+      if (!toProviderId) throw new KmApiError(422, 'km_memory_migration_to_provider_required');
+      executeMutation(ctx, 200, 'memory_backend_migration.backfill_dry_run', decodeURIComponent(migrationBackfill[1]), () =>
+        enqueueMemoryBackendMigrationBackfill({ store: {
+          getMemoryBackendMigration: store!.getMemoryBackendMigration!.bind(store),
+          transitionMemoryBackendMigration: store!.transitionMemoryBackendMigration!.bind(store),
+          listMemoryForBackendMigration: store!.listMemoryForBackendMigration!.bind(store),
+          enqueueMemoryBackendOperation: store!.enqueueMemoryBackendOperation!.bind(store),
+        }, migrationId: decodeURIComponent(migrationBackfill[1]),
+          toProviderId, limit: typeof body.limit === 'number' ? body.limit : undefined }), {
+        afterHash: response => `sha256:${createHash('sha256').update(JSON.stringify(response.migration)).digest('hex')}`,
+      }); return true;
+    }
+
+    const migrationCompare = url.pathname.match(/^\/api\/km\/backend-migrations\/([^/]+)\/compare$/);
+    if (migrationCompare) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.getMemoryBackendMigration || !store.transitionMemoryBackendMigration || !store.compareMemoryBackendBindings) throw new Error('km_memory_migrations_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const fromProviderId = String(body.fromProviderId ?? '').trim();
+      const toProviderId = String(body.toProviderId ?? '').trim();
+      if (!fromProviderId || !toProviderId) throw new KmApiError(422, 'km_memory_migration_compare_providers_required');
+      executeMutation(ctx, 200, 'memory_backend_migration.compare_dry_run', decodeURIComponent(migrationCompare[1]), () =>
+        compareMemoryBackendMigration({ store: {
+          getMemoryBackendMigration: store!.getMemoryBackendMigration!.bind(store),
+          transitionMemoryBackendMigration: store!.transitionMemoryBackendMigration!.bind(store),
+          compareMemoryBackendBindings: store!.compareMemoryBackendBindings!.bind(store),
+        }, migrationId: decodeURIComponent(migrationCompare[1]),
+          fromProviderId, toProviderId, sampleLimit: typeof body.sampleLimit === 'number' ? body.sampleLimit : undefined }), {
+        afterHash: response => `sha256:${createHash('sha256').update(JSON.stringify(response)).digest('hex')}`,
+      }); return true;
     }
 
     const transition = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/state$/);
@@ -224,6 +292,18 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/provider-configs') {
       if (!store.listMemoryProviderConfigs) throw new Error('km_provider_configs_unavailable');
       jsonRes(res, 200, { items: store.listMemoryProviderConfigs() }); return true;
+    }
+    if (url.pathname === '/api/km/backend-runtime') {
+      if (!deps.backendRuntimeStatus) throw new Error('km_backend_runtime_unavailable');
+      jsonRes(res, 200, await deps.backendRuntimeStatus()); return true;
+    }
+    if (url.pathname === '/api/km/backend-outbox') {
+      if (!store.listMemoryBackendOutbox) throw new Error('km_backend_outbox_unavailable');
+      jsonRes(res, 200, { items: store.listMemoryBackendOutbox(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/backend-migrations') {
+      if (!store.listMemoryBackendMigrations) throw new Error('km_memory_migrations_unavailable');
+      jsonRes(res, 200, { items: store.listMemoryBackendMigrations(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
     }
     if (url.pathname === '/api/km/providers') {
       if (!store.listKmProviders) throw new Error('km_providers_unavailable');

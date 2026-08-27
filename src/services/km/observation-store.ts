@@ -2078,10 +2078,11 @@ export class ObservationStore {
     return hash;
   }
 
-  listMemoryProviderConfigs(): Array<Record<string, unknown>> {
+  listMemoryProviderConfigs(input: { redactCredentials?: boolean } = {}): Array<KmMemoryProviderConfig & { configHash: string; updatedAt: string }> {
+    const redactCredentials = input.redactCredentials ?? true;
     return (this.db.prepare(`SELECT provider_id,config_json,config_hash,updated_at FROM km_memory_provider_configs ORDER BY provider_id`).all() as any[])
       .map(row => { const config = KmMemoryProviderConfigSchema.parse(JSON.parse(row.config_json)); return {
-        ...config, credentialRef: config.credentialRef.replace(/^(env|file):(.+)$/, (_m, kind) => `${kind}:***`),
+        ...config, credentialRef: redactCredentials ? config.credentialRef.replace(/^(env|file):(.+)$/, (_m, kind) => `${kind}:***`) : config.credentialRef,
         configHash: row.config_hash, updatedAt: row.updated_at,
       }; });
   }

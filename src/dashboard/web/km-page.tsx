@@ -24,6 +24,14 @@ type RetrievalAudit = { retrievalRunId: string; botAppId: string; mode: string; 
 type InjectionSnapshot = { snapshotId: string; botAppId: string; mode: string; disposition: string; itemIds: string[]; promptBytes: number };
 type PipelineProfile = { profile: { profileId: string; revision: number; botAppId: string; injectionMode: 'off' | 'shadow' | 'canary' | 'active'; memoryBackends: { writePolicy: string; primary: string; mirrors: string[] }; budgets: { promptTokens: number } }; state: string; requestedMode: string; effectiveMode: string; profileHash: string; createdAt: string };
 type ProviderConfig = { providerId: 'mem0' | 'hindsight' | 'openviking'; endpoint: string; credentialRef: string; enabled: boolean; realTransportEnabled: false; timeoutMs: number; updatedAt: string };
+type BackendRuntime = {
+  enabled: boolean;
+  leaseName: string;
+  outbox: { total: number; pending: number; inflight: number; failed: number; delivered: number; quarantined: number; oldestPendingAgeMs: number };
+  providers: Array<{ providerId: string; endpoint: string; enabled: boolean; status: string; reason?: string }>;
+};
+type BackendOutboxItem = { outboxId: string; memoryId: string; providerId: string; operation: string; status: string; attempts: number; lastError?: string; updatedAt: string };
+type BackendMigration = { migrationId: string; botAppId: string; state: string; checkpoint?: string; stats: Record<string, unknown>; updatedAt: string };
 type MemoryPolicyDecision = { decisionId: string; sourceEventId: string; memoryId?: string; policyVersion: string; disposition: string; reasonCodes: string[]; evidence: { claimKey?: string; subject?: string }; createdAt: string };
 type ConfigAudit = { auditId: string; actorId: string; action: string; targetRef: string; createdAt: string };
 type RetrievalQuality = {
@@ -96,6 +104,9 @@ function KmPage(): React.JSX.Element {
   const [injections, setInjections] = useState<InjectionSnapshot[]>([]);
   const [profiles, setProfiles] = useState<PipelineProfile[]>([]);
   const [providerConfigs, setProviderConfigs] = useState<ProviderConfig[]>([]);
+  const [backendRuntime, setBackendRuntime] = useState<BackendRuntime>();
+  const [backendOutbox, setBackendOutbox] = useState<BackendOutboxItem[]>([]);
+  const [backendMigrations, setBackendMigrations] = useState<BackendMigration[]>([]);
   const [policyDecisions, setPolicyDecisions] = useState<MemoryPolicyDecision[]>([]);
   const [configAudit, setConfigAudit] = useState<ConfigAudit[]>([]);
   const [retrievalQuality, setRetrievalQuality] = useState<RetrievalQuality>();
@@ -106,7 +117,7 @@ function KmPage(): React.JSX.Element {
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, policyDecisionList, configAuditList, quality] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -120,6 +131,9 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: InjectionSnapshot[] }>('/api/km/injections?limit=20'),
         getJson<{ items: PipelineProfile[] }>('/api/km/profiles'),
         getJson<{ items: ProviderConfig[] }>('/api/km/provider-configs'),
+        getJson<BackendRuntime>('/api/km/backend-runtime'),
+        getJson<{ items: BackendOutboxItem[] }>('/api/km/backend-outbox?limit=20'),
+        getJson<{ items: BackendMigration[] }>('/api/km/backend-migrations?limit=20'),
         getJson<{ items: MemoryPolicyDecision[] }>('/api/km/memory-policy-decisions?limit=20'),
         getJson<{ items: ConfigAudit[] }>('/api/km/config-audit?limit=20'),
         getJson<RetrievalQuality>('/api/km/retrieval/quality'),
@@ -133,6 +147,7 @@ function KmPage(): React.JSX.Element {
       setSyncStatus(syncList.items);
       setProviders(providerList.items); setJobs(jobList.items); setRetrievals(retrievalList.items); setInjections(injectionList.items);
       setProfiles(profileList.items); setProviderConfigs(providerConfigList.items);
+      setBackendRuntime(backendRuntimeStatus); setBackendOutbox(backendOutboxList.items); setBackendMigrations(backendMigrationList.items);
       setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items); setRetrievalQuality(quality);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -208,6 +223,9 @@ function KmPage(): React.JSX.Element {
         <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
         <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
         <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
+        <article><span>Backend Worker</span><strong>{backendRuntime?.enabled ? '已开启' : '未开启'}</strong></article>
+        <article><span>Backend Outbox</span><strong>{backendRuntime?.outbox.pending ?? '—'}/{backendRuntime?.outbox.total ?? '—'}</strong></article>
+        <article><span>Backend 隔离</span><strong>{backendRuntime?.outbox.quarantined ?? '—'}</strong></article>
         <article><span>Eval 运行</span><strong>{health?.evalEvolution.evalRuns ?? '—'}</strong></article>
         <article><span>失败 Eval</span><strong>{health?.evalEvolution.failingEvalRuns ?? '—'}</strong></article>
         <article><span>待审提案</span><strong>{health?.evalEvolution.reviewPendingProposals ?? '—'}</strong></article>
@@ -301,7 +319,17 @@ function KmPage(): React.JSX.Element {
         <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>只保存 endpoint 与 credential reference；不保存密钥，不发网络请求，realTransportEnabled 固定为 false。</p>
         <div className="feedback-deliveries">
           {providerConfigs.map(config => <div key={config.providerId}><code>{config.providerId}</code><span>{config.endpoint}</span><span>{config.credentialRef} · {config.timeoutMs}ms</span><b>{config.enabled ? 'configured' : 'disabled'} / transport off <button onClick={() => void checkProvider(config.providerId)}>检查</button></b></div>)}
+          {backendRuntime?.providers.map(provider => <div key={`runtime-${provider.providerId}`}><code>runtime</code><span>{provider.providerId} · {provider.endpoint}</span><span>{provider.reason ?? 'mock-only gate checked'}</span><b>{provider.status}</b></div>)}
           {configAudit.map(item => <div key={item.auditId}><code>audit</code><span>{item.action} · {item.targetRef}</span><span>{item.actorId}</span><b>{item.createdAt}</b></div>)}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Backend Runtime / Migration</h2>
+        <div className="feedback-deliveries">
+          {backendOutbox.map(item => <div key={item.outboxId}><code>{item.providerId}</code><span>{item.operation} · {item.memoryId}</span><span>attempt {item.attempts}{item.lastError ? ` · ${item.lastError}` : ''}</span><b>{item.status}</b></div>)}
+          {backendMigrations.map(item => <div key={item.migrationId}><code>migration</code><span>{item.botAppId} · {item.migrationId}</span><span>checkpoint {item.checkpoint ?? '—'} · {JSON.stringify(item.stats)}</span><b>{item.state}</b></div>)}
+          {backendOutbox.length + backendMigrations.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 backend outbox 或迁移任务。</p>}
         </div>
       </section>
 

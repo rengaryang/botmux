@@ -90,7 +90,16 @@ export class InMemoryMemoryBackendTransport implements MemoryBackendTransport {
 export interface MemoryBackendFactoryResult {
   provider?: MemoryBackendProvider;
   credential?: CredentialResolverResult;
-  status: 'ready' | 'disabled' | 'credential_missing' | 'real_transport_disabled';
+  status: 'ready' | 'disabled' | 'credential_missing' | 'real_transport_disabled' | 'unsafe_endpoint';
+}
+
+function isExplicitMockEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === 'mock:' || url.protocol === 'inmemory:';
+  } catch {
+    return false;
+  }
 }
 
 export function createMemoryBackendProvider(input: {
@@ -102,6 +111,7 @@ export function createMemoryBackendProvider(input: {
 }): MemoryBackendFactoryResult {
   const config = KmMemoryProviderConfigSchema.parse(input.config);
   if (!config.enabled) return { status: 'disabled' };
+  if (!isExplicitMockEndpoint(config.endpoint)) return { status: 'unsafe_endpoint' };
   const credential = resolveMemoryBackendCredential({ credentialRef: config.credentialRef, env: input.env, secretDir: input.secretDir });
   if (!credential.ok) return { status: 'credential_missing', credential };
   if (config.realTransportEnabled || input.allowRealTransport) {
@@ -115,3 +125,5 @@ export function createMemoryBackendProvider(input: {
       : new OpenVikingMemoryBackend(transport);
   return { status: 'ready', provider, credential };
 }
+
+export const __testOnly_isExplicitMockMemoryBackendEndpoint = isExplicitMockEndpoint;
