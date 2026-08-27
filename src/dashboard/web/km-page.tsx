@@ -17,7 +17,7 @@ type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; t
 type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
 type TraceEdge = { edgeId: string; fromType: string; fromId: string; toType: string; toId: string; edgeType: string };
 type SyncStatus = { sinkId: string; endpointRef: string; enabled: boolean; status: string; pending: number; quarantined: number; lastLocalSeq: number; lastAckAt?: string };
-type ProviderStatus = { providerId: string; kind: string; version: string; status: string };
+type ProviderStatus = { providerId: string; kind: string; version: string; status: string; descriptor?: { capabilities?: string[]; execution?: string; supportsShadow?: boolean } };
 type DistillationJob = { jobId: string; state: string; botAppId: string; profileId: string; attempts: number; lastError?: string };
 type RetrievalAudit = { retrievalRunId: string; botAppId: string; mode: string; candidateCount: number; eligibleCount: number; latencyMs: number };
 type InjectionSnapshot = { snapshotId: string; botAppId: string; mode: string; disposition: string; itemIds: string[]; promptBytes: number };
@@ -153,6 +153,14 @@ function KmPage(): React.JSX.Element {
       { state, expectedHash: entry.profileHash }); setNotice(`Profile 已切换为 ${state}`); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
+  const changeMemoryState = async (item: MemoryItem, state: string, reasonCode: string) => {
+    if (!window.confirm(`确认将 ${item.claimKey} 从 ${item.state} 切换为 ${state}？`)) return;
+    try {
+      await mutateJson(`/api/km/memory/${encodeURIComponent(item.memoryId)}/state`, 'PATCH', { toState: state, reasonCode });
+      setNotice(`Memory 已切换为 ${state}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
   const saveProvider = async () => {
     try { await mutateJson('/api/km/provider-configs', 'PUT', { ...providerForm, realTransportEnabled: false }); setNotice('Provider 配置已保存，真实 transport 仍关闭'); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
@@ -209,7 +217,12 @@ function KmPage(): React.JSX.Element {
         <h2>Knowledge / Memory Review</h2>
         <div className="feedback-deliveries">
           {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}</b></div>)}
-          {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}</b></div>)}
+          {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}{' '}
+            {(item.state === 'proposed' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'expired') && <button onClick={() => void changeMemoryState(item, 'active', 'review_approved')}>Approve</button>}{' '}
+            {item.state === 'proposed' && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_rejected')}>Reject</button>}{' '}
+            {(item.state === 'active' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'shadowed') && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_revoked')}>Revoke</button>}{' '}
+            {item.state === 'active' && <button onClick={() => void changeMemoryState(item, 'conflicted', 'review_conflict')}>Conflict</button>}
+          </b></div>)}
           {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
           {knowledge.length + memory.length + policyDecisions.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
         </div>
@@ -273,7 +286,7 @@ function KmPage(): React.JSX.Element {
       <section className="panel">
         <h2>Providers / Distillation / Retrieval Shadow</h2>
         <div className="feedback-deliveries">
-          {providers.map(provider => <div key={`${provider.providerId}@${provider.version}`}><code>{provider.kind}</code><span>{provider.providerId}</span><span>v{provider.version}</span><b>{provider.status}</b></div>)}
+          {providers.map(provider => <div key={`${provider.providerId}@${provider.version}`}><code>{provider.kind}</code><span>{provider.providerId}</span><span>{provider.descriptor?.execution ?? '—'} · {(provider.descriptor?.capabilities ?? []).slice(0, 3).join(', ')}</span><b>v{provider.version} · {provider.status}</b></div>)}
           {jobs.map(job => <div key={job.jobId}><code>distill</code><span>{job.profileId} · {job.botAppId}</span><span>attempt {job.attempts}</span><b>{job.state}</b></div>)}
           {retrievals.map(run => <div key={run.retrievalRunId}><code>retrieve</code><span>{run.botAppId} · {run.mode}</span><span>{run.candidateCount} → {run.eligibleCount}</span><b>{run.latencyMs}ms</b></div>)}
           {injections.map(item => <div key={item.snapshotId}><code>inject</code><span>{item.botAppId} · {item.mode}</span><span>{item.itemIds.length} items · {item.promptBytes} bytes</span><b>{item.disposition}</b></div>)}

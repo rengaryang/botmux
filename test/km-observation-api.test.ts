@@ -99,19 +99,56 @@ describe('KM observation dashboard API', () => {
     expect(retrieve).toHaveBeenCalledWith({ text: 'failover', limit: 20, subject: 'u1', scopes: ['user'], targetLayers: ['L3'] });
   });
 
-  it('serves trace/evolution reads and enforces approval grade through the store', async () => {
-    const listTrace = vi.fn(() => [{ edgeId: 'edge-1' }]);
-    const listEvolution = vi.fn(() => [{ proposalId: 'evo-1' }]);
-    const decideProposal = vi.fn(() => ({ approvalId: 'approval-1', state: 'approved' }));
-    const listEvalRuns = vi.fn(() => [{ evalRunId: 'eval-1' }]);
-    const listSyncStatus = vi.fn(() => [{ sinkId: 'mock', enabled: false }]);
+  it('serves guarded memory review state transitions', async () => {
+    const transitionMemory = vi.fn(() => ({ memoryId: 'mem-1', state: 'active' }));
     const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
     const deps = {
       enabled: true,
       actorId: 'reviewer-1',
       openStore: async () => ({
         schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
-        listTrace, listEvolution, decideProposal, listEvalRuns, listSyncStatus, executeKmMutation,
+        transitionMemory, executeKmMutation,
+      }),
+    };
+    const result = response();
+    const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ toState: 'active', reasonCode: 'review_approved' }))]), {
+      method: 'PATCH',
+      headers: { 'idempotency-key': 'memory-key-1' },
+    });
+    await handleKmObservationApi(req as any, result.res, new URL('http://localhost/api/km/memory/mem-1/state'), deps);
+    expect(transitionMemory).toHaveBeenCalledWith({
+      memoryId: 'mem-1',
+      toState: 'active',
+      reasonCode: 'review_approved',
+      actorId: 'reviewer-1',
+    });
+    expect(executeKmMutation).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'memory.state_changed',
+      targetRef: 'mem-1',
+    }), expect.any(Function));
+    expect(result.bodies).toEqual([{ memoryId: 'mem-1', state: 'active' }]);
+  });
+
+  it('serves trace/evolution reads and enforces approval grade through the store', async () => {
+    const listTrace = vi.fn(() => [{ edgeId: 'edge-1' }]);
+    const listEvolution = vi.fn(() => [{ proposalId: 'evo-1' }]);
+    const decideProposal = vi.fn(() => ({ approvalId: 'approval-1', state: 'approved' }));
+    const listEvalRuns = vi.fn(() => [{ evalRunId: 'eval-1' }]);
+    const listSyncStatus = vi.fn(() => [{ sinkId: 'mock', enabled: false }]);
+    const listKmProviders = vi.fn(() => [{
+      providerId: 'builtin.rules-v1',
+      kind: 'extractor',
+      version: '1',
+      status: 'validated',
+      descriptor: { capabilities: ['explicit-user-preferences'], execution: 'in-process' },
+    }]);
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const deps = {
+      enabled: true,
+      actorId: 'reviewer-1',
+      openStore: async () => ({
+        schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+        listTrace, listEvolution, decideProposal, listEvalRuns, listSyncStatus, listKmProviders, executeKmMutation,
       }),
     };
     const trace = response();
@@ -124,6 +161,17 @@ describe('KM observation dashboard API', () => {
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, sync.res,
       new URL('http://localhost/api/km/sync/sinks'), deps);
     expect(sync.bodies).toEqual([{ items: [{ sinkId: 'mock', enabled: false }] }]);
+
+    const providers = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, providers.res,
+      new URL('http://localhost/api/km/providers'), deps);
+    expect(providers.bodies).toEqual([{ items: [{
+      providerId: 'builtin.rules-v1',
+      kind: 'extractor',
+      version: '1',
+      status: 'validated',
+      descriptor: { capabilities: ['explicit-user-preferences'], execution: 'in-process' },
+    }] }]);
 
     const evals = response();
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, evals.res,

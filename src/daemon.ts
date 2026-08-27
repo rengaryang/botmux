@@ -82,7 +82,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
-import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { getSkillFeedbackStore, type TurnCompletionEventPayload } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
@@ -137,6 +137,41 @@ function trustedCallerForTurn(
     ...(senderUnionId ? { requestUserUnionId: senderUnionId } : {}),
     requestLarkAppId: larkAppId,
   };
+}
+
+function handleDurableTurnCompletionForKm(
+  ds: DaemonSession,
+  payload: TurnCompletionEventPayload,
+  source: string,
+): void {
+  if (!isKmObservationEnabled()) return;
+  const observation = observationFromTurnCompletion(payload);
+  void enqueueObservation({
+    dataDir: config.session.dataDir,
+    event: observation,
+    onResult: result => {
+      if (result.status === 'quarantined') return;
+      const botConfig = getBot(ds.larkAppId).config;
+      void enqueueAutomaticDistillation({
+        dataDir: config.session.dataDir,
+        event: observation,
+        cliId: ds.session.cliId ?? botConfig.cliId,
+        model: ds.session.model ?? botConfig.model,
+        cliSessionId: ds.session.cliSessionId,
+        cwd: ds.session.workingDir ?? ds.workingDir,
+      })
+        .then(() => runOneDistillationJob({
+          dataDir: config.session.dataDir,
+          cliId: ds.session.cliId ?? botConfig.cliId,
+          model: ds.session.model ?? botConfig.model,
+        }))
+        .catch(error => logger.warn(`[km-distillation:${source}] ${error instanceof Error ? error.message : String(error)}`));
+    },
+    onError: error => logger.warn(
+      `[km-observation:${source}] turn persistence failed turn=${payload.turnId.slice(0, 12)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ),
+  });
 }
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
@@ -21812,29 +21847,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
           onPersisted: payload => {
-            if (!payload || !isKmObservationEnabled()) return;
-            const observation = observationFromTurnCompletion(payload);
-            void enqueueObservation({
-              dataDir: config.session.dataDir,
-              event: observation,
-              onResult: result => {
-                if (result.status === 'quarantined') return;
-                const botConfig = getBot(ds.larkAppId).config;
-                void enqueueAutomaticDistillation({ dataDir: config.session.dataDir, event: observation,
-                  cliId: ds.session.cliId ?? botConfig.cliId, model: ds.session.model ?? botConfig.model,
-                  cliSessionId: ds.session.cliSessionId, cwd: ds.session.workingDir ?? ds.workingDir })
-                  .then(() => runOneDistillationJob({ dataDir: config.session.dataDir, cliId: ds.session.cliId ?? botConfig.cliId,
-                    model: ds.session.model ?? botConfig.model }))
-                  .catch(error => logger.warn(`[km-distillation] ${error instanceof Error ? error.message : String(error)}`));
-              },
-              onError: error => logger.warn(
-                `[km-observation] turn persistence failed turn=${terminal.turnId.slice(0, 12)}: `
-                + `${error instanceof Error ? error.message : String(error)}`,
-              ),
-            });
+            if (payload) handleDurableTurnCompletionForKm(ds, payload, 'terminal');
           },
         });
       }
+    },
+    onTurnCompletion(ds, payload, context) {
+      void context;
+      handleDurableTurnCompletionForKm(ds, payload, 'delivery');
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);

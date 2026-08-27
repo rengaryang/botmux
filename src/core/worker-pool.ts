@@ -102,6 +102,7 @@ import { RestartCoordinator, type RestartObserver } from './restart-coordinator.
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import type { TurnCompletionEventPayload } from '../services/skill-feedback-store.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -586,6 +587,14 @@ export interface WorkerPoolCallbacks {
   onTurnTerminal?: (
     ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+    context: { workerGeneration: number },
+  ) => void | Promise<void>;
+  /** Fired when a delivery write creates or replays a durable turn.completed
+   *  payload. This covers delivery-after-terminal order, where onTurnTerminal
+   *  has no payload yet. */
+  onTurnCompletion?: (
+    ds: DaemonSession,
+    payload: TurnCompletionEventPayload,
     context: { workerGeneration: number },
   ) => void | Promise<void>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
@@ -12393,6 +12402,8 @@ function setupWorkerHandlers(
                       () => ds.worker === worker
                         && ds.session.sessionId === msg.sessionId,
                       preview.settledEntry.replyTarget,
+                      undefined,
+                      workerGeneration,
                     );
                   });
               if (!owned) return false;
@@ -12501,6 +12512,9 @@ function setupWorkerHandlers(
           0,
           undefined,
           ownsLifecycleMutation,
+          undefined,
+          undefined,
+          workerGeneration,
         );
         break;
       }
@@ -12818,11 +12832,12 @@ async function persistFinalOutputFeedback(
   requesterSubjectId: string | undefined,
   webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
   logTag: string,
+  workerGeneration: number,
 ): Promise<void> {
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    feedbackStore.recordTurnDelivery({
+    const result = feedbackStore.recordTurnDeliveryWithCompletion({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
@@ -12847,6 +12862,15 @@ async function persistFinalOutputFeedback(
       webhookDestinations,
       context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
     });
+    if (result.completion) {
+      try {
+        await requireCallbacks().onTurnCompletion?.(ds, result.completion, { workerGeneration });
+      } catch (error) {
+        logger.warn(
+          `[${logTag}] Durable turn completion consumer failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   } catch (error) {
     logger.warn(
       `[${logTag}] Failed to persist final-output feedback delivery: ${error instanceof Error ? error.message : String(error)}`,
@@ -12863,6 +12887,7 @@ function deliverFinalOutput(
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
+  workerGeneration = closeFenceGeneration(ds),
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -13237,7 +13262,7 @@ function deliverFinalOutput(
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
         if (feedbackPolicy && baseFeedbackCard) {
-          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, workerGeneration);
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
@@ -13295,7 +13320,7 @@ function deliverFinalOutput(
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
       if (feedbackPolicy && baseFeedbackCard && messageId) {
-        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, workerGeneration);
       }
       onComplete?.(true);
     } catch (err: any) {
@@ -13330,7 +13355,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, workerGeneration);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
