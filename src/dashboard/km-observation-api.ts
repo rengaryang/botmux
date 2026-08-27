@@ -19,6 +19,10 @@ export interface KmObservationApiStore {
   listEvalRuns?(limit: number): ReturnType<ObservationStore['listEvalRuns']>;
   decideProposal?(input: Parameters<ObservationStore['decideProposal']>[0]): ReturnType<ObservationStore['decideProposal']>;
   listSyncStatus?(): ReturnType<ObservationStore['listSyncStatus']>;
+  listKmProviders?(): ReturnType<ObservationStore['listKmProviders']>;
+  listDistillationJobs?(limit: number): ReturnType<ObservationStore['listDistillationJobs']>;
+  listRetrievalAudits?(limit: number): ReturnType<ObservationStore['listRetrievalAudits']>;
+  listInjectionSnapshots?(limit: number): ReturnType<ObservationStore['listInjectionSnapshots']>;
   close(): void;
 }
 
@@ -52,6 +56,10 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/eval/runs'
     || url.pathname === '/api/km/evolution/proposals'
     || url.pathname === '/api/km/sync/sinks'
+    || url.pathname === '/api/km/providers'
+    || url.pathname === '/api/km/distillation/jobs'
+    || url.pathname === '/api/km/retrieval/runs'
+    || url.pathname === '/api/km/injections'
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
   if (!kmReadPath) return false;
   if (!deps.enabled) {
@@ -108,6 +116,23 @@ export async function handleKmObservationApi(
       if (!type || !id) { jsonRes(res, 400, { error: 'trace_type_and_id_required' }); return true; }
       jsonRes(res, 200, { items: store.listTrace({ type, id, limit: positiveInteger(url.searchParams.get('limit'), 100, 500) }) });
       return true;
+    }
+
+    if (url.pathname === '/api/km/providers') {
+      if (!store.listKmProviders) throw new Error('km_providers_unavailable');
+      jsonRes(res, 200, { items: store.listKmProviders() }); return true;
+    }
+    if (url.pathname === '/api/km/distillation/jobs') {
+      if (!store.listDistillationJobs) throw new Error('km_distillation_jobs_unavailable');
+      jsonRes(res, 200, { items: store.listDistillationJobs(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/retrieval/runs') {
+      if (!store.listRetrievalAudits) throw new Error('km_retrieval_runs_unavailable');
+      jsonRes(res, 200, { items: store.listRetrievalAudits(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/injections') {
+      if (!store.listInjectionSnapshots) throw new Error('km_injections_unavailable');
+      jsonRes(res, 200, { items: store.listInjectionSnapshots(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
     }
 
     if (url.pathname === '/api/km/sync/sinks') {
