@@ -31,7 +31,7 @@ describe('KM provider SPI and durable distillation', () => {
 
   it('persists provider/profile and claims a snapshot-stable job idempotently', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(10);
+    expect(store.schemaVersion()).toBe(11);
     store.registerKmProvider({ id: 'botmux-cli:pi:default', kind: 'extractor', version: '1', contractVersion: 1,
       capabilities: ['strict-json'], execution: 'botmux-cli', deterministic: false, supportsShadow: true, maxBatchSize: 1 });
     expect(store.putPipelineProfile(profile, 'active')).toMatch(/^sha256:/);
@@ -52,6 +52,12 @@ describe('KM provider SPI and durable distillation', () => {
     store.finishDistillationJob({ jobId: first.jobId, claimToken: claimed!.claimToken, outputHash: `sha256:${'a'.repeat(64)}` });
     expect(store.claimDistillationJob({ now: 1000 })).toBeNull();
     expect(store.setPipelineProfileState({ profileId: 'default', revision: 1, state: 'retired' })).toEqual(expect.objectContaining({ state: 'retired' }));
+    const mutation = { actorId: 'u1', idempotencyKey: 'idem-1', route: '/api/km/profiles', requestHash: `sha256:${'c'.repeat(64)}`,
+      statusCode: 201, action: 'profile.created', targetRef: 'default@1' };
+    expect(store.executeKmMutation(mutation, () => ({ ok: true }))).toEqual({ statusCode: 201, response: { ok: true }, replayed: false });
+    expect(store.executeKmMutation(mutation, () => { throw new Error('must_not_run'); })).toEqual({ statusCode: 201, response: { ok: true }, replayed: true });
+    expect(() => store.executeKmMutation({ ...mutation, requestHash: `sha256:${'d'.repeat(64)}` }, () => ({ ok: false }))).toThrow(/idempotency_conflict/);
+    expect(store.listKmConfigAudit(10)).toEqual([expect.objectContaining({ actorId: 'u1', action: 'profile.created' })]);
     store.close();
   });
 

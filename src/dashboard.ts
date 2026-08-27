@@ -3567,8 +3567,14 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const kmMutation = url.pathname.startsWith('/api/km/') && !['GET', 'HEAD'].includes((req.method ?? 'GET').toUpperCase());
+    if (kmMutation) {
+      if (!requestIdentity) return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+    }
     if (await handleKmObservationApi(req, res, url, {
       enabled: isKmObservationEnabled(),
+      actorId: requestIdentity?.userId,
       openStore: () => ObservationStore.open(config.session.dataDir),
     })) return;
 

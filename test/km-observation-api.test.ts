@@ -47,6 +47,8 @@ describe('KM observation dashboard API', () => {
       schemaVersion: 1,
       pragmas: { journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 },
       counts: { observations: 3, quarantined: 1, knowledge: 2, memory: 4 },
+      backlog: { queued: 0, retryWait: 0, oldestAgeMs: 0, claimed: 0 },
+      capabilities: { requestedModes: ['off', 'shadow'], effectiveModes: ['off', 'shadow'], livePromptInjection: false, realMemoryTransport: false },
     }]);
     expect(close).toHaveBeenCalledOnce();
   });
@@ -103,11 +105,13 @@ describe('KM observation dashboard API', () => {
     const decideProposal = vi.fn(() => ({ approvalId: 'approval-1', state: 'approved' }));
     const listEvalRuns = vi.fn(() => [{ evalRunId: 'eval-1' }]);
     const listSyncStatus = vi.fn(() => [{ sinkId: 'mock', enabled: false }]);
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
     const deps = {
       enabled: true,
+      actorId: 'reviewer-1',
       openStore: async () => ({
         schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
-        listTrace, listEvolution, decideProposal, listEvalRuns, listSyncStatus,
+        listTrace, listEvolution, decideProposal, listEvalRuns, listSyncStatus, executeKmMutation,
       }),
     };
     const trace = response();
@@ -133,7 +137,7 @@ describe('KM observation dashboard API', () => {
 
     const decision = response();
     const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ decision: 'approved', grade: 'G2', scope: { target: 'skill' }, riskAck: {} }))]), {
-      method: 'POST', headers: { 'x-km-actor-id': 'reviewer-1' },
+      method: 'POST', headers: { 'idempotency-key': 'evo-key-1' },
     });
     await handleKmObservationApi(req as any, decision.res,
       new URL('http://localhost/api/km/evolution/proposals/evo-1/decision'), deps);
@@ -146,24 +150,46 @@ describe('KM observation dashboard API', () => {
     const setPipelineProfileState = vi.fn(() => ({ state: 'shadow' }));
     const listMemoryProviderConfigs = vi.fn(() => [{ providerId: 'mem0', credentialRef: 'env:***' }]);
     const putMemoryProviderConfig = vi.fn(() => `sha256:${'b'.repeat(64)}`);
-    const deps = { enabled: true, openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
-      listPipelineProfiles, putPipelineProfile, setPipelineProfileState, listMemoryProviderConfigs, putMemoryProviderConfig }) };
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const deps = { enabled: true, actorId: 'reviewer', openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+      listPipelineProfiles, putPipelineProfile, setPipelineProfileState, listMemoryProviderConfigs, putMemoryProviderConfig, executeKmMutation }) };
     const list = response();
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, list.res, new URL('http://localhost/api/km/profiles?botAppId=bot-1'), deps);
     expect(listPipelineProfiles).toHaveBeenCalledWith('bot-1');
 
     const configReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ providerId: 'mem0', endpoint: 'https://memory.example.test',
       credentialRef: 'env:MEM0_KEY', enabled: true, realTransportEnabled: false, timeoutMs: 5000 }))]),
-      { method: 'PUT', headers: { 'x-km-actor-id': 'reviewer', 'idempotency-key': 'key-1' } });
+      { method: 'PUT', headers: { 'idempotency-key': 'key-1' } });
     const config = response();
     await handleKmObservationApi(configReq as any, config.res, new URL('http://localhost/api/km/provider-configs'), deps);
     expect(putMemoryProviderConfig).toHaveBeenCalledWith(expect.objectContaining({ providerId: 'mem0', realTransportEnabled: false }));
 
     const stateReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ state: 'shadow' }))]),
-      { method: 'PATCH', headers: { 'x-km-actor-id': 'reviewer', 'idempotency-key': 'key-2' } });
+      { method: 'PATCH', headers: { 'idempotency-key': 'key-2' } });
     const state = response();
     await handleKmObservationApi(stateReq as any, state.res, new URL('http://localhost/api/km/profiles/default/1/state'), deps);
     expect(setPipelineProfileState).toHaveBeenCalledWith({ profileId: 'default', revision: 1, state: 'shadow' });
+    expect(executeKmMutation).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects oversized mutation bodies and unopened modes', async () => {
+    const executeKmMutation = vi.fn(); const putPipelineProfile = vi.fn();
+    const deps = { enabled: true, actorId: 'reviewer', openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(),
+      list: vi.fn(), get: vi.fn(), close: vi.fn(), executeKmMutation, putPipelineProfile }) };
+    const oversized = response(); const oversizedReq = Object.assign(Readable.from([Buffer.alloc(129 * 1024, 1)]),
+      { method: 'POST', headers: { 'idempotency-key': 'large' } });
+    await handleKmObservationApi(oversizedReq as any, oversized.res, new URL('http://localhost/api/km/profiles'), deps);
+    expect(oversized.res.writeHead).toHaveBeenCalledWith(413, expect.anything());
+
+    const profile = { schemaVersion: 1, profileId: 'p', revision: 1, botAppId: 'bot', sourceProvider: 'source', windowProvider: 'window',
+      primaryExtractor: 'rules', shadowExtractors: [], knowledgeRouter: 'router', memoryPolicy: 'policy',
+      memoryBackends: { writePolicy: 'single', primary: 'sqlite', mirrors: [] }, injectionMode: 'active',
+      budgets: { sourceBytes: 1024, sourceTokens: 100, outputClaims: 1, promptTokens: 100 } };
+    const active = response(); const activeReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ profile, state: 'draft' }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'active' } });
+    await handleKmObservationApi(activeReq as any, active.res, new URL('http://localhost/api/km/profiles'), deps);
+    expect(active.res.writeHead).toHaveBeenCalledWith(422, expect.anything());
+    expect(executeKmMutation).not.toHaveBeenCalled();
   });
 
   it('returns one event and rejects unsupported methods', async () => {

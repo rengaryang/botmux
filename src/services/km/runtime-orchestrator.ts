@@ -9,6 +9,7 @@ import { extractKnowledgeCandidates } from './knowledge-extractor.js';
 import { PiDistillationExecutor } from './pi-distillation-executor.js';
 import { runCliDistillation } from './cli-distillation-runner.js';
 import { decideSafeMemoryActivation } from './safe-memory-policy.js';
+import { extractAttributedUserEvidence, extractExplicitPreferences } from './preference-extractor.js';
 import { planPromptMemory, retrievalQueryHash, type PromptMemoryCandidate } from './prompt-memory.js';
 
 function envOn(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
@@ -86,6 +87,20 @@ export async function runOneDistillationJob(input: { dataDir: string; cliId?: st
     const effectiveWindow = window.status === 'missing' || window.status === 'unsupported' || window.status === 'stale'
       ? boundedEvidenceWindow(event) : window;
     for (const candidate of extractKnowledgeCandidates(event)) store.proposeKnowledge(candidate, 'auto-rules');
+    const evidenceText = effectiveWindow.segments.map(segment => segment.text).join('\n');
+    const requesterSubjectId = typeof event.payload.requesterSubjectId === 'string' ? event.payload.requesterSubjectId : undefined;
+    for (const attributed of extractAttributedUserEvidence(evidenceText)) {
+      for (const preference of extractExplicitPreferences({ event, evidenceText: attributed.text, userId: requesterSubjectId,
+        evidenceOffset: attributed.start, roleAttributed: true })) {
+        const decision = decideSafeMemoryActivation(preference);
+        let memoryId: string | undefined;
+        if (decision.memory) memoryId = store.upsertMemory({ ...decision.memory, evidenceEventId: event.eventId }).item.memoryId;
+        store.recordMemoryPolicyDecision({ sourceEventId: event.eventId, memoryId, policyVersion: decision.policyVersion,
+          disposition: decision.disposition, reasonCodes: decision.reasonCodes,
+          evidence: { claimKey: preference.claimKey, subject: preference.subject, span: { start: preference.evidenceStart, end: preference.evidenceEnd },
+            evidenceTextHash: `sha256:${createHash('sha256').update(preference.evidenceText).digest('hex')}` } });
+      }
+    }
     if (isKmPiShadowEnabled() && (input.cliId ?? 'pi') === 'pi') {
       await runCliDistillation({ cliId: 'pi', model: typeof context.model === 'string' ? context.model : input.model,
         sourceEventId: event.eventId, profile: claim.profile, window: effectiveWindow }, new PiDistillationExecutor({ piBin: input.piBin }));
@@ -97,6 +112,17 @@ export async function runOneDistillationJob(input: { dataDir: string; cliId?: st
     store.failDistillationJob({ jobId: claim.jobId, claimToken: claim.claimToken, error: error instanceof Error ? error.message : String(error), retry: true });
     return 'inconclusive';
   } finally { store.close(); }
+}
+
+export async function drainDistillationJobs(input: { dataDir: string; cliId?: string; model?: string; piBin?: string; maxJobs?: number }): Promise<number> {
+  if (!isKmAutoDistillationEnabled()) return 0;
+  const max = Math.max(1, Math.min(input.maxJobs ?? 10, 100)); let processed = 0;
+  while (processed < max) {
+    const result = await runOneDistillationJob(input);
+    if (result === 'idle') break;
+    processed += 1;
+  }
+  return processed;
 }
 
 export async function runRetrievalShadow(input: { dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string }): Promise<void> {

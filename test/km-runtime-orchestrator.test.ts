@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ObservationStore } from '../src/services/km/observation-store.js';
-import { boundedEvidenceWindow, defaultShadowProfile, enqueueAutomaticDistillation, isKmAutoDistillationEnabled, isKmRetrievalShadowEnabled, resolveBoundedTranscriptWindow, runOneDistillationJob, runRetrievalShadow } from '../src/services/km/runtime-orchestrator.js';
+import { boundedEvidenceWindow, defaultShadowProfile, drainDistillationJobs, enqueueAutomaticDistillation, isKmAutoDistillationEnabled, isKmRetrievalShadowEnabled, resolveBoundedTranscriptWindow, runOneDistillationJob, runRetrievalShadow } from '../src/services/km/runtime-orchestrator.js';
 import type { ObservationEvent } from '../src/services/km/observation-schema.js';
 
 const dirs: string[] = [];
@@ -38,6 +38,20 @@ describe('KM runtime orchestrator', () => {
     reopened.close();
   });
 
+  it('extracts an explicit observed user preference through the safe policy', async () => {
+    const preferenceEvent: ObservationEvent = { ...event, eventId: 'evt-preference', eventType: 'turn.completed',
+      ordering: { ...event.ordering, idempotencyKey: 'pref-1' },
+      payload: { requesterSubjectId: 'u1', knowledgeCandidate: '<user_message>以后请用中文回复</user_message>' }, content: { hash: null, storageMode: 'none' } };
+    const dir = tempDir(); const store = await ObservationStore.open(dir); store.append(preferenceEvent); store.close();
+    process.env.BOTMUX_KM_AUTO_DISTILLATION_ENABLED = 'true';
+    await enqueueAutomaticDistillation({ dataDir: dir, event: preferenceEvent });
+    expect(await runOneDistillationJob({ dataDir: dir })).toBe('completed');
+    const reopened = await ObservationStore.open(dir);
+    expect(reopened.listMemory({ limit: 10 })).toEqual([expect.objectContaining({ state: 'active', subject: 'u1', claimKey: 'response.language' })]);
+    expect(reopened.listMemoryPolicyDecisions(10)).toEqual([expect.objectContaining({ disposition: 'activate', reasonCodes: ['explicit_observed_low_risk_preference'] })]);
+    reopened.close();
+  });
+
   it('uses a stored bot profile snapshot when enqueueing', async () => {
     const dir = tempDir(); const store = await ObservationStore.open(dir); store.append(event);
     const profile = { ...defaultShadowProfile('bot'), profileId: 'configured', revision: 2,
@@ -47,6 +61,14 @@ describe('KM runtime orchestrator', () => {
     await enqueueAutomaticDistillation({ dataDir: dir, event });
     const reopened = await ObservationStore.open(dir); const claim = reopened.claimDistillationJob({});
     expect(claim?.profile).toEqual(profile); reopened.close();
+  });
+
+  it('drains durable backlog for cold-start recovery', async () => {
+    const dir = tempDir(); const store = await ObservationStore.open(dir); store.append(event); store.close();
+    process.env.BOTMUX_KM_AUTO_DISTILLATION_ENABLED = 'true';
+    await enqueueAutomaticDistillation({ dataDir: dir, event });
+    expect(await drainDistillationJobs({ dataDir: dir, maxJobs: 10 })).toBe(1);
+    expect(await drainDistillationJobs({ dataDir: dir, maxJobs: 10 })).toBe(0);
   });
 
   it('builds a bounded evidence window', () => {

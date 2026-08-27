@@ -41,7 +41,7 @@ describe('retrieval eligibility and bot canary prompt planning', () => {
   });
 
   it('persists retrieval and injection audit without raw query text', async () => {
-    const store = await ObservationStore.open(tempDir()); expect(store.schemaVersion()).toBe(10);
+    const store = await ObservationStore.open(tempDir()); expect(store.schemaVersion()).toBe(11);
     const hash = retrievalQueryHash({ text: 'language', botAppId: 'bot', userId: 'u1' });
     const run = store.recordRetrievalAudit({ botAppId: 'bot', sessionId: 's1', turnId: 't1', queryHash: hash, mode: 'shadow', candidateCount: 1,
       eligibleCount: 1, latencyMs: 12, warnings: [], results: [{ itemId: 'mem-1', itemKind: 'memory', providerIds: ['sqlite'], score: .9, eligible: true }] });

@@ -36,7 +36,7 @@ describe('durable turn.completed events', () => {
     const store = await SkillFeedbackStore.open(dir);
 
     expect(store.recordTurnTerminal(terminal({ nativeSessionId: undefined, usage: undefined }))).toBeUndefined();
-    const savedDelivery = store.recordTurnDelivery(delivery());
+    const savedDelivery = store.recordTurnDelivery(delivery({ requesterSubjectId: 'ou_requester' }));
     const events = store.listTurnCompletionEvents();
 
     expect(events).toHaveLength(1);
@@ -47,7 +47,7 @@ describe('durable turn.completed events', () => {
         contentHash: expect.stringMatching(/^sha256:/), contentRef: 'lark:om_a',
         platform: 'lark', platformMessageId: 'om_a', platformAppId: 'app_a', chatId: 'chat_a', topicRootId: 'root_a',
         botAppId: 'app_a', sessionId: 'session_a', turnId: 'turn_a', nativeSessionId: 'native_a', dispatchAttempt: 2,
-        durationMs: 321, usage: { inputTokens: 12, outputTokens: 4 }, cliId: 'codex', model: 'gpt-test',
+        durationMs: 321, usage: { inputTokens: 12, outputTokens: 4 }, cliId: 'codex', model: 'gpt-test', requesterSubjectId: 'ou_requester',
       },
     });
     expect(events[0].payload).not.toHaveProperty('content');

@@ -86,7 +86,7 @@ import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
-import { enqueueAutomaticDistillation, runOneDistillationJob, runRetrievalShadow } from './services/km/runtime-orchestrator.js';
+import { drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob, runRetrievalShadow } from './services/km/runtime-orchestrator.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -22020,6 +22020,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
   sessionStore.listSessions();
+  let kmDistillationDraining = false;
+  const drainKmDistillation = () => {
+    if (kmDistillationDraining || !isKmObservationEnabled()) return;
+    kmDistillationDraining = true;
+    void drainDistillationJobs({ dataDir: config.session.dataDir, maxJobs: 10 })
+      .catch(error => logger.warn(`[km-distillation-recovery] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmDistillationDraining = false; });
+  };
+  drainKmDistillation();
+  const kmDistillationRecoveryTimer = setInterval(drainKmDistillation, 30_000);
+  kmDistillationRecoveryTimer.unref?.();
+
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
@@ -22883,6 +22895,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
+    clearInterval(kmDistillationRecoveryTimer);
     clearInterval(docCommentPollTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
@@ -23113,6 +23126,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   process.on('exit', () => {
     setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
+    clearInterval(kmDistillationRecoveryTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
