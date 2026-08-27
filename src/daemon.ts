@@ -87,6 +87,7 @@ import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-com
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
 import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
+import { isKmBackendWorkerEnabled, kmBackendWorkerIntervalMs, kmBackendWorkerStartupDelayMs, runKmBackendWorkerOnce } from './services/km/memory-backend-runtime.js';
 import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-evolution-runtime.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -22069,6 +22070,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   kmRecoveryStartupTimer.unref?.();
   const kmDistillationRecoveryTimer = setInterval(drainKmDistillation, 30_000);
   kmDistillationRecoveryTimer.unref?.();
+  let kmBackendWorkerRunning = false;
+  const runKmBackendWorker = () => {
+    if (kmBackendWorkerRunning || !isKmObservationEnabled() || !isKmBackendWorkerEnabled()) return;
+    kmBackendWorkerRunning = true;
+    void runKmBackendWorkerOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.worker && (result.worker.delivered > 0 || result.worker.retried > 0 || result.worker.quarantined > 0)) {
+          logger.info(`[km-backend-worker] delivered=${result.worker.delivered} retried=${result.worker.retried} quarantined=${result.worker.quarantined}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-backend-worker] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmBackendWorkerRunning = false; });
+  };
+  const kmBackendWorkerStartupTimer = setTimeout(runKmBackendWorker, kmBackendWorkerStartupDelayMs(idx));
+  kmBackendWorkerStartupTimer.unref?.();
+  const kmBackendWorkerTimer = setInterval(runKmBackendWorker, kmBackendWorkerIntervalMs());
+  kmBackendWorkerTimer.unref?.();
   let kmEvalEvolutionRunning = false;
   const runKmEvalEvolutionWorker = () => {
     if (kmEvalEvolutionRunning || !isKmObservationEnabled() || !isKmAutoEvalEnabled()) return;
@@ -22952,6 +22970,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(maintenanceHeartbeat);
     if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
     clearInterval(kmDistillationRecoveryTimer);
+    if (kmBackendWorkerStartupTimer) clearTimeout(kmBackendWorkerStartupTimer);
+    clearInterval(kmBackendWorkerTimer);
     if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
     clearInterval(kmEvalEvolutionTimer);
     clearInterval(docCommentPollTimer);
@@ -23186,6 +23206,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
     clearInterval(kmDistillationRecoveryTimer);
+    if (kmBackendWorkerStartupTimer) clearTimeout(kmBackendWorkerStartupTimer);
+    clearInterval(kmBackendWorkerTimer);
     if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
     clearInterval(kmEvalEvolutionTimer);
     clearInterval(idleWorkerSweepTimer);

@@ -33,6 +33,20 @@ function payloadToRef(item: MemoryBackendOutboxItem): BackendMemoryRef {
   return { providerId: item.providerId, backendRef, contentHash };
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`km_memory_backend_timeout:${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface MemoryBackendOutboxWorkerReport {
   claimed: number; delivered: number; retried: number; quarantined: number;
   failures: Array<{ outboxId: string; providerId: string; error: string; retryable: boolean }>;
@@ -44,10 +58,12 @@ export async function drainMemoryBackendOutbox(input: {
   limit?: number;
   leaseMs?: number;
   maxAttempts?: number;
+  timeoutMs?: number;
   now?: number;
 }): Promise<MemoryBackendOutboxWorkerReport> {
   const store = await ObservationStore.open(input.dataDir);
   const providers = input.providers instanceof Map ? input.providers : new Map(Object.entries(input.providers));
+  const timeoutMs = Math.max(100, Math.min(input.timeoutMs ?? 5_000, 30_000));
   const report: MemoryBackendOutboxWorkerReport = { claimed: 0, delivered: 0, retried: 0, quarantined: 0, failures: [] };
   try {
     const claim = store.claimMemoryBackendOutboxBatch({ limit: input.limit ?? 25, leaseMs: input.leaseMs, now: input.now });
@@ -65,15 +81,15 @@ export async function drainMemoryBackendOutbox(input: {
       }
       try {
         if (item.operation === 'put') {
-          const ref = await provider.put(payloadToWrite(item));
+          const ref = await withTimeout(provider.put(payloadToWrite(item)), timeoutMs, item.providerId);
           store.settleMemoryBackendOutboxItem({ outboxId: item.outboxId, claimToken: claim.claimToken, providerVersion: provider.descriptor.version,
             writeState: 'active', backendRef: ref.backendRef, contentHash: ref.contentHash, now: input.now });
         } else if (item.operation === 'revoke') {
-          await provider.revoke(payloadToRef(item), String((item.payload as any).reason ?? 'outbox_revoke'));
+          await withTimeout(provider.revoke(payloadToRef(item), String((item.payload as any).reason ?? 'outbox_revoke')), timeoutMs, item.providerId);
           store.settleMemoryBackendOutboxItem({ outboxId: item.outboxId, claimToken: claim.claimToken, providerVersion: provider.descriptor.version,
             writeState: 'revoked', contentHash: payloadToRef(item).contentHash, now: input.now });
         } else {
-          await provider.health();
+          await withTimeout(provider.health(), timeoutMs, item.providerId);
           const ref = payloadToRef(item);
           store.settleMemoryBackendOutboxItem({ outboxId: item.outboxId, claimToken: claim.claimToken, providerVersion: provider.descriptor.version,
             writeState: 'active', backendRef: ref.backendRef, contentHash: ref.contentHash, now: input.now });

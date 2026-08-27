@@ -95,6 +95,7 @@ import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.j
 import { handleKmObservationApi } from './dashboard/km-observation-api.js';
 import { isKmObservationEnabled } from './services/km/observation-queue.js';
 import { ObservationStore } from './services/km/observation-store.js';
+import { kmBackendRuntimeStatus } from './services/km/memory-backend-runtime.js';
 import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
@@ -3576,6 +3577,7 @@ const server = createServer(async (req, res) => {
       enabled: isKmObservationEnabled(),
       actorId: requestIdentity?.userId,
       openStore: () => ObservationStore.open(config.session.dataDir),
+      backendRuntimeStatus: () => kmBackendRuntimeStatus({ dataDir: config.session.dataDir }),
     })) return;
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {

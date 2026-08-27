@@ -224,6 +224,73 @@ describe('KM observation dashboard API', () => {
     expect(executeKmMutation).toHaveBeenCalledTimes(2);
   });
 
+  it('serves backend runtime status and backend outbox/migration reads', async () => {
+    const listMemoryBackendOutbox = vi.fn(() => [{ outboxId: 'mout-1', status: 'pending' }]);
+    const listMemoryBackendMigrations = vi.fn(() => [{ migrationId: 'mmig-1', state: 'draft' }]);
+    const backendRuntimeStatus = vi.fn(async () => ({
+      enabled: false,
+      leaseName: 'memory-backend-outbox',
+      outbox: { total: 1, pending: 1, inflight: 0, failed: 0, delivered: 0, quarantined: 0, oldestPendingAgeMs: 10 },
+      providers: [{ providerId: 'mem0', endpoint: 'mock://mem0', enabled: true, status: 'ready' }],
+    }));
+    const deps = { enabled: true, backendRuntimeStatus, openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(),
+      list: vi.fn(), get: vi.fn(), close: vi.fn(), listMemoryBackendOutbox, listMemoryBackendMigrations }) };
+
+    const runtime = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, runtime.res, new URL('http://localhost/api/km/backend-runtime'), deps);
+    expect(backendRuntimeStatus).toHaveBeenCalledOnce();
+    expect(runtime.bodies[0]).toEqual(expect.objectContaining({ leaseName: 'memory-backend-outbox' }));
+
+    const outbox = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, outbox.res, new URL('http://localhost/api/km/backend-outbox?limit=999'), deps);
+    expect(listMemoryBackendOutbox).toHaveBeenCalledWith(100);
+
+    const migrations = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, migrations.res, new URL('http://localhost/api/km/backend-migrations?limit=999'), deps);
+    expect(listMemoryBackendMigrations).toHaveBeenCalledWith(100);
+  });
+
+  it('serves guarded backend migration create/backfill/compare without exposing cutover', async () => {
+    const createMemoryBackendMigration = vi.fn(() => 'mmig-1');
+    let migrationState = 'draft';
+    const getMemoryBackendMigration = vi.fn(() => ({ migrationId: 'mmig-1', botAppId: 'bot-1', state: migrationState, stats: {}, createdAt: 'now', updatedAt: 'now' }));
+    const transitionMemoryBackendMigration = vi.fn((input) => { migrationState = input.toState; });
+    const listMemoryForBackendMigration = vi.fn(() => []);
+    const enqueueMemoryBackendOperation = vi.fn();
+    const compareMemoryBackendBindings = vi.fn(() => ({ fromProviderId: 'sqlite', toProviderId: 'mem0', compared: 0, matched: 0, missing: 0, mismatched: 0, samples: [] }));
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const deps = { enabled: true, actorId: 'reviewer', openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(),
+      list: vi.fn(), get: vi.fn(), close: vi.fn(), createMemoryBackendMigration, getMemoryBackendMigration, transitionMemoryBackendMigration,
+      listMemoryForBackendMigration, enqueueMemoryBackendOperation, compareMemoryBackendBindings, executeKmMutation }) };
+
+    const createReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ botAppId: 'bot-1', fromProfile: { primary: 'sqlite' }, toProfile: { primary: 'mem0' } }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'mig-create' } });
+    const created = response();
+    await handleKmObservationApi(createReq as any, created.res, new URL('http://localhost/api/km/backend-migrations'), deps);
+    expect(createMemoryBackendMigration).toHaveBeenCalledWith({ botAppId: 'bot-1', fromProfile: { primary: 'sqlite' }, toProfile: { primary: 'mem0' } });
+    expect(created.bodies).toEqual([{ migrationId: 'mmig-1', state: 'draft', automaticCutover: false }]);
+
+    const backfillReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ toProviderId: 'mem0', limit: 10 }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'mig-backfill' } });
+    const backfill = response();
+    await handleKmObservationApi(backfillReq as any, backfill.res, new URL('http://localhost/api/km/backend-migrations/mmig-1/backfill'), deps);
+    expect(transitionMemoryBackendMigration).toHaveBeenCalledWith({ migrationId: 'mmig-1', toState: 'backfilling', checkpoint: undefined, stats: {} });
+    expect(listMemoryForBackendMigration).toHaveBeenCalledWith({ afterMemoryId: undefined, limit: 10 });
+
+    const compareReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ fromProviderId: 'sqlite', toProviderId: 'mem0' }))]),
+      { method: 'POST', headers: { 'idempotency-key': 'mig-compare' } });
+    const compared = response();
+    await handleKmObservationApi(compareReq as any, compared.res, new URL('http://localhost/api/km/backend-migrations/mmig-1/compare'), deps);
+    expect(compareMemoryBackendBindings).toHaveBeenCalledWith({ fromProviderId: 'sqlite', toProviderId: 'mem0', sampleLimit: undefined });
+    expect(compared.bodies).toEqual([{ fromProviderId: 'sqlite', toProviderId: 'mem0', compared: 0, matched: 0, missing: 0, mismatched: 0, samples: [] }]);
+
+    const forbidden = response();
+    const handled = await handleKmObservationApi({ method: 'POST', headers: { 'idempotency-key': 'mig-cutover' } } as any, forbidden.res,
+      new URL('http://localhost/api/km/backend-migrations/mmig-1/cutover'), deps);
+    expect(handled).toBe(false);
+    expect(forbidden.bodies).toEqual([]);
+  });
+
   it('rejects oversized mutation bodies and unopened modes', async () => {
     const executeKmMutation = vi.fn(); const putPipelineProfile = vi.fn();
     const deps = { enabled: true, actorId: 'reviewer', openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(),

@@ -24,8 +24,14 @@ export type KmProviderDescriptor = z.infer<typeof KmProviderDescriptorSchema>;
 /** Connection metadata only. Credentials are referenced, never stored inline. */
 export const KmMemoryProviderConfigSchema = z.object({
   providerId: z.enum(['mem0', 'hindsight', 'openviking']),
-  endpoint: z.string().url().refine(value => value.startsWith('https://') || value.startsWith('http://localhost') || value.startsWith('http://127.0.0.1'),
-    'endpoint must use HTTPS (loopback HTTP is allowed)'),
+  endpoint: z.string().url().refine(value => {
+    const parsed = new URL(value);
+    return parsed.protocol === 'mock:'
+      || parsed.protocol === 'inmemory:'
+      || value.startsWith('https://')
+      || value.startsWith('http://localhost')
+      || value.startsWith('http://127.0.0.1');
+  }, 'endpoint must use HTTPS, loopback HTTP, mock://, or inmemory://'),
   credentialRef: z.string().superRefine((value, ctx) => {
     if (/^env:[A-Z_][A-Z0-9_]*$/.test(value)) return;
     if (/^file:\/[^\s]+$/.test(value)) return;

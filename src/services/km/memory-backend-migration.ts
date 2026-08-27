@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { ObservationStore, type MemoryBackendMigrationSnapshot, type MemoryItem } from './observation-store.js';
+import type { ObservationStore, MemoryBackendMigrationSnapshot, MemoryItem } from './observation-store.js';
 
 function contentHash(memory: MemoryItem): string {
   return `sha256:${createHash('sha256').update(JSON.stringify({
@@ -20,8 +20,20 @@ export interface MemoryBackendBackfillReport {
   done: boolean;
 }
 
+type MemoryBackendMigrationBackfillStore = Pick<ObservationStore,
+  | 'getMemoryBackendMigration'
+  | 'transitionMemoryBackendMigration'
+  | 'listMemoryForBackendMigration'
+  | 'enqueueMemoryBackendOperation'
+>;
+type MemoryBackendMigrationCompareStore = Pick<ObservationStore,
+  | 'getMemoryBackendMigration'
+  | 'transitionMemoryBackendMigration'
+  | 'compareMemoryBackendBindings'
+>;
+
 export function enqueueMemoryBackendMigrationBackfill(input: {
-  store: ObservationStore;
+  store: MemoryBackendMigrationBackfillStore;
   migrationId: string;
   toProviderId: string;
   limit?: number;
@@ -66,7 +78,7 @@ export function enqueueMemoryBackendMigrationBackfill(input: {
 }
 
 export function compareMemoryBackendMigration(input: {
-  store: ObservationStore;
+  store: MemoryBackendMigrationCompareStore;
   migrationId: string;
   fromProviderId: string;
   toProviderId: string;
