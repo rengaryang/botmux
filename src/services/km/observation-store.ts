@@ -10,7 +10,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -162,6 +162,11 @@ const PHASE12_SCHEMA = `
   CREATE TABLE IF NOT EXISTS km_runtime_leases (
     lease_name TEXT PRIMARY KEY, holder_id TEXT NOT NULL, expires_at INTEGER NOT NULL, updated_at TEXT NOT NULL
   );
+`;
+
+const PHASE13_SCHEMA = `
+  UPDATE prompt_injection_snapshots
+    SET requested_mode=COALESCE(requested_mode,mode), effective_mode=COALESCE(effective_mode,mode);
 `;
 
 const PHASE11_SCHEMA = `
@@ -501,6 +506,7 @@ export interface RetrievalQuery {
   text: string;
   scopes?: MemoryScope[];
   subject?: string;
+  subjects?: Partial<Record<MemoryScope, string>>;
   targetLayers?: KnowledgeLayer[];
   limit: number;
 }
@@ -514,6 +520,8 @@ export interface RetrievalItem {
   sourceRefs: unknown[];
   privacyClass: KmPrivacyClass;
   freshness: 'fresh' | 'stale' | 'purged' | 'unknown';
+  scope?: MemoryScope;
+  subject?: string;
 }
 
 export type ApprovalGrade = 'G0' | 'G1' | 'G2' | 'G3' | 'G4';
@@ -753,6 +761,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 10) this.migrateToPhase10();
     if (this.schemaVersion() < 11) this.migrateToPhase11();
     if (this.schemaVersion() < 12) this.migrateToPhase12();
+    if (this.schemaVersion() < 13) this.migrateToPhase13();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -1352,14 +1361,15 @@ export class ObservationStore {
   }
 
   recordPromptInjectionSnapshot(input: {
-    retrievalRunId: string; botAppId: string; mode: string;
+    retrievalRunId: string; botAppId: string; mode: string; requestedMode?: string; effectiveMode?: string;
     disposition: 'off' | 'would_inject' | 'injected' | 'skipped'; itemIds: string[];
     prompt?: string; reason?: string;
   }): string {
     const id = `inject_${randomUUID().replaceAll('-', '')}`; const prompt = input.prompt ?? '';
-    this.db.prepare(`INSERT INTO prompt_injection_snapshots(snapshot_id,retrieval_run_id,bot_app_id,mode,disposition,item_ids_json,prompt_hash,prompt_bytes,reason,created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, input.retrievalRunId, input.botAppId, input.mode, input.disposition,
-      JSON.stringify(input.itemIds), prompt ? sha256(prompt) : null, Buffer.byteLength(prompt), input.reason ?? null, new Date().toISOString());
+    this.db.prepare(`INSERT INTO prompt_injection_snapshots(snapshot_id,retrieval_run_id,bot_app_id,mode,requested_mode,effective_mode,disposition,item_ids_json,prompt_hash,prompt_bytes,reason,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.retrievalRunId, input.botAppId, input.mode, input.requestedMode ?? input.mode,
+      input.effectiveMode ?? input.mode, input.disposition, JSON.stringify(input.itemIds), prompt ? sha256(prompt) : null,
+      Buffer.byteLength(prompt), input.reason ?? null, new Date().toISOString());
     return id;
   }
 
@@ -1436,12 +1446,17 @@ export class ObservationStore {
 
     for (const item of this.listMemory({ limit: 500, state: 'active' })) {
       if (input.scopes?.length && !input.scopes.includes(item.scope)) continue;
+      if (input.subjects) {
+        const expectedSubject = input.subjects[item.scope];
+        if (!expectedSubject || expectedSubject !== item.subject) continue;
+      }
       if (input.subject && input.subject !== item.subject) continue;
       if (item.ttlExpiresAt && Date.parse(item.ttlExpiresAt) <= Date.now()) continue;
       const itemScore = score(`${item.claimKey} ${item.claimText}`);
       if (terms.length && itemScore === 0) continue;
       items.push({ id: item.memoryId, kind: 'memory', title: item.claimKey, text: item.claimText,
-        score: itemScore, sourceRefs: item.sourceRefs, privacyClass: item.privacyClass, freshness: 'fresh' });
+        score: itemScore, sourceRefs: item.sourceRefs, privacyClass: item.privacyClass, freshness: 'fresh',
+        scope: item.scope, subject: item.subject });
     }
     return items.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
   }
@@ -1865,10 +1880,12 @@ export class ObservationStore {
   }
 
   listInjectionSnapshots(limit: number): Array<Record<string, unknown>> {
-    return (this.db.prepare(`SELECT snapshot_id,retrieval_run_id,bot_app_id,mode,disposition,item_ids_json,prompt_bytes,reason,created_at
+    return (this.db.prepare(`SELECT snapshot_id,retrieval_run_id,bot_app_id,mode,requested_mode,effective_mode,disposition,item_ids_json,prompt_hash,prompt_bytes,reason,created_at
       FROM prompt_injection_snapshots ORDER BY created_at DESC,snapshot_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 500))) as any[])
       .map(row => ({ snapshotId: row.snapshot_id, retrievalRunId: row.retrieval_run_id, botAppId: row.bot_app_id,
-        mode: row.mode, disposition: row.disposition, itemIds: JSON.parse(row.item_ids_json), promptBytes: row.prompt_bytes,
+        mode: row.mode, requestedMode: row.requested_mode ?? row.mode, effectiveMode: row.effective_mode ?? row.mode,
+        disposition: row.disposition, itemIds: JSON.parse(row.item_ids_json), ...(row.prompt_hash ? { promptHash: row.prompt_hash } : {}),
+        promptBytes: row.prompt_bytes,
         ...(row.reason ? { reason: row.reason } : {}), createdAt: row.created_at }));
   }
 
@@ -1988,6 +2005,19 @@ export class ObservationStore {
       if (this.schemaVersion() >= 12) { this.db.exec('COMMIT;'); return; }
       this.db.exec(PHASE12_SCHEMA);
       this.db.exec('PRAGMA user_version=12;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  private migrateToPhase13(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 13) { this.db.exec('COMMIT;'); return; }
+      const columns = new Set((this.db.prepare('PRAGMA table_info(prompt_injection_snapshots)').all() as Array<{ name: string }>).map(row => row.name));
+      if (!columns.has('requested_mode')) this.db.exec('ALTER TABLE prompt_injection_snapshots ADD COLUMN requested_mode TEXT;');
+      if (!columns.has('effective_mode')) this.db.exec('ALTER TABLE prompt_injection_snapshots ADD COLUMN effective_mode TEXT;');
+      this.db.exec(PHASE13_SCHEMA);
+      this.db.exec('PRAGMA user_version=13;');
       this.db.exec('COMMIT;');
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }

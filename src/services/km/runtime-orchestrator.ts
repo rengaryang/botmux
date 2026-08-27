@@ -10,7 +10,13 @@ import { PiDistillationExecutor } from './pi-distillation-executor.js';
 import { runCliDistillation } from './cli-distillation-runner.js';
 import { decideSafeMemoryActivation } from './safe-memory-policy.js';
 import { extractAttributedUserEvidence, extractExplicitPreferences } from './preference-extractor.js';
-import { planPromptMemory, retrievalQueryHash, type PromptMemoryCandidate } from './prompt-memory.js';
+import {
+  composeLivePromptMemory,
+  planPromptMemory,
+  retrievalQueryHash,
+  type PromptMemoryCandidate,
+  type PromptMemoryMode,
+} from './prompt-memory.js';
 import { federatedMemoryRetrieveWithTelemetry } from './memory-backend-coordinator.js';
 import type { MemoryBackendProvider } from './memory-backend-spi.js';
 
@@ -21,6 +27,12 @@ export function isKmAutoDistillationEnabled(env = process.env): boolean { return
 export function isKmPiShadowEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_PI_SHADOW_ENABLED', env); }
 export function isKmRetrievalShadowEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED', env); }
 export function isKmFederatedRetrievalEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_FEDERATED_RETRIEVAL_ENABLED', env); }
+export function isKmLiveInjectionEnabled(env = process.env): boolean { return envOn('BOTMUX_KM_LIVE_INJECTION_ENABLED', env); }
+export function isKmEffectiveModeAuthorized(env = process.env): boolean { return envOn('BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED', env); }
+
+function parseBotAllowlist(value: string | undefined): string[] {
+  return (value ?? '').split(/[,\s]+/u).map(item => item.trim()).filter(Boolean);
+}
 
 export function defaultShadowProfile(botAppId: string, cliId = 'pi', model?: string): KmPipelineProfile {
   return {
@@ -147,9 +159,10 @@ export async function runRetrievalShadow(input: {
   try {
     const profile = store.getEffectivePipelineProfile(input.botAppId);
     if (profile?.injectionMode === 'off') return;
-    const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'], subject: input.userId, limit: 50 });
+    const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'],
+      subjects: { ...(input.userId ? { user: input.userId } : {}), bot: input.botAppId }, limit: 50 });
     const candidates: PromptMemoryCandidate[] = raw.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
-      ...(item.kind === 'memory' ? { scope: 'user', subject: input.userId } : {}), providerIds: ['sqlite'] }));
+      providerIds: ['sqlite'] }));
     const warnings: string[] = [];
     if (isKmFederatedRetrievalEnabled(input.env) && input.providers?.length) {
       const remote = await federatedMemoryRetrieveWithTelemetry({ providers: input.providers,
@@ -175,6 +188,50 @@ export async function runRetrievalShadow(input: {
       results: [...plan.eligible.map(item => ({ itemId: item.id, itemKind: item.kind, providerIds: item.providerIds ?? [], score: item.score, eligible: true })),
         ...plan.filtered.map(value => ({ itemId: value.item.id, itemKind: value.item.kind, providerIds: value.item.providerIds ?? [], score: value.item.score, eligible: false, filterReason: value.reason }))] });
     store.recordPromptInjectionSnapshot({ retrievalRunId: runId, botAppId: input.botAppId, mode: 'shadow', disposition: plan.disposition,
-      itemIds: plan.eligible.map(item => item.id), prompt: plan.prompt, reason: plan.reason });
+      requestedMode: plan.requestedMode, effectiveMode: plan.effectiveMode,
+      itemIds: plan.selectedItemIds, prompt: plan.prompt, reason: plan.reason });
+  } finally { store.close(); }
+}
+
+export async function composePromptMemoryForTurn(input: {
+  dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string; promptContent: string;
+  env?: NodeJS.ProcessEnv; providers?: MemoryBackendProvider[]; providerTimeoutMs?: number;
+}): Promise<{ promptContent: string; injected: boolean; reason?: string }> {
+  if (!isKmRetrievalShadowEnabled(input.env) && !isKmLiveInjectionEnabled(input.env)) {
+    return { promptContent: input.promptContent, injected: false, reason: 'retrieval_gate_disabled' };
+  }
+  const started = Date.now(); const store = await ObservationStore.open(input.dataDir);
+  try {
+    const profile = store.getEffectivePipelineProfile(input.botAppId);
+    const requestedMode = (profile?.injectionMode ?? 'shadow') as PromptMemoryMode;
+    const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'],
+      subjects: { ...(input.userId ? { user: input.userId } : {}), bot: input.botAppId }, limit: 50 });
+    const candidates: PromptMemoryCandidate[] = raw.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
+      providerIds: ['sqlite'] }));
+    const warnings: string[] = [];
+    if (isKmFederatedRetrievalEnabled(input.env) && input.providers?.length) {
+      warnings.push('federated_retrieval_not_live_prompt_boundary');
+    } else if (input.providers?.length) {
+      warnings.push('federated_retrieval_gate_disabled');
+    }
+    const composed = composeLivePromptMemory(input.promptContent, candidates, {
+      botAppId: input.botAppId,
+      userId: input.userId,
+      requestedMode,
+      effectiveModeAuthorized: isKmEffectiveModeAuthorized(input.env),
+      liveInjectionEnabled: isKmLiveInjectionEnabled(input.env),
+      canaryBotIds: parseBotAllowlist(input.env?.BOTMUX_KM_CANARY_BOT_APP_IDS),
+      promptTokenBudget: profile?.budgets.promptTokens ?? 1_800,
+    });
+    const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
+      queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: composed.plan.effectiveMode,
+      candidateCount: candidates.length, eligibleCount: composed.plan.eligible.length, latencyMs: Date.now() - started,
+      warnings,
+      results: [...composed.plan.eligible.map(item => ({ itemId: item.id, itemKind: item.kind, providerIds: item.providerIds ?? [], score: item.score, eligible: true })),
+        ...composed.plan.filtered.map(value => ({ itemId: value.item.id, itemKind: value.item.kind, providerIds: value.item.providerIds ?? [], score: value.item.score, eligible: false, filterReason: value.reason }))] });
+    store.recordPromptInjectionSnapshot({ retrievalRunId: runId, botAppId: input.botAppId, mode: composed.plan.effectiveMode,
+      requestedMode: composed.plan.requestedMode, effectiveMode: composed.plan.effectiveMode, disposition: composed.plan.disposition,
+      itemIds: composed.plan.selectedItemIds, prompt: composed.plan.prompt, reason: composed.plan.reason });
+    return { promptContent: composed.content, injected: composed.mutated, reason: composed.plan.reason };
   } finally { store.close(); }
 }

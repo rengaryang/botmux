@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ObservationStore } from '../src/services/km/observation-store.js';
-import { boundedEvidenceWindow, defaultShadowProfile, drainDistillationJobs, enqueueAutomaticDistillation, isKmAutoDistillationEnabled, isKmRetrievalShadowEnabled, resolveBoundedTranscriptWindow, runOneDistillationJob, runRetrievalShadow } from '../src/services/km/runtime-orchestrator.js';
+import { boundedEvidenceWindow, composePromptMemoryForTurn, defaultShadowProfile, drainDistillationJobs, enqueueAutomaticDistillation, isKmAutoDistillationEnabled, isKmRetrievalShadowEnabled, resolveBoundedTranscriptWindow, runOneDistillationJob, runRetrievalShadow } from '../src/services/km/runtime-orchestrator.js';
 import { observationFromTurnCompletion } from '../src/services/km/observation-producers.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import type { ObservationEvent } from '../src/services/km/observation-schema.js';
@@ -11,7 +11,7 @@ import type { MemoryBackendProvider } from '../src/services/km/memory-backend-sp
 
 const dirs: string[] = [];
 function tempDir(): string { const dir = mkdtempSync(join(tmpdir(), 'botmux-km-runtime-')); dirs.push(dir); return dir; }
-afterEach(() => { delete process.env.BOTMUX_KM_AUTO_DISTILLATION_ENABLED; delete process.env.BOTMUX_KM_PI_SHADOW_ENABLED; delete process.env.BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED; delete process.env.CODEX_HOME; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { delete process.env.BOTMUX_KM_AUTO_DISTILLATION_ENABLED; delete process.env.BOTMUX_KM_PI_SHADOW_ENABLED; delete process.env.BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED; delete process.env.BOTMUX_KM_LIVE_INJECTION_ENABLED; delete process.env.BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED; delete process.env.BOTMUX_KM_CANARY_BOT_APP_IDS; delete process.env.BOTMUX_KM_FEDERATED_RETRIEVAL_ENABLED; delete process.env.CODEX_HOME; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const event: ObservationEvent = {
   schemaVersion: 1, eventId: 'evt-runtime-1', eventType: 'workflow.artifact.produced',
   source: { producer: 'workflow', adapter: 'workflow', resolverStatus: 'resolved', confidence: 'observed' },
@@ -124,6 +124,82 @@ describe('KM runtime orchestrator', () => {
       providers: [provider], env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true', BOTMUX_KM_FEDERATED_RETRIEVAL_ENABLED: 'true' } as any });
     store = await ObservationStore.open(dir);
     expect(store.listRetrievalAudits(1)).toEqual([expect.objectContaining({ candidateCount: 1, warnings: [] })]);
+    store.close();
+  });
+
+  it('composes live prompt memory only after all canary gates pass and audits requested/effective mode', async () => {
+    const dir = tempDir(); const store = await ObservationStore.open(dir);
+    store.upsertMemory({ state: 'active', scope: 'user', subject: 'u1', claimKey: 'language', claimText: 'Prefer Chinese', confidence: 'observed',
+      privacyClass: 'internal', sourceRefs: [{ kind: 'api', ref: 'evt' }] });
+    store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'canary', revision: 1, injectionMode: 'canary' }, 'shadow');
+    store.close();
+
+    const blocked = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't1', userId: 'u1',
+      queryText: 'Chinese', promptContent: 'hello', env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true' } as any });
+    expect(blocked).toEqual({ promptContent: 'hello', injected: false, reason: 'live_gate_disabled' });
+
+    let reopened = await ObservationStore.open(dir);
+    expect(reopened.listInjectionSnapshots(1)).toEqual([expect.objectContaining({
+      requestedMode: 'canary',
+      effectiveMode: 'shadow',
+      disposition: 'would_inject',
+      reason: 'live_gate_disabled',
+      itemIds: expect.arrayContaining([expect.any(String)]),
+    })]);
+    reopened.close();
+
+    const injected = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't2', userId: 'u1',
+      queryText: 'Chinese', promptContent: 'hello', env: {
+        BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true',
+        BOTMUX_KM_LIVE_INJECTION_ENABLED: 'true',
+        BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED: 'true',
+        BOTMUX_KM_CANARY_BOT_APP_IDS: 'bot',
+      } as any });
+    expect(injected.injected).toBe(true);
+    expect(injected.promptContent).toContain('<botmux_km_context');
+    expect(injected.promptContent.endsWith('\n\nhello')).toBe(true);
+
+    reopened = await ObservationStore.open(dir);
+    expect(reopened.listInjectionSnapshots(1)).toEqual([expect.objectContaining({
+      requestedMode: 'canary',
+      effectiveMode: 'canary',
+      disposition: 'injected',
+      promptHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    })]);
+    reopened.close();
+  });
+
+  it('does not require the shadow retrieval gate once the explicit live gates pass', async () => {
+    const dir = tempDir(); const store = await ObservationStore.open(dir);
+    store.upsertMemory({ state: 'active', scope: 'bot', subject: 'bot', claimKey: 'style', claimText: 'Use concise bullets', confidence: 'observed',
+      privacyClass: 'internal', sourceRefs: [{ kind: 'api', ref: 'evt' }] });
+    store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'active-live', revision: 1, injectionMode: 'active' }, 'shadow');
+    store.close();
+    const result = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't-live',
+      queryText: 'bullets', promptContent: 'hello', env: {
+        BOTMUX_KM_LIVE_INJECTION_ENABLED: 'true',
+        BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED: 'true',
+        BOTMUX_KM_CANARY_BOT_APP_IDS: 'bot',
+      } as any });
+    expect(result.injected).toBe(true);
+    expect(result.promptContent).toContain('Use concise bullets');
+  });
+
+  it('does not call federated providers from the live prompt boundary', async () => {
+    const dir = tempDir(); const provider: MemoryBackendProvider = {
+      descriptor: { id: 'mem0', version: '1', kind: 'mem0', capabilities: { put: true, update: true, revoke: true, retrieve: true, metadataFilter: true, namespaces: true, ttl: false, snapshot: false } },
+      health: async () => ({ status: 'ok' }),
+      put: async item => ({ providerId: 'mem0', backendRef: 'mem0-ref', contentHash: item.contentHash }),
+      revoke: async () => {},
+      retrieve: async () => { throw new Error('must_not_probe_network'); },
+    };
+    await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', userId: 'u1',
+      queryText: 'Chinese', promptContent: 'hello', providers: [provider], env: {
+        BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true',
+        BOTMUX_KM_FEDERATED_RETRIEVAL_ENABLED: 'true',
+      } as any });
+    const store = await ObservationStore.open(dir);
+    expect(store.listRetrievalAudits(1)).toEqual([expect.objectContaining({ warnings: ['federated_retrieval_not_live_prompt_boundary'] })]);
     store.close();
   });
 

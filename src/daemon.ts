@@ -86,7 +86,7 @@ import { getSkillFeedbackStore, type TurnCompletionEventPayload } from './servic
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
-import { drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob, runRetrievalShadow } from './services/km/runtime-orchestrator.js';
+import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -19149,13 +19149,6 @@ async function handleThreadReplyAdmitted(
     + initialCodexAppApplicationContext
     + parsed.content;
   let promptContent = initialPromptContent;
-  const kmShadowSession = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (kmShadowSession) {
-    void runRetrievalShadow({ dataDir: config.session.dataDir, botAppId: larkAppId,
-      sessionId: kmShadowSession.session.sessionId, turnId: parsed.messageId,
-      userId: senderOpenIdForPrefix, queryText: parsed.content })
-      .catch(error => logger.warn(`[km-retrieval-shadow] ${error instanceof Error ? error.message : String(error)}`));
-  }
   let rewrittenCodexAppMessageContext: string | undefined;
   if (!prepared) {
     const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
@@ -19651,6 +19644,26 @@ async function handleThreadReplyAdmitted(
     ?? initialCodexAppMessageContext;
   const codexAppApplicationContext = initialCodexAppApplicationContext;
 
+  const composePromptMemoryAtBoundary = async (session: DaemonSession): Promise<void> => {
+    try {
+      const result = await composePromptMemoryForTurn({
+        dataDir: config.session.dataDir,
+        botAppId: larkAppId,
+        sessionId: session.session.sessionId,
+        turnId: parsed.messageId,
+        userId: senderOpenIdForPrefix,
+        queryText: parsed.content,
+        promptContent,
+      });
+      if (result.injected) {
+        promptContent = result.promptContent;
+        logger.info(`[${tag(session)}] KM live prompt-memory injected for turn ${parsed.messageId.substring(0, 12)}`);
+      }
+    } catch (error) {
+      logger.warn(`[km-prompt-memory] ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
   let attachments: LarkAttachment[];
@@ -19711,6 +19724,7 @@ async function handleThreadReplyAdmitted(
   // preparation. Re-check once at the final routing boundary so the oldest
   // surviving follower atomically takes over instead of proceeding unclaimed.
   tryAcquireInitialStartClaim();
+  if (ds) await composePromptMemoryAtBoundary(ds);
 
   // A published worker:null owner is not necessarily ready to refork: its
   // opening turn may still be preparing. Buffer both repo-pending and
