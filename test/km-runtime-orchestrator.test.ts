@@ -38,6 +38,17 @@ describe('KM runtime orchestrator', () => {
     reopened.close();
   });
 
+  it('uses a stored bot profile snapshot when enqueueing', async () => {
+    const dir = tempDir(); const store = await ObservationStore.open(dir); store.append(event);
+    const profile = { ...defaultShadowProfile('bot'), profileId: 'configured', revision: 2,
+      memoryBackends: { writePolicy: 'single' as const, primary: 'sqlite', mirrors: [] } };
+    store.putPipelineProfile(profile, 'shadow'); store.close();
+    process.env.BOTMUX_KM_AUTO_DISTILLATION_ENABLED = 'true';
+    await enqueueAutomaticDistillation({ dataDir: dir, event });
+    const reopened = await ObservationStore.open(dir); const claim = reopened.claimDistillationJob({});
+    expect(claim?.profile).toEqual(profile); reopened.close();
+  });
+
   it('builds a bounded evidence window', () => {
     const window = boundedEvidenceWindow(event, 'x'.repeat(300_000));
     expect(window.status).toBe('partial');

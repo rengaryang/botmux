@@ -12,7 +12,7 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 describe('KM Phase 3 trace, eval and evolution', () => {
   it('migrates additively through the latest schema and keeps trace edges idempotent', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(9);
+    expect(store.schemaVersion()).toBe(10);
     const input = { fromType: 'turn', fromId: 'turn-1', toType: 'skill', toId: 'skill-1', edgeType: 'used' as const };
     expect(store.addTraceEdge(input).created).toBe(true);
     expect(store.addTraceEdge(input).created).toBe(false);

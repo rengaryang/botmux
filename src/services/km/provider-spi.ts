@@ -20,6 +20,18 @@ export const KmProviderDescriptorSchema = z.object({
 }).strict();
 export type KmProviderDescriptor = z.infer<typeof KmProviderDescriptorSchema>;
 
+/** Connection metadata only. Credentials are referenced, never stored inline. */
+export const KmMemoryProviderConfigSchema = z.object({
+  providerId: z.enum(['mem0', 'hindsight', 'openviking']),
+  endpoint: z.string().url().refine(value => value.startsWith('https://') || value.startsWith('http://localhost') || value.startsWith('http://127.0.0.1'),
+    'endpoint must use HTTPS (loopback HTTP is allowed)'),
+  credentialRef: z.string().regex(/^(env|file):[^\s]+$/, 'credentialRef must be env:NAME or file:/path'),
+  enabled: z.boolean().default(false),
+  realTransportEnabled: z.literal(false).default(false),
+  timeoutMs: z.number().int().min(100).max(30_000).default(5_000),
+}).strict();
+export type KmMemoryProviderConfig = z.infer<typeof KmMemoryProviderConfigSchema>;
+
 export const KmPipelineProfileSchema = z.object({
   schemaVersion: z.literal(1),
   profileId: z.string().trim().min(1),

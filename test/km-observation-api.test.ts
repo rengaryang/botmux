@@ -140,6 +140,32 @@ describe('KM observation dashboard API', () => {
     expect(decideProposal).toHaveBeenCalledWith({ proposalId: 'evo-1', decision: 'approved', actorId: 'reviewer-1', grade: 'G2', scope: { target: 'skill' }, riskAck: {} });
   });
 
+  it('serves guarded pipeline profile and provider configuration mutations', async () => {
+    const listPipelineProfiles = vi.fn(() => [{ state: 'draft' }]);
+    const putPipelineProfile = vi.fn(() => `sha256:${'a'.repeat(64)}`);
+    const setPipelineProfileState = vi.fn(() => ({ state: 'shadow' }));
+    const listMemoryProviderConfigs = vi.fn(() => [{ providerId: 'mem0', credentialRef: 'env:***' }]);
+    const putMemoryProviderConfig = vi.fn(() => `sha256:${'b'.repeat(64)}`);
+    const deps = { enabled: true, openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+      listPipelineProfiles, putPipelineProfile, setPipelineProfileState, listMemoryProviderConfigs, putMemoryProviderConfig }) };
+    const list = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, list.res, new URL('http://localhost/api/km/profiles?botAppId=bot-1'), deps);
+    expect(listPipelineProfiles).toHaveBeenCalledWith('bot-1');
+
+    const configReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ providerId: 'mem0', endpoint: 'https://memory.example.test',
+      credentialRef: 'env:MEM0_KEY', enabled: true, realTransportEnabled: false, timeoutMs: 5000 }))]),
+      { method: 'PUT', headers: { 'x-km-actor-id': 'reviewer', 'idempotency-key': 'key-1' } });
+    const config = response();
+    await handleKmObservationApi(configReq as any, config.res, new URL('http://localhost/api/km/provider-configs'), deps);
+    expect(putMemoryProviderConfig).toHaveBeenCalledWith(expect.objectContaining({ providerId: 'mem0', realTransportEnabled: false }));
+
+    const stateReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ state: 'shadow' }))]),
+      { method: 'PATCH', headers: { 'x-km-actor-id': 'reviewer', 'idempotency-key': 'key-2' } });
+    const state = response();
+    await handleKmObservationApi(stateReq as any, state.res, new URL('http://localhost/api/km/profiles/default/1/state'), deps);
+    expect(setPipelineProfileState).toHaveBeenCalledWith({ profileId: 'default', revision: 1, state: 'shadow' });
+  });
+
   it('returns one event and rejects unsupported methods', async () => {
     const get = vi.fn(() => ({ eventId: 'evt-1', payload: { status: 'completed' } }));
     const first = response();

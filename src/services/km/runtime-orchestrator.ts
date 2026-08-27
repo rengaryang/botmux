@@ -33,9 +33,12 @@ export function defaultShadowProfile(botAppId: string, cliId = 'pi', model?: str
 export async function enqueueAutomaticDistillation(input: { dataDir: string; event: ObservationEvent; cliId?: string; model?: string; cliSessionId?: string; cwd?: string }): Promise<void> {
   if (!isKmAutoDistillationEnabled() || process.env.BOTMUX_KM_WORKLOAD === 'distillation') return;
   const store = await ObservationStore.open(input.dataDir);
-  try { store.createDistillationJob({ sourceEventId: input.event.eventId, profile: defaultShadowProfile(input.event.identity.botAppId, input.cliId, input.model),
-    evidenceContext: { cliId: input.cliId, model: input.model, cliSessionId: input.cliSessionId, cwd: input.cwd } }); }
-  finally { store.close(); }
+  try {
+    const profile = store.getEffectivePipelineProfile(input.event.identity.botAppId)
+      ?? defaultShadowProfile(input.event.identity.botAppId, input.cliId, input.model);
+    store.createDistillationJob({ sourceEventId: input.event.eventId, profile,
+      evidenceContext: { cliId: input.cliId, model: input.model, cliSessionId: input.cliSessionId, cwd: input.cwd } });
+  } finally { store.close(); }
 }
 
 /** Metadata/artifact bounded window. Transcript text is supplied only by an explicitly wired resolver. */
@@ -100,13 +103,19 @@ export async function runRetrievalShadow(input: { dataDir: string; botAppId: str
   if (!isKmRetrievalShadowEnabled()) return;
   const started = Date.now(); const store = await ObservationStore.open(input.dataDir);
   try {
+    const profile = store.getEffectivePipelineProfile(input.botAppId);
+    if (profile?.injectionMode === 'off') return;
     const raw = store.retrieve({ text: input.queryText, scopes: ['user', 'bot'], subject: input.userId, limit: 50 });
     const candidates: PromptMemoryCandidate[] = raw.map(item => ({ ...item, state: item.kind === 'memory' ? 'active' : 'approved',
       ...(item.kind === 'memory' ? { scope: 'user', subject: input.userId } : {}), providerIds: ['sqlite'] }));
-    const plan = planPromptMemory(candidates, { botAppId: input.botAppId, userId: input.userId, mode: 'shadow', promptTokenBudget: 1_800 });
+    // This runtime path remains fail-closed in Shadow even if a stored profile
+    // requests canary/active; live prompt mutation requires a separate gate.
+    const plan = planPromptMemory(candidates, { botAppId: input.botAppId, userId: input.userId, mode: 'shadow',
+      promptTokenBudget: profile?.budgets.promptTokens ?? 1_800 });
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
       queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: 'shadow',
-      candidateCount: candidates.length, eligibleCount: plan.eligible.length, latencyMs: Date.now() - started, warnings: [],
+      candidateCount: candidates.length, eligibleCount: plan.eligible.length, latencyMs: Date.now() - started,
+      warnings: profile && profile.injectionMode !== 'shadow' ? [`configured_mode_${profile.injectionMode}_forced_shadow`] : [],
       results: [...plan.eligible.map(item => ({ itemId: item.id, itemKind: item.kind, providerIds: item.providerIds ?? [], score: item.score, eligible: true })),
         ...plan.filtered.map(value => ({ itemId: value.item.id, itemKind: value.item.kind, providerIds: value.item.providerIds ?? [], score: value.item.score, eligible: false, filterReason: value.reason }))] });
     store.recordPromptInjectionSnapshot({ retrievalRunId: runId, botAppId: input.botAppId, mode: 'shadow', disposition: plan.disposition,
