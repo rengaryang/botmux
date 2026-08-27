@@ -25,7 +25,11 @@ export const KmMemoryProviderConfigSchema = z.object({
   providerId: z.enum(['mem0', 'hindsight', 'openviking']),
   endpoint: z.string().url().refine(value => value.startsWith('https://') || value.startsWith('http://localhost') || value.startsWith('http://127.0.0.1'),
     'endpoint must use HTTPS (loopback HTTP is allowed)'),
-  credentialRef: z.string().regex(/^(env|file):[^\s]+$/, 'credentialRef must be env:NAME or file:/path'),
+  credentialRef: z.string().superRefine((value, ctx) => {
+    if (/^env:[A-Z_][A-Z0-9_]*$/.test(value)) return;
+    if (/^file:\/[^\s]+$/.test(value)) return;
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'credentialRef must be env:UPPER_CASE_NAME or file:/absolute/path' });
+  }),
   enabled: z.boolean().default(false),
   realTransportEnabled: z.literal(false).default(false),
   timeoutMs: z.number().int().min(100).max(30_000).default(5_000),
@@ -61,6 +65,12 @@ export const KmPipelineProfileSchema = z.object({
   }
   if (profile.shadowExtractors.includes(profile.primaryExtractor)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['shadowExtractors'], message: 'primary cannot also be shadow' });
+  }
+  if (new Set(profile.memoryBackends.mirrors).size !== profile.memoryBackends.mirrors.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['memoryBackends', 'mirrors'], message: 'duplicate mirror backend' });
+  }
+  if (profile.memoryBackends.mirrors.includes(profile.memoryBackends.primary)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['memoryBackends', 'mirrors'], message: 'primary cannot also be mirror' });
   }
 });
 export type KmPipelineProfile = z.infer<typeof KmPipelineProfileSchema>;

@@ -71,6 +71,14 @@ describe('KM runtime orchestrator', () => {
     expect(await drainDistillationJobs({ dataDir: dir, maxJobs: 10 })).toBe(0);
   });
 
+  it('elects one durable recovery lease holder', async () => {
+    const dir = tempDir(); const store = await ObservationStore.open(dir);
+    expect(store.acquireRuntimeLease({ leaseName: 'distillation-recovery', holderId: 'a', now: 1000, ttlMs: 5000 })).toBe(true);
+    expect(store.acquireRuntimeLease({ leaseName: 'distillation-recovery', holderId: 'b', now: 1001, ttlMs: 5000 })).toBe(false);
+    expect(store.acquireRuntimeLease({ leaseName: 'distillation-recovery', holderId: 'b', now: 7000, ttlMs: 5000 })).toBe(true);
+    store.close();
+  });
+
   it('builds a bounded evidence window', () => {
     const window = boundedEvidenceWindow(event, 'x'.repeat(300_000));
     expect(window.status).toBe('partial');

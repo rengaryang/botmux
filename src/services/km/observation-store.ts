@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema, KmProviderDescriptorSchema, type KmMemoryProviderConfig, type KmPipelineProfile, type KmProviderDescriptor } from './provider-spi.js';
 import {
@@ -9,7 +10,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -150,6 +151,16 @@ const PHASE8_SCHEMA = `
     migration_id TEXT PRIMARY KEY, bot_app_id TEXT NOT NULL, from_profile_json TEXT NOT NULL CHECK(json_valid(from_profile_json)),
     to_profile_json TEXT NOT NULL CHECK(json_valid(to_profile_json)), state TEXT NOT NULL CHECK(state IN ('draft','backfilling','comparing','ready','cutover','rolled_back','failed')),
     checkpoint TEXT, stats_json TEXT NOT NULL CHECK(json_valid(stats_json)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
+`;
+
+const PHASE12_SCHEMA = `
+  UPDATE km_pipeline_profiles SET state='retired'
+    WHERE state='shadow' AND rowid NOT IN (SELECT MAX(rowid) FROM km_pipeline_profiles WHERE state='shadow' GROUP BY bot_app_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS km_pipeline_profiles_one_shadow_bot
+    ON km_pipeline_profiles(bot_app_id) WHERE state='shadow';
+  CREATE TABLE IF NOT EXISTS km_runtime_leases (
+    lease_name TEXT PRIMARY KEY, holder_id TEXT NOT NULL, expires_at INTEGER NOT NULL, updated_at TEXT NOT NULL
   );
 `;
 
@@ -595,6 +606,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 9) this.migrateToPhase9();
     if (this.schemaVersion() < 10) this.migrateToPhase10();
     if (this.schemaVersion() < 11) this.migrateToPhase11();
+    if (this.schemaVersion() < 12) this.migrateToPhase12();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -635,6 +647,23 @@ export class ObservationStore {
       knowledge: Number((this.db.prepare('SELECT COUNT(*) AS count FROM knowledge_items').get() as any).count),
       memory: Number((this.db.prepare('SELECT COUNT(*) AS count FROM memory_items').get() as any).count),
     };
+  }
+
+  acquireRuntimeLease(input: { leaseName: string; holderId: string; now?: number; ttlMs?: number }): boolean {
+    const now = input.now ?? Date.now(); const expiresAt = now + Math.max(1_000,input.ttlMs ?? 45_000);
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const row = this.db.prepare(`SELECT holder_id,expires_at FROM km_runtime_leases WHERE lease_name=?`).get(input.leaseName) as any;
+      if (row && row.holder_id !== input.holderId && Number(row.expires_at) > now) { this.db.exec('COMMIT;'); return false; }
+      this.db.prepare(`INSERT INTO km_runtime_leases(lease_name,holder_id,expires_at,updated_at) VALUES(?,?,?,?)
+        ON CONFLICT(lease_name) DO UPDATE SET holder_id=excluded.holder_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at`)
+        .run(input.leaseName,input.holderId,expiresAt,new Date(now).toISOString());
+      this.db.exec('COMMIT;'); return true;
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  releaseRuntimeLease(input: { leaseName: string; holderId: string }): void {
+    this.db.prepare(`DELETE FROM km_runtime_leases WHERE lease_name=? AND holder_id=?`).run(input.leaseName,input.holderId);
   }
 
   distillationBacklogStatus(now = Date.now()): { queued: number; retryWait: number; oldestAgeMs: number; claimed: number } {
@@ -1348,6 +1377,7 @@ export class ObservationStore {
     this.db.exec('SAVEPOINT km_profile_put;');
     try {
       if (state === 'active') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='active'`).run(profile.botAppId);
+      if (state === 'shadow') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='shadow'`).run(profile.botAppId);
       this.db.prepare(`INSERT INTO km_pipeline_profiles(profile_id,revision,bot_app_id,profile_json,profile_hash,state,created_at)
         VALUES(?,?,?,?,?,?,?)`).run(profile.profileId, profile.revision, profile.botAppId, json, hash, state, now);
       this.db.exec('RELEASE km_profile_put;');
@@ -1365,13 +1395,17 @@ export class ObservationStore {
     }; });
   }
 
-  setPipelineProfileState(input: { profileId: string; revision: number; state: 'draft' | 'shadow' | 'active' | 'retired' }): Record<string, unknown> {
-    const row = this.db.prepare(`SELECT bot_app_id FROM km_pipeline_profiles WHERE profile_id=? AND revision=?`).get(input.profileId, input.revision) as any;
+  setPipelineProfileState(input: { profileId: string; revision: number; state: 'draft' | 'shadow' | 'active' | 'retired'; expectedHash?: string }): Record<string, unknown> {
+    const row = this.db.prepare(`SELECT bot_app_id,state,profile_hash FROM km_pipeline_profiles WHERE profile_id=? AND revision=?`).get(input.profileId, input.revision) as any;
     if (!row) throw new Error('km_pipeline_profile_not_found');
+    if (input.expectedHash && input.expectedHash !== row.profile_hash) throw new Error('km_pipeline_profile_version_conflict');
+    const allowed: Record<string, string[]> = { draft: ['shadow','retired'], shadow: ['draft','retired'], active: ['retired'], retired: [] };
+    if (row.state !== input.state && !allowed[row.state]?.includes(input.state)) throw new Error(`km_pipeline_profile_invalid_transition:${row.state}:${input.state}`);
     this.db.exec('SAVEPOINT km_profile_state;');
     try {
-      if (input.state === 'active') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='active'`).run(row.bot_app_id);
-      this.db.prepare(`UPDATE km_pipeline_profiles SET state=? WHERE profile_id=? AND revision=?`).run(input.state, input.profileId, input.revision);
+      if (input.state === 'shadow') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='shadow' AND NOT (profile_id=? AND revision=?)`)
+        .run(row.bot_app_id,input.profileId,input.revision);
+      this.db.prepare(`UPDATE km_pipeline_profiles SET state=? WHERE profile_id=? AND revision=? AND profile_hash=?`).run(input.state,input.profileId,input.revision,row.profile_hash);
       this.db.exec('RELEASE km_profile_state;');
     } catch (error) { try { this.db.exec('ROLLBACK TO km_profile_state; RELEASE km_profile_state;'); } catch {} throw error; }
     return this.listPipelineProfiles(row.bot_app_id).find(value => (value.profile as KmPipelineProfile).profileId === input.profileId
@@ -1405,8 +1439,15 @@ export class ObservationStore {
     const row = this.db.prepare(`SELECT config_json,updated_at FROM km_memory_provider_configs WHERE provider_id=?`).get(providerId) as any;
     if (!row) throw new Error('km_memory_provider_config_not_found');
     const config = KmMemoryProviderConfigSchema.parse(JSON.parse(row.config_json));
-    const [kind, value] = config.credentialRef.split(':', 2);
-    const credentialAvailable = kind === 'env' ? Boolean(env[value]?.trim()) : kind === 'file' ? existsSync(value) : false;
+    const kind = config.credentialRef.startsWith('env:') ? 'env' : 'file';
+    const value = config.credentialRef.slice(kind.length + 1);
+    let credentialAvailable = false;
+    if (kind === 'env') credentialAvailable = Boolean(env[value]?.trim());
+    else try {
+      const allowedRoot = resolve(env.BOTMUX_KM_SECRET_DIR?.trim() || join(homedir(), '.botmux', 'secrets'));
+      const candidate = resolve(value); const insideAllowedRoot = candidate === allowedRoot || candidate.startsWith(`${allowedRoot}/`);
+      const stat = lstatSync(candidate); credentialAvailable = insideAllowedRoot && stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o077) === 0;
+    } catch { credentialAvailable = false; }
     return { providerId: config.providerId, status: !config.enabled ? 'disabled' : credentialAvailable ? 'configuration_ready' : 'credential_missing',
       endpointValid: true, credentialAvailable, transportChecked: false, realTransportEnabled: false, updatedAt: row.updated_at };
   }
@@ -1507,6 +1548,36 @@ export class ObservationStore {
         ...(row.reason ? { reason: row.reason } : {}), createdAt: row.created_at }));
   }
 
+  retrievalQualitySummary(): Record<string, number> {
+    const row = this.db.prepare(`SELECT COUNT(*) runs,
+      SUM(CASE WHEN candidate_count=0 THEN 1 ELSE 0 END) zero_hits,
+      SUM(candidate_count) candidates,SUM(eligible_count) eligible,
+      COALESCE(AVG(latency_ms),0) avg_latency_ms FROM retrieval_runs`).get() as any;
+    return { runs: Number(row.runs ?? 0), zeroHits: Number(row.zero_hits ?? 0), candidates: Number(row.candidates ?? 0),
+      eligible: Number(row.eligible ?? 0), avgLatencyMs: Math.round(Number(row.avg_latency_ms ?? 0)) };
+  }
+
+  retrievalRetentionPreview(cutoffIso: string): { cutoff: string; eligibleRuns: number } {
+    const cutoff = new Date(cutoffIso); if (!Number.isFinite(cutoff.getTime())) throw new Error('km_retention_cutoff_invalid');
+    const normalized = cutoff.toISOString();
+    const row = this.db.prepare(`SELECT COUNT(*) count FROM retrieval_runs WHERE created_at<?`).get(normalized) as any;
+    return { cutoff: normalized, eligibleRuns: Number(row.count ?? 0) };
+  }
+
+  purgeRetrievalAudit(input: { cutoffIso: string; expectedEligibleRuns: number; actorId: string; reason: string }): number {
+    const preview = this.retrievalRetentionPreview(input.cutoffIso);
+    if (preview.eligibleRuns !== input.expectedEligibleRuns) throw new Error('km_retention_preview_conflict');
+    requireText(input.actorId,'retention_actor'); requireText(input.reason,'retention_reason');
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const changes = Number(this.db.prepare(`DELETE FROM retrieval_runs WHERE created_at<?`).run(preview.cutoff).changes);
+      this.db.prepare(`INSERT INTO km_config_audit(audit_id,actor_id,action,target_ref,before_hash,after_hash,request_hash,idempotency_key,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(`kma_${randomUUID().replaceAll('-', '')}`,input.actorId,'retrieval.retention_purge',preview.cutoff,null,null,
+        sha256(JSON.stringify({ expectedEligibleRuns: input.expectedEligibleRuns, reason: input.reason })),'retention-worker',new Date().toISOString());
+      this.db.exec('COMMIT;'); return changes;
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
   private knowledgeFromRow(row: any): KnowledgeItem {
     return {
       knowledgeId: row.knowledge_id, state: row.state, targetLayer: row.target_layer,
@@ -1571,6 +1642,16 @@ export class ObservationStore {
       try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
       throw error;
     }
+  }
+
+  private migrateToPhase12(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 12) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE12_SCHEMA);
+      this.db.exec('PRAGMA user_version=12;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
   private migrateToPhase11(): void {
@@ -1705,6 +1786,7 @@ export class ObservationStore {
       'km_mutation_idempotency',
       'km_config_audit',
       'km_memory_policy_decisions',
+      'km_runtime_leases',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

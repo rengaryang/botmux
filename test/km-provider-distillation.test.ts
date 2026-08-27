@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -27,11 +27,12 @@ describe('KM provider SPI and durable distillation', () => {
     expect(KmPipelineProfileSchema.parse(profile).botAppId).toBe('bot-1');
     expect(() => KmProviderDescriptorSchema.parse({})).toThrow();
     expect(() => KmPipelineProfileSchema.parse({ ...profile, shadowExtractors: [profile.primaryExtractor] })).toThrow(/primary cannot also be shadow/);
+    expect(() => KmPipelineProfileSchema.parse({ ...profile, memoryBackends: { writePolicy: 'primary-mirror', primary: 'mem0', mirrors: ['mem0'] } })).toThrow(/primary cannot also be mirror/);
   });
 
   it('persists provider/profile and claims a snapshot-stable job idempotently', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(11);
+    expect(store.schemaVersion()).toBe(12);
     store.registerKmProvider({ id: 'botmux-cli:pi:default', kind: 'extractor', version: '1', contractVersion: 1,
       capabilities: ['strict-json'], execution: 'botmux-cli', deterministic: false, supportsShadow: true, maxBatchSize: 1 });
     expect(store.putPipelineProfile(profile, 'active')).toMatch(/^sha256:/);
@@ -43,6 +44,10 @@ describe('KM provider SPI and durable distillation', () => {
       enabled: true, realTransportEnabled: false })]);
     expect(store.memoryProviderConfigurationHealth('mem0', {})).toEqual(expect.objectContaining({ status: 'credential_missing',
       transportChecked: false, realTransportEnabled: false }));
+    const secret = join(tempDir(), 'secret'); writeFileSync(secret, 'token'); chmodSync(secret, 0o600);
+    store.putMemoryProviderConfig({ providerId: 'hindsight', endpoint: 'https://memory.example.test', credentialRef: `file:${secret}`,
+      enabled: true, realTransportEnabled: false, timeoutMs: 5000 });
+    expect(store.memoryProviderConfigurationHealth('hindsight', { BOTMUX_KM_SECRET_DIR: join(secret, '..') })).toEqual(expect.objectContaining({ status: 'configuration_ready', credentialAvailable: true }));
     const first = store.createDistillationJob({ sourceEventId: 'evt-1', profile, now: 1000 });
     expect(first.created).toBe(true);
     expect(store.createDistillationJob({ sourceEventId: 'evt-1', profile, now: 1000 })).toEqual({ jobId: first.jobId, created: false });
@@ -51,13 +56,29 @@ describe('KM provider SPI and durable distillation', () => {
     expect(claimed?.profile).toEqual(profile);
     store.finishDistillationJob({ jobId: first.jobId, claimToken: claimed!.claimToken, outputHash: `sha256:${'a'.repeat(64)}` });
     expect(store.claimDistillationJob({ now: 1000 })).toBeNull();
-    expect(store.setPipelineProfileState({ profileId: 'default', revision: 1, state: 'retired' })).toEqual(expect.objectContaining({ state: 'retired' }));
+    expect(store.setPipelineProfileState({ profileId: 'default', revision: 1, state: 'retired', expectedHash: store.listPipelineProfiles('bot-1')[0].profileHash as string })).toEqual(expect.objectContaining({ state: 'retired' }));
+    expect(() => store.setPipelineProfileState({ profileId: 'default', revision: 1, state: 'shadow' })).toThrow(/invalid_transition/);
     const mutation = { actorId: 'u1', idempotencyKey: 'idem-1', route: '/api/km/profiles', requestHash: `sha256:${'c'.repeat(64)}`,
       statusCode: 201, action: 'profile.created', targetRef: 'default@1' };
     expect(store.executeKmMutation(mutation, () => ({ ok: true }))).toEqual({ statusCode: 201, response: { ok: true }, replayed: false });
     expect(store.executeKmMutation(mutation, () => { throw new Error('must_not_run'); })).toEqual({ statusCode: 201, response: { ok: true }, replayed: true });
     expect(() => store.executeKmMutation({ ...mutation, requestHash: `sha256:${'d'.repeat(64)}` }, () => ({ ok: false }))).toThrow(/idempotency_conflict/);
     expect(store.listKmConfigAudit(10)).toEqual([expect.objectContaining({ actorId: 'u1', action: 'profile.created' })]);
+    expect(store.retrievalQualitySummary()).toEqual({ runs: 0, zeroHits: 0, candidates: 0, eligible: 0, avgLatencyMs: 0 });
+    expect(store.retrievalRetentionPreview('2026-01-01T00:00:00.000Z')).toEqual({ cutoff: '2026-01-01T00:00:00.000Z', eligibleRuns: 0 });
+    store.close();
+  });
+
+  it('keeps at most one effective shadow profile per bot', async () => {
+    const store = await ObservationStore.open(tempDir());
+    const first = { ...profile, profileId: 'first', revision: 1 };
+    const second = { ...profile, profileId: 'second', revision: 2 };
+    store.putPipelineProfile(first, 'shadow'); store.putPipelineProfile(second, 'shadow');
+    expect(store.listPipelineProfiles('bot-1').filter(row => row.state === 'shadow')).toEqual([expect.objectContaining({ profile: second })]);
+    expect(store.listPipelineProfiles('bot-1').filter(row => row.state === 'retired')).toEqual([expect.objectContaining({ profile: first })]);
+    const secondRow = store.listPipelineProfiles('bot-1').find(row => (row.profile as KmPipelineProfile).profileId === 'second')!;
+    expect(() => store.setPipelineProfileState({ profileId: 'second', revision: 2, state: 'retired', expectedHash: 'sha256:stale' })).toThrow(/version_conflict/);
+    expect(store.setPipelineProfileState({ profileId: 'second', revision: 2, state: 'retired', expectedHash: secondRow.profileHash as string })).toEqual(expect.objectContaining({ state: 'retired' }));
     store.close();
   });
 
