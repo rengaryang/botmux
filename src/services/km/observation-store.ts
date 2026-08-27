@@ -9,7 +9,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -111,6 +111,24 @@ const FRESH_SCHEMA = `
     value INTEGER NOT NULL
   );
   INSERT INTO local_sequence_counter(name, value) VALUES('observation_events', 0);
+`;
+
+const PHASE8_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS memory_backend_outbox (
+    outbox_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL, operation TEXT NOT NULL CHECK(operation IN ('put','revoke','verify')),
+    payload_json TEXT NOT NULL CHECK(json_valid(payload_json)), payload_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','inflight','delivered','failed','quarantined')),
+    attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+    claimed_at INTEGER, claim_token TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(memory_id,provider_id,operation,payload_hash)
+  );
+  CREATE INDEX IF NOT EXISTS memory_backend_outbox_due ON memory_backend_outbox(status,next_attempt_at,created_at);
+  CREATE TABLE IF NOT EXISTS memory_backend_migrations (
+    migration_id TEXT PRIMARY KEY, bot_app_id TEXT NOT NULL, from_profile_json TEXT NOT NULL CHECK(json_valid(from_profile_json)),
+    to_profile_json TEXT NOT NULL CHECK(json_valid(to_profile_json)), state TEXT NOT NULL CHECK(state IN ('draft','backfilling','comparing','ready','cutover','rolled_back','failed')),
+    checkpoint TEXT, stats_json TEXT NOT NULL CHECK(json_valid(stats_json)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
 `;
 
 const PHASE7_SCHEMA = `
@@ -524,6 +542,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 5) this.migrateToPhase5();
     if (this.schemaVersion() < 6) this.migrateToPhase6();
     if (this.schemaVersion() < 7) this.migrateToPhase7();
+    if (this.schemaVersion() < 8) this.migrateToPhase8();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -904,6 +923,34 @@ export class ObservationStore {
       ...(row.backend_ref ? { backendRef: row.backend_ref } : {}), writeState: row.write_state, contentHash: row.content_hash,
       ...(row.last_verified_at ? { lastVerifiedAt: row.last_verified_at } : {}), ...(row.last_error ? { lastError: row.last_error } : {}),
       updatedAt: row.updated_at }));
+  }
+
+  enqueueMemoryBackendOperation(input: { memoryId: string; providerId: string; operation: 'put' | 'revoke' | 'verify'; payload: Record<string, unknown>; now?: number }): { outboxId: string; created: boolean } {
+    if (!this.getMemory(input.memoryId)) throw new Error('km_memory_not_found');
+    const payloadJson = JSON.stringify(input.payload);
+    const hash = sha256(payloadJson);
+    const outboxId = `mout_${createHash('sha256').update(`${input.memoryId}|${input.providerId}|${input.operation}|${hash}`).digest('hex')}`;
+    const nowMs = input.now ?? Date.now(); const now = new Date(nowMs).toISOString();
+    const result = this.db.prepare(`INSERT OR IGNORE INTO memory_backend_outbox(
+      outbox_id,memory_id,provider_id,operation,payload_json,payload_hash,status,next_attempt_at,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(outboxId, input.memoryId, input.providerId, input.operation, payloadJson, hash, nowMs, now, now);
+    return { outboxId, created: Number(result.changes) === 1 };
+  }
+
+  createMemoryBackendMigration(input: { botAppId: string; fromProfile: Record<string, unknown>; toProfile: Record<string, unknown> }): string {
+    const migrationId = `mmig_${randomUUID().replaceAll('-', '')}`; const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO memory_backend_migrations(migration_id,bot_app_id,from_profile_json,to_profile_json,state,stats_json,created_at,updated_at)
+      VALUES(?,?,?,?,'draft','{}',?,?)`).run(migrationId, requireText(input.botAppId, 'migration_bot'), JSON.stringify(input.fromProfile), JSON.stringify(input.toProfile), now, now);
+    return migrationId;
+  }
+
+  transitionMemoryBackendMigration(input: { migrationId: string; toState: 'backfilling' | 'comparing' | 'ready' | 'cutover' | 'rolled_back' | 'failed'; checkpoint?: string; stats?: Record<string, unknown> }): void {
+    const row = this.db.prepare('SELECT state FROM memory_backend_migrations WHERE migration_id=?').get(input.migrationId) as { state: string } | undefined;
+    if (!row) throw new Error('km_memory_migration_not_found');
+    const allowed: Record<string, string[]> = { draft: ['backfilling','failed'], backfilling: ['comparing','failed'], comparing: ['ready','failed'], ready: ['cutover','failed'], cutover: ['rolled_back'], rolled_back: [], failed: ['backfilling'] };
+    if (!allowed[row.state]?.includes(input.toState)) throw new Error(`km_memory_migration_invalid_transition:${row.state}:${input.toState}`);
+    this.db.prepare(`UPDATE memory_backend_migrations SET state=?,checkpoint=?,stats_json=?,updated_at=? WHERE migration_id=?`)
+      .run(input.toState, input.checkpoint ?? null, JSON.stringify(input.stats ?? {}), new Date().toISOString(), input.migrationId);
   }
 
   getMemory(memoryId: string): MemoryItem | null {
@@ -1299,6 +1346,19 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase8(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 8) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE8_SCHEMA);
+      this.db.exec('PRAGMA user_version=8;');
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      throw error;
+    }
+  }
+
   private migrateToPhase7(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -1376,6 +1436,8 @@ export class ObservationStore {
       'km_pipeline_profiles',
       'distillation_jobs',
       'memory_backend_bindings',
+      'memory_backend_outbox',
+      'memory_backend_migrations',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

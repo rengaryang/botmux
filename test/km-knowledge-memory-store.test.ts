@@ -34,7 +34,7 @@ describe('KM Phase 2 knowledge and memory store', () => {
     `);
     db.close();
     const store = await ObservationStore.open(dir);
-    expect(store.schemaVersion()).toBe(7);
+    expect(store.schemaVersion()).toBe(8);
     expect(store.listKnowledge({ limit: 10 })).toEqual([]);
     store.close();
   });
