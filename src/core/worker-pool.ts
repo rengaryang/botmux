@@ -124,6 +124,7 @@ import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import type { TurnCompletionEventPayload } from '../services/skill-feedback-store.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -858,6 +859,14 @@ export interface WorkerPoolCallbacks {
       activeController?: TrustedCaller;
     },
   ) => boolean | Promise<boolean>;
+  /** Fired when a delivery write creates or replays a durable turn.completed
+   *  payload. This covers delivery-after-terminal order, where onTurnTerminal
+   *  has no payload yet. */
+  onTurnCompletion?: (
+    ds: DaemonSession,
+    payload: TurnCompletionEventPayload,
+    context: { workerGeneration: number },
+  ) => void | Promise<void>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -15948,6 +15957,9 @@ function setupWorkerHandlers(
                       () => ds.worker === worker
                         && ds.session.sessionId === msg.sessionId,
                       preview.settledEntry.replyTarget,
+                      undefined,
+                      undefined,
+                      workerGeneration,
                     );
                   });
               if (!owned) return false;
@@ -16088,6 +16100,10 @@ function setupWorkerHandlers(
           0,
           undefined,
           ownsLifecycleMutation,
+          undefined,
+          undefined,
+          undefined,
+          workerGeneration,
         );
         break;
       }
@@ -16650,6 +16666,7 @@ async function persistFinalOutputDelivery(
   webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
   logTag: string,
   correlationDiscriminator?: string,
+  workerGeneration = closeFenceGeneration(ds),
 ): Promise<void> {
   // A control needs BOTH the policy and the card snapshot to stay clickable
   // after a restart; either one missing means "record the delivery, no control".
@@ -16658,7 +16675,7 @@ async function persistFinalOutputDelivery(
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
     if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
-    feedbackStore.recordTurnDelivery({
+    const result = feedbackStore.recordTurnDeliveryWithCompletion({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
@@ -16684,6 +16701,15 @@ async function persistFinalOutputDelivery(
       webhookDestinations,
       context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
     });
+    if (result.completion) {
+      try {
+        await requireCallbacks().onTurnCompletion?.(ds, result.completion, { workerGeneration });
+      } catch (error) {
+        logger.warn(
+          `[${logTag}] Durable turn completion consumer failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   } catch (error) {
     logger.warn(
       `[${logTag}] Failed to persist final-output turn delivery: ${error instanceof Error ? error.message : String(error)}`,
@@ -16723,6 +16749,7 @@ function deliverFinalOutput(
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
+  workerGeneration = closeFenceGeneration(ds),
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -17183,7 +17210,7 @@ function deliverFinalOutput(
         // never correlate to a feedback turn_terminal; skip them. Every other
         // fallback final is recorded regardless of the feedback policy.
         if (!managedReceiver) {
-          await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+          await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, undefined, workerGeneration);
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
@@ -17285,7 +17312,7 @@ function deliverFinalOutput(
           explicit ? explicit.feedback?.policy : feedbackPolicy,
           explicit ? (explicit.feedback && explicit.finalCard ? JSON.parse(explicit.finalCard) as Record<string, unknown> : undefined) : baseFeedbackCard,
           explicit ? explicit.feedback?.requesterSubjectId : feedbackRequesterSubjectId,
-          getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, explicit ? messageId : undefined);
+          getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, explicit ? messageId : undefined, workerGeneration);
       }
       onComplete?.(true, messageId);
     } catch (err: any) {
@@ -17327,7 +17354,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, workerGeneration);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

@@ -14,6 +14,7 @@ export interface KmObservationApiStore {
   get(eventId: string): ReturnType<ObservationStore['get']>;
   listKnowledge?(filter: Parameters<ObservationStore['listKnowledge']>[0]): ReturnType<ObservationStore['listKnowledge']>;
   listMemory?(filter: Parameters<ObservationStore['listMemory']>[0]): ReturnType<ObservationStore['listMemory']>;
+  transitionMemory?(input: Parameters<ObservationStore['transitionMemory']>[0]): ReturnType<ObservationStore['transitionMemory']>;
   retrieve?(query: Parameters<ObservationStore['retrieve']>[0]): ReturnType<ObservationStore['retrieve']>;
   transitionKnowledge?(input: Parameters<ObservationStore['transitionKnowledge']>[0]): ReturnType<ObservationStore['transitionKnowledge']>;
   knowledgeExportDryRun?(knowledgeId: string): ReturnType<ObservationStore['knowledgeExportDryRun']>;
@@ -83,6 +84,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/memory'
     || url.pathname === '/api/km/retrieve'
     || /^\/api\/km\/knowledge\/[^/]+\/(state|export-dry-run)$/.test(url.pathname)
+    || /^\/api\/km\/memory\/[^/]+\/state$/.test(url.pathname)
     || url.pathname === '/api/km/trace'
     || url.pathname === '/api/km/eval/runs'
     || url.pathname === '/api/km/evolution/proposals'
@@ -159,6 +161,17 @@ export async function handleKmObservationApi(
       executeMutation(ctx, 200, 'knowledge.state_changed', decodeURIComponent(transition[1]), () => store!.transitionKnowledge!({
         knowledgeId: decodeURIComponent(transition[1]), toState: String(body.toState) as any,
         reasonCode: String(body.reasonCode ?? ''), actorId: ctx.actorId })); return true;
+    }
+
+    const memoryTransition = url.pathname.match(/^\/api\/km\/memory\/([^/]+)\/state$/);
+    if (memoryTransition) {
+      if (req.method !== 'PATCH') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.transitionMemory) throw new Error('km_memory_review_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'memory.state_changed', decodeURIComponent(memoryTransition[1]), () => store!.transitionMemory!({
+        memoryId: decodeURIComponent(memoryTransition[1]), toState: String(body.toState) as any,
+        reasonCode: String(body.reasonCode ?? ''), actorId: ctx.actorId,
+      })); return true;
     }
 
     const dryRun = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/export-dry-run$/);

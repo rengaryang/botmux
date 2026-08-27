@@ -86,10 +86,13 @@ import {
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+<<<<<<< HEAD
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
-import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
+=======
+import { getSkillFeedbackStore, type TurnCompletionEventPayload } from './services/skill-feedback-store.js';
+>>>>>>> 9dff85c4 (feat(km): complete P0 memory data loop)
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
@@ -200,6 +203,41 @@ function trustedCallerForTurn(
     requestLarkAppId: larkAppId,
     ...(senderIsBot === undefined ? {} : { senderType: senderIsBot ? 'bot' as const : 'user' as const }),
   };
+}
+
+function handleDurableTurnCompletionForKm(
+  ds: DaemonSession,
+  payload: TurnCompletionEventPayload,
+  source: string,
+): void {
+  if (!isKmObservationEnabled()) return;
+  const observation = observationFromTurnCompletion(payload);
+  void enqueueObservation({
+    dataDir: config.session.dataDir,
+    event: observation,
+    onResult: result => {
+      if (result.status === 'quarantined') return;
+      const botConfig = getBot(ds.larkAppId).config;
+      void enqueueAutomaticDistillation({
+        dataDir: config.session.dataDir,
+        event: observation,
+        cliId: ds.session.cliId ?? botConfig.cliId,
+        model: ds.session.model ?? botConfig.model,
+        cliSessionId: ds.session.cliSessionId,
+        cwd: ds.session.workingDir ?? ds.workingDir,
+      })
+        .then(() => runOneDistillationJob({
+          dataDir: config.session.dataDir,
+          cliId: ds.session.cliId ?? botConfig.cliId,
+          model: ds.session.model ?? botConfig.model,
+        }))
+        .catch(error => logger.warn(`[km-distillation:${source}] ${error instanceof Error ? error.message : String(error)}`));
+    },
+    onError: error => logger.warn(
+      `[km-observation:${source}] turn persistence failed turn=${payload.turnId.slice(0, 12)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ),
+  });
 }
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
@@ -27320,26 +27358,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
           onPersisted: payload => {
-            if (!payload || !isKmObservationEnabled()) return;
-            const observation = observationFromTurnCompletion(payload);
-            void enqueueObservation({
-              dataDir: config.session.dataDir,
-              event: observation,
-              onResult: result => {
-                if (result.status === 'quarantined') return;
-                const botConfig = getBot(ds.larkAppId).config;
-                void enqueueAutomaticDistillation({ dataDir: config.session.dataDir, event: observation,
-                  cliId: ds.session.cliId ?? botConfig.cliId, model: ds.session.model ?? botConfig.model,
-                  cliSessionId: ds.session.cliSessionId, cwd: ds.session.workingDir ?? ds.workingDir })
-                  .then(() => runOneDistillationJob({ dataDir: config.session.dataDir, cliId: ds.session.cliId ?? botConfig.cliId,
-                    model: ds.session.model ?? botConfig.model }))
-                  .catch(error => logger.warn(`[km-distillation] ${error instanceof Error ? error.message : String(error)}`));
-              },
-              onError: error => logger.warn(
-                `[km-observation] turn persistence failed turn=${terminal.turnId.slice(0, 12)}: `
-                + `${error instanceof Error ? error.message : String(error)}`,
-              ),
-            });
+            if (payload) handleDurableTurnCompletionForKm(ds, payload, 'terminal');
           },
         });
       }
@@ -27370,6 +27389,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+    onTurnCompletion(ds, payload, context) {
+      void context;
+      handleDurableTurnCompletionForKm(ds, payload, 'delivery');
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);

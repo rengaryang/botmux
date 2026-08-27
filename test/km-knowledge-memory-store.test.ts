@@ -103,6 +103,47 @@ describe('KM Phase 2 knowledge and memory store', () => {
     store.close();
   });
 
+  it('supports human-reviewed memory approve, conflict, revoke transitions', async () => {
+    const store = await ObservationStore.open(tempDir());
+    const memory = store.upsertMemory({
+      state: 'proposed', scope: 'user', subject: 'u1', claimKey: 'language', claimText: 'Chinese',
+      confidence: 'observed', privacyClass: 'internal', sourceRefs,
+    }).item;
+    const rejected = store.upsertMemory({
+      state: 'proposed', scope: 'user', subject: 'u2', claimKey: 'language', claimText: 'English',
+      confidence: 'observed', privacyClass: 'internal', sourceRefs,
+    }).item;
+    expect(() => store.transitionMemory({ memoryId: memory.memoryId, toState: 'active', reasonCode: 'auto', actorId: 'system' }))
+      .toThrow(/activation_requires_human_review/);
+    expect(store.transitionMemory({ memoryId: rejected.memoryId, toState: 'revoked', reasonCode: 'reject', actorId: 'human-1' }).state)
+      .toBe('revoked');
+    expect(store.transitionMemory({ memoryId: memory.memoryId, toState: 'active', reasonCode: 'reviewed', actorId: 'human-1' }).state)
+      .toBe('active');
+    expect(store.transitionMemory({ memoryId: memory.memoryId, toState: 'conflicted', reasonCode: 'conflict', actorId: 'human-1' }).state)
+      .toBe('conflicted');
+    expect(store.transitionMemory({ memoryId: memory.memoryId, toState: 'revoked', reasonCode: 'reject', actorId: 'human-1' }).state)
+      .toBe('revoked');
+    expect(() => store.transitionMemory({ memoryId: memory.memoryId, toState: 'active', reasonCode: 'bad', actorId: 'human-1' }))
+      .toThrow(/invalid_transition/);
+    store.close();
+  });
+
+  it('registers builtin KM providers with versions and capabilities', async () => {
+    const store = await ObservationStore.open(tempDir());
+    const providers = store.listKmProviders();
+    expect(providers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ providerId: 'observation-source-v1', kind: 'source', version: '1' }),
+      expect.objectContaining({ providerId: 'bounded-transcript-window-v1', kind: 'window-resolver', version: '1' }),
+      expect.objectContaining({ providerId: 'builtin.rules-v1', kind: 'extractor', version: '1' }),
+      expect.objectContaining({ providerId: 'safe-auto-activation-v1', kind: 'memory-policy', version: '1' }),
+      expect.objectContaining({ providerId: 'mem0', kind: 'memory-backend', version: '1' }),
+    ]));
+    expect(providers.find(provider => provider.providerId === 'builtin.rules-v1')?.descriptor).toEqual(expect.objectContaining({
+      capabilities: expect.arrayContaining(['explicit-user-preferences', 'mechanical-attribution-only']),
+    }));
+    store.close();
+  });
+
   it('detects conflicting memory and excludes non-active memory from retrieval', async () => {
     const store = await ObservationStore.open(tempDir());
     const first = store.upsertMemory({

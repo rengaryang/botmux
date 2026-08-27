@@ -57,6 +57,29 @@ describe('durable turn.completed events', () => {
     expect(readFileSync(join(dir, 'botmux-feedback.sqlite'))).not.toContain('private final answer');
   });
 
+  it('returns completion payload to delivery-side consumers when terminal arrived first', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+
+    expect(store.recordTurnTerminal(terminal())).toBeUndefined();
+    const result = store.recordTurnDeliveryWithCompletion(delivery({ requesterSubjectId: 'ou_requester' }));
+
+    expect(result.delivery).toEqual(expect.objectContaining({
+      status: 'completed',
+      platformMessageId: 'om_a',
+      requesterSubjectId: 'ou_requester',
+    }));
+    expect(result.completion).toEqual(expect.objectContaining({
+      type: 'turn.completed',
+      deliveryId: result.delivery.deliveryId,
+      botAppId: 'app_a',
+      sessionId: 'session_a',
+      turnId: 'turn_a',
+      requesterSubjectId: 'ou_requester',
+    }));
+    store.close();
+  });
+
   it('persists only a content-free feedback card template for callback reconstruction', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
     const store = await SkillFeedbackStore.open(dir);

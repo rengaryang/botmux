@@ -577,6 +577,130 @@ const KNOWLEDGE_TRANSITIONS: Readonly<Record<KnowledgeState, readonly KnowledgeS
   purged_local: [],
 };
 
+const MEMORY_TRANSITIONS: Readonly<Record<MemoryState, readonly MemoryState[]>> = {
+  proposed: ['active', 'revoked', 'shadowed'],
+  active: ['stale', 'conflicted', 'revoked', 'expired'],
+  stale: ['active', 'revoked', 'purged_local'],
+  conflicted: ['proposed', 'active', 'revoked'],
+  shadowed: ['proposed', 'revoked', 'purged_local'],
+  expired: ['active', 'purged_local'],
+  revoked: ['purged_local'],
+  purged_local: [],
+};
+
+const BUILTIN_KM_PROVIDER_DESCRIPTORS: readonly KmProviderDescriptor[] = [
+  {
+    id: 'observation-source-v1',
+    kind: 'source',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['turn-completed', 'skill-telemetry', 'workflow-artifacts', 'idempotent-source-keys'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 100,
+  },
+  {
+    id: 'bounded-transcript-window-v1',
+    kind: 'window-resolver',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['tail-window', 'transcript-path-resolution', 'metadata-fallback', 'sha256-content-hash'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 1,
+  },
+  {
+    id: 'builtin.rules-v1',
+    kind: 'extractor',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['workflow-artifact-candidates', 'explicit-user-preferences', 'mechanical-attribution-only'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 1,
+  },
+  {
+    id: 'builtin.layer-router-v1',
+    kind: 'knowledge-router',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['reviewed-only', 'l2-l3-routing', 'privacy-preserving-source-refs'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 100,
+  },
+  {
+    id: 'safe-auto-activation-v1',
+    kind: 'memory-policy',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['explicit-observed-low-risk-auto-active', 'sensitive-reject', 'broad-scope-propose'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 100,
+  },
+  {
+    id: 'sqlite',
+    kind: 'memory-backend',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['local-durable', 'retrieve', 'state-history', 'no-network'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 100,
+  },
+  {
+    id: 'mem0',
+    kind: 'memory-backend',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['configured-only', 'transport-disabled', 'credential-reference'],
+    execution: 'service',
+    deterministic: false,
+    supportsShadow: true,
+    maxBatchSize: 50,
+  },
+  {
+    id: 'hindsight',
+    kind: 'memory-backend',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['configured-only', 'transport-disabled', 'credential-reference'],
+    execution: 'service',
+    deterministic: false,
+    supportsShadow: true,
+    maxBatchSize: 50,
+  },
+  {
+    id: 'openviking',
+    kind: 'memory-backend',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['configured-only', 'transport-disabled', 'credential-reference'],
+    execution: 'service',
+    deterministic: false,
+    supportsShadow: true,
+    maxBatchSize: 50,
+  },
+  {
+    id: 'prompt-memory-v1',
+    kind: 'prompt-composer',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['shadow-would-inject', 'token-budget', 'privacy-filter'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 50,
+  },
+];
+
 export class ObservationStore {
   readonly path: string;
   private readonly db: DatabaseSyncType;
@@ -608,6 +732,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 11) this.migrateToPhase11();
     if (this.schemaVersion() < 12) this.migrateToPhase12();
     this.validateSchema();
+    this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
 
@@ -1096,6 +1221,43 @@ export class ObservationStore {
     return rows.map(row => this.memoryFromRow(row));
   }
 
+  transitionMemory(input: {
+    memoryId: string;
+    toState: MemoryState;
+    reasonCode: string;
+    actorId: string;
+    evidenceEventId?: string;
+  }): MemoryItem {
+    const current = this.getMemory(input.memoryId);
+    if (!current) throw new Error('km_memory_not_found');
+    if (!MEMORY_TRANSITIONS[current.state].includes(input.toState)) {
+      throw new Error(`km_memory_invalid_transition:${current.state}:${input.toState}`);
+    }
+    if (input.toState === 'active') {
+      if (!input.actorId.trim() || input.actorId === 'system') throw new Error('km_memory_activation_requires_human_review');
+      if (current.confidence === 'inferred') throw new Error('km_memory_inferred_requires_human_review');
+      if (current.privacyClass === 'sensitive' || current.privacyClass === 'secret-reference-only') {
+        throw new Error('km_memory_privacy_not_activatable');
+      }
+    }
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_memory_transition;');
+    try {
+      this.db.prepare('UPDATE memory_items SET state=?,updated_at=? WHERE memory_id=?')
+        .run(input.toState, now, input.memoryId);
+      this.db.prepare(`
+        INSERT INTO memory_state_history(history_id,memory_id,from_state,to_state,reason_code,actor_id,evidence_event_id,created_at)
+        VALUES(?,?,?,?,?,?,?,?)
+      `).run(kmId('hist'), input.memoryId, current.state, input.toState,
+        requireText(input.reasonCode, 'memory_reason'), requireText(input.actorId, 'actor_id'), input.evidenceEventId ?? null, now);
+      this.db.exec('RELEASE km_memory_transition;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK TO km_memory_transition; RELEASE km_memory_transition;'); } catch { /* savepoint may already be closed */ }
+      throw error;
+    }
+    return this.getMemory(input.memoryId)!;
+  }
+
   retrieve(input: RetrievalQuery): RetrievalItem[] {
     const limit = Math.max(1, Math.min(input.limit, 100));
     const terms = input.text.toLowerCase().split(/\s+/u).map(term => term.trim()).filter(Boolean);
@@ -1337,7 +1499,8 @@ export class ObservationStore {
     const descriptor = KmProviderDescriptorSchema.parse(descriptorInput);
     this.db.prepare(`INSERT INTO km_provider_registry(provider_id,provider_kind,provider_version,descriptor_json,status,updated_at)
       VALUES(?,?,?,?,?,?) ON CONFLICT(provider_id,provider_version) DO UPDATE SET descriptor_json=excluded.descriptor_json,
-      provider_kind=excluded.provider_kind,status=excluded.status,updated_at=excluded.updated_at`)
+      provider_kind=excluded.provider_kind,status=excluded.status,updated_at=excluded.updated_at
+      WHERE descriptor_json<>excluded.descriptor_json OR provider_kind<>excluded.provider_kind OR status<>excluded.status`)
       .run(descriptor.id, descriptor.kind, descriptor.version, JSON.stringify(descriptor), 'validated', new Date().toISOString());
   }
 
@@ -1518,8 +1681,10 @@ export class ObservationStore {
   }
 
   listKmProviders(): Array<Record<string, unknown>> {
-    return (this.db.prepare(`SELECT provider_id,provider_kind,provider_version,status,last_health_json,updated_at FROM km_provider_registry ORDER BY provider_kind,provider_id`).all() as any[])
-      .map(row => ({ providerId: row.provider_id, kind: row.provider_kind, version: row.provider_version, status: row.status,
+    this.seedBuiltinKmProvidersBestEffort();
+    return (this.db.prepare(`SELECT provider_id,provider_kind,provider_version,descriptor_json,status,last_health_json,updated_at FROM km_provider_registry ORDER BY provider_kind,provider_id`).all() as any[])
+      .map(row => ({ providerId: row.provider_id, kind: row.provider_kind, version: row.provider_version,
+        descriptor: KmProviderDescriptorSchema.parse(JSON.parse(row.descriptor_json)), status: row.status,
         ...(row.last_health_json ? { health: JSON.parse(row.last_health_json) } : {}), updatedAt: row.updated_at }));
   }
 
@@ -1791,6 +1956,22 @@ export class ObservationStore {
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
       if (!row) throw new Error(`km_observation_schema_invalid:missing_${table}`);
+    }
+  }
+
+  private seedBuiltinKmProviders(): void {
+    for (const descriptor of BUILTIN_KM_PROVIDER_DESCRIPTORS) this.registerKmProvider(descriptor);
+  }
+
+  private seedBuiltinKmProvidersBestEffort(): void {
+    const previousTimeout = Number((this.db.prepare('PRAGMA busy_timeout').get() as any)?.timeout ?? BUSY_TIMEOUT_MS);
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      this.seedBuiltinKmProviders();
+    } catch (error) {
+      if (!isSqliteBusyError(error)) throw error;
+    } finally {
+      this.db.exec(`PRAGMA busy_timeout=${previousTimeout};`);
     }
   }
 }
