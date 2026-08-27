@@ -7,6 +7,7 @@ import { boundedEvidenceWindow, defaultShadowProfile, drainDistillationJobs, enq
 import { observationFromTurnCompletion } from '../src/services/km/observation-producers.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import type { ObservationEvent } from '../src/services/km/observation-schema.js';
+import type { MemoryBackendProvider } from '../src/services/km/memory-backend-spi.js';
 
 const dirs: string[] = [];
 function tempDir(): string { const dir = mkdtempSync(join(tmpdir(), 'botmux-km-runtime-')); dirs.push(dir); return dir; }
@@ -103,6 +104,27 @@ describe('KM runtime orchestrator', () => {
     const { DatabaseSync } = await import('node:sqlite'); const db = new DatabaseSync(join(dir, 'botmux-km.sqlite'), { readOnly: true });
     expect(db.prepare('select count(*) n from retrieval_runs').get()).toEqual(expect.objectContaining({ n: 1 }));
     expect(db.prepare('select disposition from prompt_injection_snapshots').get()).toEqual(expect.objectContaining({ disposition: 'would_inject' })); db.close();
+  });
+
+  it('keeps federated retrieval behind its own disabled gate', async () => {
+    const dir = tempDir();
+    const provider: MemoryBackendProvider = {
+      descriptor: { id: 'mem0', version: '1', kind: 'mem0', capabilities: { put: true, update: true, revoke: true, retrieve: true, metadataFilter: true, namespaces: true, ttl: false, snapshot: false } },
+      health: async () => ({ status: 'ok' }),
+      put: async item => ({ providerId: 'mem0', backendRef: 'mem0-ref', contentHash: item.contentHash }),
+      revoke: async () => {},
+      retrieve: async () => [{ providerId: 'mem0', backendRef: 'remote-1', memoryId: 'remote-1', text: 'Remote Chinese preference', score: 1, scope: 'user', subject: 'u1' }],
+    };
+    await runRetrievalShadow({ dataDir: dir, botAppId: 'bot', sessionId: 's1', userId: 'u1', queryText: 'Chinese',
+      providers: [provider], env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true' } as any });
+    let store = await ObservationStore.open(dir);
+    expect(store.listRetrievalAudits(1)).toEqual([expect.objectContaining({ candidateCount: 0, warnings: ['federated_retrieval_gate_disabled'] })]);
+    store.close();
+    await runRetrievalShadow({ dataDir: dir, botAppId: 'bot', sessionId: 's2', userId: 'u1', queryText: 'Chinese',
+      providers: [provider], env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true', BOTMUX_KM_FEDERATED_RETRIEVAL_ENABLED: 'true' } as any });
+    store = await ObservationStore.open(dir);
+    expect(store.listRetrievalAudits(1)).toEqual([expect.objectContaining({ candidateCount: 1, warnings: [] })]);
+    store.close();
   });
 
   it('runs the real delivery-after-terminal path into observation, durable job, memory, and wouldInject audit', async () => {

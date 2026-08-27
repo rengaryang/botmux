@@ -458,6 +458,28 @@ export interface MemoryBackendBinding {
   writeState: 'pending' | 'active' | 'failed' | 'revoked' | 'shadow';
   contentHash: string; lastVerifiedAt?: string; lastError?: string; updatedAt: string;
 }
+export type MemoryBackendOutboxOperation = 'put' | 'revoke' | 'verify';
+export interface MemoryBackendOutboxItem {
+  outboxId: string; memoryId: string; providerId: string; operation: MemoryBackendOutboxOperation;
+  payload: Record<string, unknown>; payloadHash: string; attempts: number;
+}
+export interface MemoryBackendOutboxClaim {
+  claimToken: string;
+  items: MemoryBackendOutboxItem[];
+}
+export interface MemoryBackendOutboxRow extends MemoryBackendOutboxItem {
+  status: 'pending' | 'inflight' | 'delivered' | 'failed' | 'quarantined';
+  nextAttemptAt: number; claimedAt?: number; lastError?: string; createdAt: string; updatedAt: string;
+}
+export interface MemoryBackendMigrationSnapshot {
+  migrationId: string; botAppId: string; fromProfile: Record<string, unknown>; toProfile: Record<string, unknown>;
+  state: 'draft' | 'backfilling' | 'comparing' | 'ready' | 'cutover' | 'rolled_back' | 'failed';
+  checkpoint?: string; stats: Record<string, unknown>; createdAt: string; updatedAt: string;
+}
+export interface MemoryBackendBindingCompareReport {
+  fromProviderId: string; toProviderId: string; compared: number; matched: number; missing: number; mismatched: number;
+  samples: Array<{ memoryId: string; reason: 'missing' | 'content_hash_mismatch' | 'state_not_active'; fromContentHash?: string; toContentHash?: string; toState?: string }>;
+}
 
 export interface MemoryUpsertInput {
   memoryId?: string;
@@ -1143,7 +1165,7 @@ export class ObservationStore {
       updatedAt: row.updated_at }));
   }
 
-  enqueueMemoryBackendOperation(input: { memoryId: string; providerId: string; operation: 'put' | 'revoke' | 'verify'; payload: Record<string, unknown>; now?: number }): { outboxId: string; created: boolean } {
+  enqueueMemoryBackendOperation(input: { memoryId: string; providerId: string; operation: MemoryBackendOutboxOperation; payload: Record<string, unknown>; now?: number }): { outboxId: string; created: boolean } {
     if (!this.getMemory(input.memoryId)) throw new Error('km_memory_not_found');
     const payloadJson = JSON.stringify(input.payload);
     const hash = sha256(payloadJson);
@@ -1153,6 +1175,143 @@ export class ObservationStore {
       outbox_id,memory_id,provider_id,operation,payload_json,payload_hash,status,next_attempt_at,created_at,updated_at
     ) VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(outboxId, input.memoryId, input.providerId, input.operation, payloadJson, hash, nowMs, now, now);
     return { outboxId, created: Number(result.changes) === 1 };
+  }
+
+  claimMemoryBackendOutboxBatch(input: { providerId?: string; limit: number; now?: number; leaseMs?: number }): MemoryBackendOutboxClaim {
+    const now = input.now ?? Date.now();
+    const lease = Math.max(1_000, input.leaseMs ?? 60_000);
+    const limit = Math.max(1, Math.min(input.limit, 100));
+    const token = `mclaim_${randomUUID().replaceAll('-', '')}`;
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`UPDATE memory_backend_outbox SET status='failed',claim_token=NULL,claimed_at=NULL,last_error='claim_lease_expired',next_attempt_at=?,updated_at=?
+        WHERE status='inflight' AND claimed_at<?`).run(now, new Date(now).toISOString(), now - lease);
+      const rows = input.providerId
+        ? this.db.prepare(`SELECT outbox_id FROM memory_backend_outbox WHERE provider_id=? AND status IN ('pending','failed') AND next_attempt_at<=?
+            ORDER BY created_at,outbox_id LIMIT ?`).all(input.providerId, now, limit) as any[]
+        : this.db.prepare(`SELECT outbox_id FROM memory_backend_outbox WHERE status IN ('pending','failed') AND next_attempt_at<=?
+            ORDER BY created_at,outbox_id LIMIT ?`).all(now, limit) as any[];
+      const claim = this.db.prepare(`UPDATE memory_backend_outbox SET status='inflight',attempts=attempts+1,claimed_at=?,claim_token=?,updated_at=? WHERE outbox_id=?`);
+      for (const row of rows) claim.run(now, token, new Date(now).toISOString(), row.outbox_id);
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch {}
+      throw error;
+    }
+    const items = this.db.prepare(`SELECT outbox_id,memory_id,provider_id,operation,payload_json,payload_hash,attempts
+      FROM memory_backend_outbox WHERE claim_token=? ORDER BY created_at,outbox_id`).all(token) as any[];
+    return { claimToken: token, items: items.map(row => ({
+      outboxId: row.outbox_id, memoryId: row.memory_id, providerId: row.provider_id, operation: row.operation,
+      payload: JSON.parse(row.payload_json), payloadHash: row.payload_hash, attempts: row.attempts,
+    })) };
+  }
+
+  settleMemoryBackendOutboxItem(input: {
+    outboxId: string; claimToken: string; providerVersion: string; writeState: MemoryBackendBinding['writeState'];
+    contentHash: string; backendRef?: string; now?: number;
+  }): void {
+    const nowMs = input.now ?? Date.now(); const now = new Date(nowMs).toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const row = this.db.prepare(`SELECT memory_id,provider_id FROM memory_backend_outbox WHERE outbox_id=? AND claim_token=? AND status='inflight'`)
+        .get(input.outboxId, input.claimToken) as { memory_id: string; provider_id: string } | undefined;
+      if (!row) throw new Error('km_memory_backend_outbox_claim_lost');
+      this.db.prepare(`UPDATE memory_backend_outbox SET status='delivered',claim_token=NULL,claimed_at=NULL,last_error=NULL,updated_at=? WHERE outbox_id=?`)
+        .run(now, input.outboxId);
+      this.db.prepare(`INSERT INTO memory_backend_bindings(
+        memory_id,provider_id,provider_version,backend_ref,write_state,content_hash,last_verified_at,last_error,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(memory_id,provider_id) DO UPDATE SET
+        provider_version=excluded.provider_version,backend_ref=excluded.backend_ref,write_state=excluded.write_state,
+        content_hash=excluded.content_hash,last_verified_at=excluded.last_verified_at,last_error=NULL,updated_at=excluded.updated_at`)
+        .run(row.memory_id, row.provider_id, input.providerVersion, input.backendRef ?? null, input.writeState,
+          input.contentHash, input.writeState === 'active' || input.writeState === 'shadow' ? now : null, null, now);
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch {}
+      throw error;
+    }
+  }
+
+  failMemoryBackendOutboxItem(input: { outboxId: string; claimToken: string; error: string; retry: boolean; now?: number; maxAttempts?: number }): void {
+    const nowMs = input.now ?? Date.now(); const now = new Date(nowMs).toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const row = this.db.prepare(`SELECT memory_id,provider_id,attempts,payload_json FROM memory_backend_outbox WHERE outbox_id=? AND claim_token=? AND status='inflight'`)
+        .get(input.outboxId, input.claimToken) as { memory_id: string; provider_id: string; attempts: number; payload_json: string } | undefined;
+      if (!row) throw new Error('km_memory_backend_outbox_claim_lost');
+      const maxAttempts = Math.max(1, input.maxAttempts ?? 5);
+      const retry = input.retry && row.attempts < maxAttempts;
+      const status = retry ? 'failed' : 'quarantined';
+      const delay = Math.min(15 * 60_000, 1_000 * 2 ** Math.max(0, row.attempts - 1));
+      const message = input.error.slice(0, 500);
+      this.db.prepare(`UPDATE memory_backend_outbox SET status=?,claim_token=NULL,claimed_at=NULL,last_error=?,next_attempt_at=?,updated_at=? WHERE outbox_id=?`)
+        .run(status, message, retry ? nowMs + delay : Number.MAX_SAFE_INTEGER, now, input.outboxId);
+      let contentHash = sha256(row.payload_json);
+      try {
+        const payload = JSON.parse(row.payload_json) as { contentHash?: unknown };
+        if (typeof payload.contentHash === 'string' && payload.contentHash.trim()) contentHash = payload.contentHash;
+      } catch { /* keep payload hash fallback */ }
+      this.db.prepare(`INSERT INTO memory_backend_bindings(
+        memory_id,provider_id,provider_version,backend_ref,write_state,content_hash,last_verified_at,last_error,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(memory_id,provider_id) DO UPDATE SET
+        write_state='failed',last_error=excluded.last_error,updated_at=excluded.updated_at`)
+        .run(row.memory_id, row.provider_id, 'unknown', null, 'failed', contentHash, null, message, now);
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch {}
+      throw error;
+    }
+  }
+
+  listMemoryBackendOutbox(limit: number): MemoryBackendOutboxRow[] {
+    return (this.db.prepare(`SELECT * FROM memory_backend_outbox ORDER BY created_at DESC,outbox_id DESC LIMIT ?`)
+      .all(Math.max(1, Math.min(limit, 500))) as any[]).map(row => ({
+        outboxId: row.outbox_id, memoryId: row.memory_id, providerId: row.provider_id, operation: row.operation,
+        payload: JSON.parse(row.payload_json), payloadHash: row.payload_hash, status: row.status, attempts: row.attempts,
+        nextAttemptAt: row.next_attempt_at, ...(row.claimed_at ? { claimedAt: row.claimed_at } : {}),
+        ...(row.last_error ? { lastError: row.last_error } : {}), createdAt: row.created_at, updatedAt: row.updated_at,
+      }));
+  }
+
+  listMemoryForBackendMigration(input: { afterMemoryId?: string; limit: number }): MemoryItem[] {
+    const limit = Math.max(1, Math.min(input.limit, 500));
+    const rows = input.afterMemoryId
+      ? this.db.prepare(`SELECT * FROM memory_items WHERE memory_id>? AND state IN ('proposed','active','stale','conflicted','shadowed','expired')
+          ORDER BY memory_id ASC LIMIT ?`).all(input.afterMemoryId, limit) as any[]
+      : this.db.prepare(`SELECT * FROM memory_items WHERE state IN ('proposed','active','stale','conflicted','shadowed','expired')
+          ORDER BY memory_id ASC LIMIT ?`).all(limit) as any[];
+    return rows.map(row => this.memoryFromRow(row));
+  }
+
+  getMemoryBackendMigration(migrationId: string): MemoryBackendMigrationSnapshot | null {
+    const row = this.db.prepare(`SELECT * FROM memory_backend_migrations WHERE migration_id=?`).get(migrationId) as any;
+    return row ? this.memoryBackendMigrationFromRow(row) : null;
+  }
+
+  listMemoryBackendMigrations(limit: number): MemoryBackendMigrationSnapshot[] {
+    return (this.db.prepare(`SELECT * FROM memory_backend_migrations ORDER BY created_at DESC,migration_id DESC LIMIT ?`)
+      .all(Math.max(1, Math.min(limit, 500))) as any[]).map(row => this.memoryBackendMigrationFromRow(row));
+  }
+
+  compareMemoryBackendBindings(input: { fromProviderId: string; toProviderId: string; sampleLimit?: number }): MemoryBackendBindingCompareReport {
+    const rows = this.db.prepare(`SELECT f.memory_id,f.content_hash from_hash,t.content_hash to_hash,t.write_state to_state
+      FROM memory_backend_bindings f LEFT JOIN memory_backend_bindings t ON t.memory_id=f.memory_id AND t.provider_id=?
+      WHERE f.provider_id=? AND f.write_state IN ('active','shadow') ORDER BY f.memory_id ASC`).all(input.toProviderId, input.fromProviderId) as any[];
+    const samples: MemoryBackendBindingCompareReport['samples'] = [];
+    let matched = 0; let missing = 0; let mismatched = 0;
+    const sampleLimit = Math.max(0, Math.min(input.sampleLimit ?? 20, 100));
+    for (const row of rows) {
+      let reason: MemoryBackendBindingCompareReport['samples'][number]['reason'] | undefined;
+      if (!row.to_state) { missing += 1; reason = 'missing'; }
+      else if (row.to_state !== 'active' && row.to_state !== 'shadow') { mismatched += 1; reason = 'state_not_active'; }
+      else if (row.from_hash !== row.to_hash) { mismatched += 1; reason = 'content_hash_mismatch'; }
+      else matched += 1;
+      if (reason && samples.length < sampleLimit) samples.push({ memoryId: row.memory_id, reason,
+        ...(row.from_hash ? { fromContentHash: row.from_hash } : {}), ...(row.to_hash ? { toContentHash: row.to_hash } : {}),
+        ...(row.to_state ? { toState: row.to_state } : {}) });
+    }
+    return { fromProviderId: input.fromProviderId, toProviderId: input.toProviderId,
+      compared: rows.length, matched, missing, mismatched, samples };
   }
 
   createMemoryBackendMigration(input: { botAppId: string; fromProfile: Record<string, unknown>; toProfile: Record<string, unknown> }): string {
@@ -1165,7 +1324,7 @@ export class ObservationStore {
   transitionMemoryBackendMigration(input: { migrationId: string; toState: 'backfilling' | 'comparing' | 'ready' | 'cutover' | 'rolled_back' | 'failed'; checkpoint?: string; stats?: Record<string, unknown> }): void {
     const row = this.db.prepare('SELECT state FROM memory_backend_migrations WHERE migration_id=?').get(input.migrationId) as { state: string } | undefined;
     if (!row) throw new Error('km_memory_migration_not_found');
-    const allowed: Record<string, string[]> = { draft: ['backfilling','failed'], backfilling: ['comparing','failed'], comparing: ['ready','failed'], ready: ['cutover','failed'], cutover: ['rolled_back'], rolled_back: [], failed: ['backfilling'] };
+    const allowed: Record<string, string[]> = { draft: ['backfilling','failed'], backfilling: ['backfilling','comparing','failed'], comparing: ['ready','failed'], ready: ['cutover','failed'], cutover: ['rolled_back'], rolled_back: [], failed: ['backfilling'] };
     if (!allowed[row.state]?.includes(input.toState)) throw new Error(`km_memory_migration_invalid_transition:${row.state}:${input.toState}`);
     this.db.prepare(`UPDATE memory_backend_migrations SET state=?,checkpoint=?,stats_json=?,updated_at=? WHERE migration_id=?`)
       .run(input.toState, input.checkpoint ?? null, JSON.stringify(input.stats ?? {}), new Date().toISOString(), input.migrationId);
@@ -1760,6 +1919,20 @@ export class ObservationStore {
       sourceRefs: parseJsonArray(row.source_refs_json), ...(row.ttl_expires_at ? { ttlExpiresAt: row.ttl_expires_at } : {}),
       ...(row.review_after ? { reviewAfter: row.review_after } : {}), syncPolicy: row.sync_policy,
       privacyClass: row.privacy_class, createdAt: row.created_at, updatedAt: row.updated_at,
+    };
+  }
+
+  private memoryBackendMigrationFromRow(row: any): MemoryBackendMigrationSnapshot {
+    return {
+      migrationId: row.migration_id,
+      botAppId: row.bot_app_id,
+      fromProfile: JSON.parse(row.from_profile_json),
+      toProfile: JSON.parse(row.to_profile_json),
+      state: row.state,
+      ...(row.checkpoint ? { checkpoint: row.checkpoint } : {}),
+      stats: JSON.parse(row.stats_json),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   }
 
