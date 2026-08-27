@@ -3,6 +3,7 @@ import { lstatSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { canonicalJsonStringify } from '../../utils/canonical-json.js';
 import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema, KmProviderDescriptorSchema, type KmMemoryProviderConfig, type KmPipelineProfile, type KmProviderDescriptor } from './provider-spi.js';
 import {
   ObservationEventSchema,
@@ -208,6 +209,69 @@ const PHASE15_SCHEMA = `
     report_hash TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS km_retention_reports_completed ON km_retention_reports(completed_at DESC,report_id DESC);
+  CREATE TABLE IF NOT EXISTS km_golden_cases (
+    case_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision>=1),
+    state TEXT NOT NULL CHECK(state IN ('reviewed','retired')),
+    title TEXT NOT NULL,
+    query_hash TEXT NOT NULL,
+    query_redacted TEXT NOT NULL,
+    expected_claims_json TEXT NOT NULL CHECK(json_valid(expected_claims_json)),
+    source_refs_json TEXT NOT NULL CHECK(json_valid(source_refs_json)),
+    provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json)),
+    privacy_class TEXT NOT NULL CHECK(privacy_class IN ('public-to-team','internal')),
+    content_hash TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    reviewed_by TEXT NOT NULL,
+    retired_by TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    retired_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(case_id,revision),
+    UNIQUE(content_hash)
+  );
+  CREATE INDEX IF NOT EXISTS km_golden_cases_state_updated ON km_golden_cases(state,updated_at DESC,case_id,revision);
+  CREATE TABLE IF NOT EXISTS km_shadow_comparisons (
+    comparison_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    rules_snapshot_hash TEXT NOT NULL,
+    pi_snapshot_hash TEXT NOT NULL,
+    rules_claims_json TEXT NOT NULL CHECK(json_valid(rules_claims_json)),
+    pi_claims_json TEXT NOT NULL CHECK(json_valid(pi_claims_json)),
+    metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+    latency_json TEXT NOT NULL CHECK(json_valid(latency_json)),
+    cost_json TEXT NOT NULL CHECK(json_valid(cost_json)),
+    created_at TEXT NOT NULL,
+    UNIQUE(case_id,revision,rules_snapshot_hash,pi_snapshot_hash),
+    FOREIGN KEY(case_id,revision) REFERENCES km_golden_cases(case_id,revision) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS km_shadow_comparisons_case_created ON km_shadow_comparisons(case_id,revision,created_at DESC);
+  CREATE TABLE IF NOT EXISTS km_shadow_review_labels (
+    label_id TEXT PRIMARY KEY,
+    comparison_id TEXT NOT NULL REFERENCES km_shadow_comparisons(comparison_id) ON DELETE CASCADE,
+    case_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    claim_key TEXT NOT NULL,
+    extractor TEXT NOT NULL CHECK(extractor IN ('rules','pi')),
+    label TEXT NOT NULL CHECK(label IN ('true_positive','false_positive','false_negative','true_negative','needs_review')),
+    actor_id TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(comparison_id,claim_key,extractor,label,actor_id)
+  );
+  CREATE INDEX IF NOT EXISTS km_shadow_review_labels_case ON km_shadow_review_labels(case_id,revision,created_at DESC);
+  CREATE TABLE IF NOT EXISTS km_shadow_readiness_reports (
+    report_id TEXT PRIMARY KEY,
+    window_hash TEXT NOT NULL UNIQUE,
+    thresholds_json TEXT NOT NULL CHECK(json_valid(thresholds_json)),
+    metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+    ready INTEGER NOT NULL CHECK(ready IN (0,1)),
+    reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json)),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_shadow_readiness_reports_created ON km_shadow_readiness_reports(created_at DESC,report_id DESC);
 `;
 
 const PHASE11_SCHEMA = `
@@ -641,6 +705,89 @@ export interface KmEvalMetricWindow {
   windowHash: string;
 }
 
+export type KmGoldenCaseState = 'reviewed' | 'retired';
+export type KmShadowExtractor = 'rules' | 'pi';
+export type KmShadowReviewLabel = 'true_positive' | 'false_positive' | 'false_negative' | 'true_negative' | 'needs_review';
+export interface KmGoldenExpectedClaim {
+  claimKey: string;
+  claimTextHash: string;
+  category?: string;
+}
+export interface KmGoldenCase {
+  caseId: string;
+  revision: number;
+  state: KmGoldenCaseState;
+  title: string;
+  queryHash: string;
+  queryRedacted: string;
+  expectedClaims: KmGoldenExpectedClaim[];
+  sourceRefs: unknown[];
+  provenance: Record<string, unknown>;
+  privacyClass: 'public-to-team' | 'internal';
+  contentHash: string;
+  createdBy: string;
+  reviewedBy: string;
+  retiredBy?: string;
+  createdAt: string;
+  reviewedAt: string;
+  retiredAt?: string;
+  updatedAt: string;
+}
+export interface KmGoldenCaseInput {
+  caseId?: string;
+  title: string;
+  queryRedacted: string;
+  expectedClaims: KmGoldenExpectedClaim[];
+  sourceRefs: unknown[];
+  provenance: Record<string, unknown>;
+  privacyClass?: 'public-to-team' | 'internal';
+  actorId: string;
+}
+export interface KmShadowComparisonMetrics {
+  expectedCount: number;
+  rulesClaimCount: number;
+  piClaimCount: number;
+  claimOverlap: number;
+  rulesUnique: number;
+  piUnique: number;
+  routingDisagreement: number;
+  evidenceCoverage: number;
+  privacyBlocks: number;
+  schemaFailures: number;
+  falsePositiveLabels: number;
+  falseNegativeLabels: number;
+}
+export interface KmShadowComparisonInput {
+  caseId: string;
+  revision?: number;
+  rulesClaims: Array<{ claimKey: string; route?: string; evidenceRefs?: unknown[]; privacyBlocked?: boolean; schemaFailure?: boolean }>;
+  piClaims: Array<{ claimKey: string; route?: string; evidenceRefs?: unknown[]; privacyBlocked?: boolean; schemaFailure?: boolean }>;
+  latency?: Record<string, unknown>;
+  cost?: Record<string, unknown>;
+}
+export interface KmShadowComparison {
+  comparisonId: string;
+  caseId: string;
+  revision: number;
+  rulesSnapshotHash: string;
+  piSnapshotHash: string;
+  rulesClaims: KmShadowComparisonInput['rulesClaims'];
+  piClaims: KmShadowComparisonInput['piClaims'];
+  metrics: KmShadowComparisonMetrics;
+  latency: Record<string, unknown>;
+  cost: Record<string, unknown>;
+  createdAt: string;
+}
+export interface KmShadowReadinessReport {
+  reportId: string;
+  windowHash: string;
+  thresholds: Record<string, number>;
+  metrics: Record<string, number>;
+  ready: boolean;
+  reasonCodes: string[];
+  createdAt: string;
+}
+
 export interface KnowledgeExportDryRun {
   knowledgeId: string;
   targetLayer: KnowledgeLayer;
@@ -674,7 +821,7 @@ function quarantineId(): string {
   return `q_${randomUUID().replaceAll('-', '')}`;
 }
 
-function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval'): string {
+function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready'): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
@@ -827,6 +974,47 @@ function retentionSpec(domain: KmRetentionDomain): RetentionDomainSpec {
           all_quarantine_evidence: '1=1',
         },
       };
+  }
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  const parsed = JSON.parse(value);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+}
+
+function assertNoRawText(value: unknown, field: string): void {
+  if (typeof value === 'string') {
+    if (/<raw_transcript>|<\/raw_transcript>/iu.test(value)) throw new Error(`km_${field}_raw_transcript_forbidden`);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) assertNoRawText(item, field);
+    return;
+  }
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (/^(raw|text|transcript|rawTranscript|content)$/u.test(key)) throw new Error(`km_${field}_raw_text_field_forbidden`);
+    assertNoRawText(child, field);
+  }
+}
+
+function isReviewedRedactedProvenance(value: Record<string, unknown>): boolean {
+  const reviewed = value.explicitlyReviewed === true || value.reviewed === true;
+  const redactionStatus = typeof value.redactionStatus === 'string' ? value.redactionStatus : '';
+  const redacted = value.redacted === true || redactionStatus === 'redacted' || redactionStatus === 'not_needed';
+  return reviewed && redacted;
+}
+
+function assertReviewedDistillationSourceRefs(sourceRefs: unknown[]): void {
+  for (const ref of sourceRefs) {
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) throw new Error('km_golden_source_ref_invalid');
+    const record = ref as Record<string, unknown>;
+    const kind = typeof record.kind === 'string' ? record.kind : '';
+    const sourceRef = typeof record.ref === 'string' ? record.ref.trim() : '';
+    if (kind !== 'distillation-example' && kind !== 'reviewed-distillation-example') {
+      throw new Error('km_golden_source_ref_not_reviewed_distillation_example');
+    }
+    if (!sourceRef) throw new Error('km_golden_source_ref_required');
   }
 }
 
@@ -987,6 +1175,17 @@ const BUILTIN_KM_PROVIDER_DESCRIPTORS: readonly KmProviderDescriptor[] = [
     deterministic: true,
     supportsShadow: true,
     maxBatchSize: 25,
+  },
+  {
+    id: 'km-shadow-quality-v1',
+    kind: 'evaluator',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['golden-set-governance', 'rules-pi-shadow-comparison', 'readiness-report', 'local-only', 'no-external-execution'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 100,
   },
 ];
 
@@ -1636,6 +1835,211 @@ export class ObservationStore {
       input.effectiveMode ?? input.mode, input.disposition, JSON.stringify(input.itemIds), prompt ? sha256(prompt) : null,
       Buffer.byteLength(prompt), input.reason ?? null, new Date().toISOString());
     return id;
+  }
+
+  upsertGoldenCase(input: KmGoldenCaseInput): { item: KmGoldenCase; created: boolean } {
+    const actorId = requireText(input.actorId, 'golden_actor');
+    const title = requireText(input.title, 'golden_title');
+    const queryRedacted = requireText(input.queryRedacted, 'golden_query_redacted');
+    if (/<raw_transcript>|<\/raw_transcript>/iu.test(queryRedacted)) throw new Error('km_golden_raw_transcript_forbidden');
+    if (input.expectedClaims.length === 0) throw new Error('km_golden_expected_claims_required');
+    if (input.sourceRefs.length === 0) throw new Error('km_golden_source_refs_required');
+    assertNoRawText(input.sourceRefs, 'golden_source_refs');
+    assertReviewedDistillationSourceRefs(input.sourceRefs);
+    assertNoRawText(input.provenance, 'golden_provenance');
+    if (!isReviewedRedactedProvenance(input.provenance)) throw new Error('km_golden_requires_reviewed_redacted_provenance');
+    const normalizedClaims = input.expectedClaims.map(claim => ({
+      claimKey: requireText(claim.claimKey, 'golden_claim_key'),
+      claimTextHash: requireText(claim.claimTextHash, 'golden_claim_hash'),
+      ...(claim.category?.trim() ? { category: claim.category.trim() } : {}),
+    })).sort((a, b) => a.claimKey.localeCompare(b.claimKey));
+    if (normalizedClaims.some(claim => !/^sha256:[a-f0-9]{64}$/u.test(claim.claimTextHash))) throw new Error('km_golden_claim_hash_invalid');
+    const queryHash = sha256(queryRedacted);
+    const caseId = input.caseId?.trim() || `gold_${createHash('sha256').update(`${title}|${queryHash}`).digest('hex').slice(0, 32)}`;
+    const provenance = { ...input.provenance, reviewedOnly: true, redacted: true };
+    const canonicalContent = canonicalJsonStringify({
+      caseId, title, queryHash, queryRedacted, expectedClaims: normalizedClaims,
+      sourceRefs: input.sourceRefs, provenance, privacyClass: input.privacyClass ?? 'internal',
+    });
+    const contentHash = sha256(canonicalContent);
+    const existing = this.db.prepare('SELECT * FROM km_golden_cases WHERE content_hash=?').get(contentHash) as any;
+    if (existing) return { item: this.goldenCaseFromRow(existing), created: false };
+    const latest = this.db.prepare('SELECT MAX(revision) revision FROM km_golden_cases WHERE case_id=?').get(caseId) as { revision: number | null } | undefined;
+    const revision = Number(latest?.revision ?? 0) + 1;
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_golden_upsert;');
+    try {
+      this.db.prepare(`INSERT INTO km_golden_cases(
+        case_id,revision,state,title,query_hash,query_redacted,expected_claims_json,source_refs_json,provenance_json,
+        privacy_class,content_hash,created_by,reviewed_by,created_at,reviewed_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(caseId, revision, 'reviewed', title, queryHash, queryRedacted,
+        JSON.stringify(normalizedClaims), JSON.stringify(input.sourceRefs), JSON.stringify(provenance),
+        input.privacyClass ?? 'internal', contentHash, actorId, actorId, now, now, now);
+      this.db.prepare(`INSERT INTO km_config_audit(audit_id,actor_id,action,target_ref,before_hash,after_hash,request_hash,idempotency_key,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(`kma_${randomUUID().replaceAll('-', '')}`, actorId, 'golden.created', `${caseId}@${revision}`,
+        null, contentHash, sha256(canonicalContent), `golden:${contentHash}`, now);
+      this.db.exec('RELEASE km_golden_upsert;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_golden_upsert; RELEASE km_golden_upsert;'); } catch {} throw error; }
+    return { item: this.getGoldenCase(caseId, revision)!, created: true };
+  }
+
+  getGoldenCase(caseId: string, revision?: number): KmGoldenCase | null {
+    const row = revision
+      ? this.db.prepare('SELECT * FROM km_golden_cases WHERE case_id=? AND revision=?').get(caseId, revision) as any
+      : this.db.prepare('SELECT * FROM km_golden_cases WHERE case_id=? ORDER BY revision DESC LIMIT 1').get(caseId) as any;
+    return row ? this.goldenCaseFromRow(row) : null;
+  }
+
+  listGoldenCases(input: { limit: number; state?: KmGoldenCaseState } = { limit: 50 }): KmGoldenCase[] {
+    const limit = Math.max(1, Math.min(input.limit, 500));
+    const rows = input.state
+      ? this.db.prepare('SELECT * FROM km_golden_cases WHERE state=? ORDER BY updated_at DESC,case_id DESC,revision DESC LIMIT ?').all(input.state, limit) as any[]
+      : this.db.prepare('SELECT * FROM km_golden_cases ORDER BY updated_at DESC,case_id DESC,revision DESC LIMIT ?').all(limit) as any[];
+    return rows.map(row => this.goldenCaseFromRow(row));
+  }
+
+  retireGoldenCase(input: { caseId: string; revision?: number; actorId: string; reasonCode: string }): KmGoldenCase {
+    const current = this.getGoldenCase(input.caseId, input.revision);
+    if (!current) throw new Error('km_golden_case_not_found');
+    if (current.state === 'retired') return current;
+    const actorId = requireText(input.actorId, 'golden_actor');
+    requireText(input.reasonCode, 'golden_reason');
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_golden_retire;');
+    try {
+      this.db.prepare('UPDATE km_golden_cases SET state=?,retired_by=?,retired_at=?,updated_at=? WHERE case_id=? AND revision=?')
+        .run('retired', actorId, now, now, current.caseId, current.revision);
+      this.db.prepare(`INSERT INTO km_config_audit(audit_id,actor_id,action,target_ref,before_hash,after_hash,request_hash,idempotency_key,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(`kma_${randomUUID().replaceAll('-', '')}`, actorId, 'golden.retired', `${current.caseId}@${current.revision}`,
+        current.contentHash, null, sha256(JSON.stringify({ reasonCode: input.reasonCode })), `golden-retire:${current.caseId}:${current.revision}`, now);
+      this.db.exec('RELEASE km_golden_retire;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_golden_retire; RELEASE km_golden_retire;'); } catch {} throw error; }
+    return this.getGoldenCase(current.caseId, current.revision)!;
+  }
+
+  recordShadowComparison(input: KmShadowComparisonInput): { item: KmShadowComparison; created: boolean } {
+    const golden = this.getGoldenCase(input.caseId, input.revision);
+    if (!golden) throw new Error('km_golden_case_not_found');
+    if (golden.state !== 'reviewed') throw new Error('km_golden_case_not_reviewed');
+    const normalizeClaims = (claims: KmShadowComparisonInput['rulesClaims']) => claims.map(claim => ({
+      claimKey: requireText(claim.claimKey, 'shadow_claim_key'),
+      ...(claim.route?.trim() ? { route: claim.route.trim() } : {}),
+      ...(claim.evidenceRefs ? { evidenceRefs: claim.evidenceRefs } : {}),
+      ...(claim.privacyBlocked ? { privacyBlocked: true } : {}),
+      ...(claim.schemaFailure ? { schemaFailure: true } : {}),
+    })).sort((a, b) => a.claimKey.localeCompare(b.claimKey));
+    const rulesClaims = normalizeClaims(input.rulesClaims);
+    const piClaims = normalizeClaims(input.piClaims);
+    assertNoRawText(rulesClaims, 'shadow_rules_claims');
+    assertNoRawText(piClaims, 'shadow_pi_claims');
+    assertNoRawText(input.latency ?? {}, 'shadow_latency');
+    assertNoRawText(input.cost ?? {}, 'shadow_cost');
+    const rulesSnapshotHash = sha256(canonicalJsonStringify(rulesClaims));
+    const piSnapshotHash = sha256(canonicalJsonStringify(piClaims));
+    const metrics = this.computeShadowComparisonMetrics(golden, rulesClaims, piClaims, undefined);
+    const comparisonId = `cmp_${createHash('sha256').update(`${golden.caseId}|${golden.revision}|${rulesSnapshotHash}|${piSnapshotHash}`).digest('hex')}`;
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`INSERT OR IGNORE INTO km_shadow_comparisons(
+      comparison_id,case_id,revision,rules_snapshot_hash,pi_snapshot_hash,rules_claims_json,pi_claims_json,metrics_json,latency_json,cost_json,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(comparisonId, golden.caseId, golden.revision, rulesSnapshotHash, piSnapshotHash,
+      JSON.stringify(rulesClaims), JSON.stringify(piClaims), JSON.stringify(metrics), JSON.stringify(input.latency ?? {}), JSON.stringify(input.cost ?? {}), now);
+    return { item: this.getShadowComparison(comparisonId)!, created: Number(result.changes) === 1 };
+  }
+
+  getShadowComparison(comparisonId: string): KmShadowComparison | null {
+    const row = this.db.prepare('SELECT * FROM km_shadow_comparisons WHERE comparison_id=?').get(comparisonId) as any;
+    return row ? this.shadowComparisonFromRow(row) : null;
+  }
+
+  listShadowComparisons(input: { limit: number; caseId?: string } = { limit: 50 }): KmShadowComparison[] {
+    const limit = Math.max(1, Math.min(input.limit, 500));
+    const rows = input.caseId
+      ? this.db.prepare('SELECT * FROM km_shadow_comparisons WHERE case_id=? ORDER BY created_at DESC,comparison_id DESC LIMIT ?').all(input.caseId, limit) as any[]
+      : this.db.prepare('SELECT * FROM km_shadow_comparisons ORDER BY created_at DESC,comparison_id DESC LIMIT ?').all(limit) as any[];
+    return rows.map(row => this.shadowComparisonFromRow(row));
+  }
+
+  addShadowReviewLabel(input: {
+    comparisonId: string; claimKey: string; extractor: KmShadowExtractor; label: KmShadowReviewLabel; actorId: string; reasonCode: string;
+  }): { labelId: string; created: boolean } {
+    const comparison = this.getShadowComparison(input.comparisonId);
+    if (!comparison) throw new Error('km_shadow_comparison_not_found');
+    const claimKey = requireText(input.claimKey, 'shadow_label_claim_key');
+    const actorId = requireText(input.actorId, 'shadow_label_actor');
+    const reasonCode = requireText(input.reasonCode, 'shadow_label_reason');
+    if (!['rules','pi'].includes(input.extractor)) throw new Error('km_shadow_label_extractor_invalid');
+    if (!['true_positive','false_positive','false_negative','true_negative','needs_review'].includes(input.label)) throw new Error('km_shadow_label_invalid');
+    const labelId = `label_${createHash('sha256').update(`${comparison.comparisonId}|${claimKey}|${input.extractor}|${input.label}|${actorId}`).digest('hex')}`;
+    const result = this.db.prepare(`INSERT OR IGNORE INTO km_shadow_review_labels(
+      label_id,comparison_id,case_id,revision,claim_key,extractor,label,actor_id,reason_code,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(labelId, comparison.comparisonId, comparison.caseId, comparison.revision, claimKey,
+      input.extractor, input.label, actorId, reasonCode, new Date().toISOString());
+    this.refreshComparisonMetrics(comparison.comparisonId);
+    return { labelId, created: Number(result.changes) === 1 };
+  }
+
+  listShadowReviewLabels(limit: number): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT * FROM km_shadow_review_labels ORDER BY created_at DESC,label_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 500))) as any[])
+      .map(row => ({ labelId: row.label_id, comparisonId: row.comparison_id, caseId: row.case_id, revision: Number(row.revision),
+        claimKey: row.claim_key, extractor: row.extractor, label: row.label, actorId: row.actor_id,
+        reasonCode: row.reason_code, createdAt: row.created_at }));
+  }
+
+  shadowReadinessReport(input: { thresholds?: Record<string, number> } = {}): KmShadowReadinessReport {
+    const thresholds = {
+      minReviewedCases: input.thresholds?.minReviewedCases ?? 1,
+      minComparisons: input.thresholds?.minComparisons ?? 1,
+      maxSchemaFailures: input.thresholds?.maxSchemaFailures ?? 0,
+      maxPrivacyBlocks: input.thresholds?.maxPrivacyBlocks ?? 0,
+      maxRoutingDisagreementRate: input.thresholds?.maxRoutingDisagreementRate ?? 0.2,
+      minEvidenceCoverage: input.thresholds?.minEvidenceCoverage ?? 0.8,
+      maxFalsePositiveLabels: input.thresholds?.maxFalsePositiveLabels ?? 0,
+      maxFalseNegativeLabels: input.thresholds?.maxFalseNegativeLabels ?? 0,
+    };
+    const goldenRow = this.db.prepare("SELECT COUNT(*) reviewed_cases FROM km_golden_cases WHERE state='reviewed'").get() as any;
+    const comparisonRow = this.db.prepare('SELECT COUNT(*) comparisons FROM km_shadow_comparisons').get() as any;
+    const rows = this.db.prepare('SELECT metrics_json FROM km_shadow_comparisons').all() as any[];
+    const aggregate: Record<string, number> = { reviewedCases: Number(goldenRow.reviewed_cases ?? 0), comparisons: Number(comparisonRow.comparisons ?? 0),
+      claimOverlap: 0, rulesUnique: 0, piUnique: 0, routingDisagreement: 0, privacyBlocks: 0, schemaFailures: 0,
+      falsePositiveLabels: 0, falseNegativeLabels: 0, avgEvidenceCoverage: 0 };
+    let coverageTotal = 0;
+    for (const row of rows) {
+      const metrics = JSON.parse(row.metrics_json) as KmShadowComparisonMetrics;
+      aggregate.claimOverlap += metrics.claimOverlap;
+      aggregate.rulesUnique += metrics.rulesUnique;
+      aggregate.piUnique += metrics.piUnique;
+      aggregate.routingDisagreement += metrics.routingDisagreement;
+      aggregate.privacyBlocks += metrics.privacyBlocks;
+      aggregate.schemaFailures += metrics.schemaFailures;
+      aggregate.falsePositiveLabels += metrics.falsePositiveLabels;
+      aggregate.falseNegativeLabels += metrics.falseNegativeLabels;
+      coverageTotal += metrics.evidenceCoverage;
+    }
+    aggregate.avgEvidenceCoverage = rows.length ? Number((coverageTotal / rows.length).toFixed(4)) : 0;
+    const denominator = Math.max(1, aggregate.claimOverlap + aggregate.rulesUnique + aggregate.piUnique);
+    aggregate.routingDisagreementRate = Number((aggregate.routingDisagreement / denominator).toFixed(4));
+    const reasonCodes: string[] = [];
+    if (aggregate.reviewedCases < thresholds.minReviewedCases) reasonCodes.push('insufficient_reviewed_golden_cases');
+    if (aggregate.comparisons < thresholds.minComparisons) reasonCodes.push('insufficient_shadow_comparisons');
+    if (aggregate.schemaFailures > thresholds.maxSchemaFailures) reasonCodes.push('schema_failures_above_threshold');
+    if (aggregate.privacyBlocks > thresholds.maxPrivacyBlocks) reasonCodes.push('privacy_blocks_above_threshold');
+    if (aggregate.routingDisagreementRate > thresholds.maxRoutingDisagreementRate) reasonCodes.push('routing_disagreement_above_threshold');
+    if (aggregate.avgEvidenceCoverage < thresholds.minEvidenceCoverage) reasonCodes.push('evidence_coverage_below_threshold');
+    if (aggregate.falsePositiveLabels > thresholds.maxFalsePositiveLabels) reasonCodes.push('false_positive_labels_above_threshold');
+    if (aggregate.falseNegativeLabels > thresholds.maxFalseNegativeLabels) reasonCodes.push('false_negative_labels_above_threshold');
+    const windowHash = sha256(canonicalJsonStringify({ thresholds, aggregate }));
+    const existing = this.db.prepare('SELECT * FROM km_shadow_readiness_reports WHERE window_hash=?').get(windowHash) as any;
+    if (existing) return this.shadowReadinessFromRow(existing);
+    const reportId = kmId('ready'); const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO km_shadow_readiness_reports(report_id,window_hash,thresholds_json,metrics_json,ready,reason_codes_json,created_at)
+      VALUES(?,?,?,?,?,?,?)`).run(reportId, windowHash, JSON.stringify(thresholds), JSON.stringify(aggregate), reasonCodes.length === 0 ? 1 : 0,
+      JSON.stringify(reasonCodes), now);
+    return this.shadowReadinessReportLatest()!;
+  }
+
+  shadowReadinessReportLatest(): KmShadowReadinessReport | null {
+    const row = this.db.prepare('SELECT * FROM km_shadow_readiness_reports ORDER BY created_at DESC,report_id DESC LIMIT 1').get() as any;
+    return row ? this.shadowReadinessFromRow(row) : null;
   }
 
   listPendingEvalTargets(input: { limit: number }): KmEvalTarget[] {
@@ -2698,6 +3102,108 @@ export class ObservationStore {
     };
   }
 
+  private goldenCaseFromRow(row: any): KmGoldenCase {
+    return {
+      caseId: row.case_id,
+      revision: Number(row.revision),
+      state: row.state,
+      title: row.title,
+      queryHash: row.query_hash,
+      queryRedacted: row.query_redacted,
+      expectedClaims: parseJsonArray(row.expected_claims_json) as KmGoldenExpectedClaim[],
+      sourceRefs: parseJsonArray(row.source_refs_json),
+      provenance: parseJsonRecord(row.provenance_json),
+      privacyClass: row.privacy_class,
+      contentHash: row.content_hash,
+      createdBy: row.created_by,
+      reviewedBy: row.reviewed_by,
+      ...(row.retired_by ? { retiredBy: row.retired_by } : {}),
+      createdAt: row.created_at,
+      reviewedAt: row.reviewed_at,
+      ...(row.retired_at ? { retiredAt: row.retired_at } : {}),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private shadowComparisonFromRow(row: any): KmShadowComparison {
+    return {
+      comparisonId: row.comparison_id,
+      caseId: row.case_id,
+      revision: Number(row.revision),
+      rulesSnapshotHash: row.rules_snapshot_hash,
+      piSnapshotHash: row.pi_snapshot_hash,
+      rulesClaims: parseJsonArray(row.rules_claims_json) as KmShadowComparison['rulesClaims'],
+      piClaims: parseJsonArray(row.pi_claims_json) as KmShadowComparison['piClaims'],
+      metrics: parseJsonRecord(row.metrics_json) as unknown as KmShadowComparisonMetrics,
+      latency: parseJsonRecord(row.latency_json),
+      cost: parseJsonRecord(row.cost_json),
+      createdAt: row.created_at,
+    };
+  }
+
+  private shadowReadinessFromRow(row: any): KmShadowReadinessReport {
+    return {
+      reportId: row.report_id,
+      windowHash: row.window_hash,
+      thresholds: parseJsonRecord(row.thresholds_json) as Record<string, number>,
+      metrics: parseJsonRecord(row.metrics_json) as Record<string, number>,
+      ready: Boolean(row.ready),
+      reasonCodes: parseJsonArray(row.reason_codes_json).map(String),
+      createdAt: row.created_at,
+    };
+  }
+
+  private computeShadowComparisonMetrics(
+    golden: KmGoldenCase,
+    rulesClaims: KmShadowComparison['rulesClaims'],
+    piClaims: KmShadowComparison['piClaims'],
+    labelCounts?: { falsePositiveLabels: number; falseNegativeLabels: number },
+  ): KmShadowComparisonMetrics {
+    const rulesKeys = new Set(rulesClaims.map(claim => claim.claimKey));
+    const piKeys = new Set(piClaims.map(claim => claim.claimKey));
+    const overlap = [...rulesKeys].filter(key => piKeys.has(key)).length;
+    const routeByKey = (claims: KmShadowComparison['rulesClaims']) => new Map(claims.map(claim => [claim.claimKey, claim.route ?? '']));
+    const rulesRoutes = routeByKey(rulesClaims);
+    const piRoutes = routeByKey(piClaims);
+    let routingDisagreement = 0;
+    for (const key of rulesKeys) {
+      if (piKeys.has(key) && rulesRoutes.get(key) !== piRoutes.get(key)) routingDisagreement += 1;
+    }
+    const allClaims = [...rulesClaims, ...piClaims];
+    const claimsWithEvidence = allClaims.filter(claim => Array.isArray(claim.evidenceRefs) && claim.evidenceRefs.length > 0).length;
+    return {
+      expectedCount: golden.expectedClaims.length,
+      rulesClaimCount: rulesKeys.size,
+      piClaimCount: piKeys.size,
+      claimOverlap: overlap,
+      rulesUnique: [...rulesKeys].filter(key => !piKeys.has(key)).length,
+      piUnique: [...piKeys].filter(key => !rulesKeys.has(key)).length,
+      routingDisagreement,
+      evidenceCoverage: allClaims.length === 0 ? 0 : Number((claimsWithEvidence / allClaims.length).toFixed(4)),
+      privacyBlocks: allClaims.filter(claim => claim.privacyBlocked).length,
+      schemaFailures: allClaims.filter(claim => claim.schemaFailure).length,
+      falsePositiveLabels: labelCounts?.falsePositiveLabels ?? 0,
+      falseNegativeLabels: labelCounts?.falseNegativeLabels ?? 0,
+    };
+  }
+
+  private refreshComparisonMetrics(comparisonId: string): void {
+    const comparison = this.getShadowComparison(comparisonId);
+    if (!comparison) return;
+    const golden = this.getGoldenCase(comparison.caseId, comparison.revision);
+    if (!golden) return;
+    const labelRow = this.db.prepare(`SELECT
+      SUM(CASE WHEN label='false_positive' THEN 1 ELSE 0 END) false_positive,
+      SUM(CASE WHEN label='false_negative' THEN 1 ELSE 0 END) false_negative
+      FROM km_shadow_review_labels WHERE comparison_id=?`).get(comparisonId) as any;
+    const metrics = this.computeShadowComparisonMetrics(golden, comparison.rulesClaims, comparison.piClaims, {
+      falsePositiveLabels: Number(labelRow.false_positive ?? 0),
+      falseNegativeLabels: Number(labelRow.false_negative ?? 0),
+    });
+    this.db.prepare('UPDATE km_shadow_comparisons SET metrics_json=? WHERE comparison_id=?')
+      .run(JSON.stringify(metrics), comparisonId);
+  }
+
   private createFreshSchema(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -2929,6 +3435,10 @@ export class ObservationStore {
       'km_memory_policy_decisions',
       'km_runtime_leases',
       'km_retention_reports',
+      'km_golden_cases',
+      'km_shadow_comparisons',
+      'km_shadow_review_labels',
+      'km_shadow_readiness_reports',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

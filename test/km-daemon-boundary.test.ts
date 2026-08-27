@@ -19,6 +19,16 @@ describe('KM live prompt-memory daemon boundary', () => {
     expect(daemonSource).toContain('clearInterval(kmBackendWorkerTimer)');
   });
 
+  it('starts shadow quality only behind explicit observation and shadow-quality gates', () => {
+    expect(daemonSource).toContain('runKmShadowQualityOnce');
+    expect(daemonSource.match(/runKmShadowQualityOnce\(/g)).toHaveLength(1);
+    const gate = 'if (kmShadowQualityRunning || !isKmObservationEnabled() || !isKmShadowQualityEnabled()) return;';
+    expect(daemonSource).toContain(gate);
+    expect(daemonSource).not.toContain('BOTMUX_KM_PI_SHADOW_ENABLED =');
+    expect(daemonSource).not.toContain('BOTMUX_KM_AUTO_EVAL_ENABLED =');
+    expect(daemonSource).not.toContain('BOTMUX_KM_AUTO_EVOLUTION_ENABLED =');
+  });
+
   it('composes before ordinary prompt builders and after command early returns', () => {
     const helper = daemonSource.indexOf('const composePromptMemoryAtBoundary');
     const call = daemonSource.indexOf('await composePromptMemoryAtBoundary(ds)');

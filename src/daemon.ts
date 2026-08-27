@@ -90,6 +90,7 @@ import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDist
 import { isKmBackendWorkerEnabled, kmBackendWorkerIntervalMs, kmBackendWorkerStartupDelayMs, runKmBackendWorkerOnce } from './services/km/memory-backend-runtime.js';
 import { isKmRetentionShadowEnabled, kmRetentionShadowIntervalMs, kmRetentionShadowStartupDelayMs, runKmRetentionShadowOnce } from './services/km/retention-runtime.js';
 import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-evolution-runtime.js';
+import { isKmShadowQualityEnabled, runKmShadowQualityOnce } from './services/km/shadow-quality-runtime.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -22122,6 +22123,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   kmRetentionShadowStartupTimer.unref?.();
   const kmRetentionShadowTimer = setInterval(runKmRetentionShadow, kmRetentionShadowIntervalMs());
   kmRetentionShadowTimer.unref?.();
+  let kmShadowQualityRunning = false;
+  const runKmShadowQualityWorker = () => {
+    if (kmShadowQualityRunning || !isKmObservationEnabled() || !isKmShadowQualityEnabled()) return;
+    kmShadowQualityRunning = true;
+    void runKmShadowQualityOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.createdComparisons > 0) {
+          logger.info(`[km-shadow-quality] scanned=${result.scannedCases} comparisons=${result.createdComparisons} ready=${result.readinessReady}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-shadow-quality] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmShadowQualityRunning = false; });
+  };
+  const kmShadowQualityStartupTimer = setTimeout(runKmShadowQualityWorker, 8_000 + idx * 750);
+  kmShadowQualityStartupTimer.unref?.();
+  const kmShadowQualityTimer = setInterval(runKmShadowQualityWorker, 60_000);
+  kmShadowQualityTimer.unref?.();
 
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
@@ -22994,6 +23012,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(kmRetentionShadowTimer);
     if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
     clearInterval(kmEvalEvolutionTimer);
+    if (kmShadowQualityStartupTimer) clearTimeout(kmShadowQualityStartupTimer);
+    clearInterval(kmShadowQualityTimer);
     clearInterval(docCommentPollTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
@@ -23232,6 +23252,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(kmRetentionShadowTimer);
     if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
     clearInterval(kmEvalEvolutionTimer);
+    if (kmShadowQualityStartupTimer) clearTimeout(kmShadowQualityStartupTimer);
+    clearInterval(kmShadowQualityTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
