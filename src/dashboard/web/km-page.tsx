@@ -20,6 +20,10 @@ type KnowledgeExportJob = {
   manifest?: { contentHash: string; stagedFile?: string };
 };
 type MemoryItem = { memoryId: string; state: string; scope: string; subject: string; claimKey: string; confidence: string };
+type ImportJob = {
+  jobId: string; state: string; sourceCount: number; eligibleCount: number; importedCount: number; dedupedCount: number;
+  conflictCount: number; skippedCount: number; failedCount: number; outboxEnqueuedCount: number; configHash: string; updatedAt: string;
+};
 type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; targetId: string; passCount: number; warnCount: number; failCount: number };
 type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
 type TraceEdge = { edgeId: string; fromType: string; fromId: string; toType: string; toId: string; edgeType: string };
@@ -143,6 +147,7 @@ function KmPage(): React.JSX.Element {
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
   const [exportJobs, setExportJobs] = useState<KnowledgeExportJob[]>([]);
   const [memory, setMemory] = useState<MemoryItem[]>([]);
+  const [importJobs, setImportJobs] = useState<ImportJob[]>([]);
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
   const [proposals, setProposals] = useState<EvolutionProposal[]>([]);
   const [traceType, setTraceType] = useState('turn');
@@ -169,16 +174,18 @@ function KmPage(): React.JSX.Element {
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
+  const [importForm, setImportForm] = useState({ source: 'knowledge-items', allowlistedRoots: '', markdownFiles: '', defaultScope: 'workspace', defaultSubject: 'default' });
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, exportList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [h, list, knowledgeList, exportList, memoryList, importJobList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
         getJson<{ items: KnowledgeExportJob[] }>('/api/km/exports'),
         getJson<{ items: MemoryItem[] }>('/api/km/memory?limit=20'),
+        getJson<{ items: ImportJob[] }>('/api/km/imports?limit=20'),
         getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
         getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
         getJson<{ items: SyncStatus[] }>('/api/km/sync/sinks'),
@@ -204,6 +211,7 @@ function KmPage(): React.JSX.Element {
       setKnowledge(knowledgeList.items);
       setExportJobs(exportList.items);
       setMemory(memoryList.items);
+      setImportJobs(importJobList.items);
       setEvalRuns(evalList.items);
       setProposals(proposalList.items);
       setSyncStatus(syncList.items);
@@ -281,6 +289,29 @@ function KmPage(): React.JSX.Element {
       setNotice(`配置检查：${providerId} = ${String(result.status)}（未发网络请求）`); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
+  const scanImport = async () => {
+    try {
+      const config = {
+        source: importForm.source,
+        allowlistedRoots: importForm.allowlistedRoots.split('\n').map(value => value.trim()).filter(Boolean),
+        markdownFiles: importForm.markdownFiles.split('\n').map(value => value.trim()).filter(Boolean),
+        defaultScope: importForm.defaultScope,
+        defaultSubject: importForm.defaultSubject,
+        enqueueBackendOutbox: false,
+      };
+      const report = await mutateJson<{ job: ImportJob }>('/api/km/imports', 'POST', { config });
+      setNotice(`导入预览已创建：${report.job.jobId}，需显式执行`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const executeImport = async (job: ImportJob) => {
+    if (!window.confirm(`确认执行 KM 导入 ${job.jobId}？这会写入本地 memory_items，冲突内容只标记不覆盖。`)) return;
+    try {
+      await mutateJson(`/api/km/imports/${encodeURIComponent(job.jobId)}/execute`, 'POST', { approvalToken: job.jobId });
+      setNotice(`导入执行完成：${job.jobId}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
   const createGoldenCase = async () => {
     try {
       await mutateJson('/api/km/golden-cases', 'POST', {
@@ -344,6 +375,7 @@ function KmPage(): React.JSX.Element {
         <article><span>隔离冲突</span><strong>{health?.counts.quarantined ?? '—'}</strong></article>
         <article><span>知识候选</span><strong>{health?.counts.knowledge ?? '—'}</strong></article>
         <article><span>记忆条目</span><strong>{health?.counts.memory ?? '—'}</strong></article>
+        <article><span>导入任务</span><strong>{importJobs.length}</strong></article>
         <article><span>Schema 版本</span><strong>{health?.schemaVersion ?? '—'}</strong></article>
         <article><span>WAL 模式</span><strong>{health?.pragmas.journalMode ?? '—'}</strong></article>
         <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
@@ -428,6 +460,32 @@ function KmPage(): React.JSX.Element {
           </b></div>)}
           {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
           {knowledge.length + memory.length + policyDecisions.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Knowledge → Memory Import</h2>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginBottom: 10 }}>
+          <select value={importForm.source} onChange={e => setImportForm({ ...importForm, source: e.target.value })}>
+            <option value="knowledge-items">approved knowledge_items</option>
+            <option value="markdown-files">selected Markdown files</option>
+            <option value="mixed">mixed</option>
+          </select>
+          <input value={importForm.defaultScope} onChange={e => setImportForm({ ...importForm, defaultScope: e.target.value })} placeholder="workspace/project/skill/environment/team" />
+          <input value={importForm.defaultSubject} onChange={e => setImportForm({ ...importForm, defaultSubject: e.target.value })} placeholder="Subject" />
+          <textarea value={importForm.allowlistedRoots} onChange={e => setImportForm({ ...importForm, allowlistedRoots: e.target.value })} placeholder="Allowlisted roots, one per line" />
+          <textarea value={importForm.markdownFiles} onChange={e => setImportForm({ ...importForm, markdownFiles: e.target.value })} placeholder="Explicit Markdown files, one per line" />
+          <button disabled={!importForm.allowlistedRoots.trim() || !importForm.defaultSubject.trim()} onClick={() => void scanImport()}>Scan Preview</button>
+        </div>
+        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>扫描只读取 approved/fresh/observed/non-sensitive knowledge_items 和显式列出的 allowlist 内 Markdown；执行需确认，不启用外部 transport。</p>
+        <div className="feedback-deliveries">
+          {importJobs.map(job => <div key={job.jobId}>
+            <code>{job.state}</code>
+            <span>{job.jobId}</span>
+            <span>source {job.sourceCount} · eligible {job.eligibleCount} · imported {job.importedCount} · deduped {job.dedupedCount} · conflict {job.conflictCount} · skipped {job.skippedCount}</span>
+            <b>{job.outboxEnqueuedCount} outbox {job.state === 'preview' || job.state === 'review_pending' || job.state === 'partial' ? <button onClick={() => void executeImport(job)}>Execute</button> : null}</b>
+          </div>)}
+          {importJobs.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无导入任务。</p>}
         </div>
       </section>
 

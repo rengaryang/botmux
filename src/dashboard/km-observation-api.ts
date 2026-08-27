@@ -14,6 +14,10 @@ import {
   planKnowledgeExport,
   reviewKnowledgeExportJob,
 } from '../services/km/knowledge-export-staging.js';
+import {
+  createKnowledgeToMemoryImportPreview,
+  executeKnowledgeToMemoryImport,
+} from '../services/km/knowledge-to-memory-import.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -71,6 +75,11 @@ export interface KmObservationApiStore {
   listShadowReviewLabels?(limit: number): ReturnType<ObservationStore['listShadowReviewLabels']>;
   shadowReadinessReport?(input?: Parameters<ObservationStore['shadowReadinessReport']>[0]): ReturnType<ObservationStore['shadowReadinessReport']>;
   shadowReadinessReportLatest?(): ReturnType<ObservationStore['shadowReadinessReportLatest']>;
+  listKnowledgeToMemoryImportJobs?(limit: number): ReturnType<ObservationStore['listKnowledgeToMemoryImportJobs']>;
+  getKnowledgeToMemoryImportReport?(jobId: string): ReturnType<ObservationStore['getKnowledgeToMemoryImportReport']>;
+  createKnowledgeToMemoryImportPreview?(input: Parameters<ObservationStore['createKnowledgeToMemoryImportPreview']>[0]): ReturnType<ObservationStore['createKnowledgeToMemoryImportPreview']>;
+  submitKnowledgeToMemoryImportReview?(input: Parameters<ObservationStore['submitKnowledgeToMemoryImportReview']>[0]): ReturnType<ObservationStore['submitKnowledgeToMemoryImportReview']>;
+  runKnowledgeToMemoryImport?(input: Parameters<ObservationStore['runKnowledgeToMemoryImport']>[0]): ReturnType<ObservationStore['runKnowledgeToMemoryImport']>;
   close(): void;
 }
 
@@ -133,6 +142,9 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/injections'
     || url.pathname === '/api/km/profiles'
     || url.pathname === '/api/km/provider-configs'
+    || url.pathname === '/api/km/imports'
+    || /^\/api\/km\/imports\/[^/]+$/.test(url.pathname)
+    || /^\/api\/km\/imports\/[^/]+\/execute$/.test(url.pathname)
     || url.pathname === '/api/km/backend-runtime'
     || url.pathname === '/api/km/backend-outbox'
     || url.pathname === '/api/km/backend-migrations'
@@ -201,6 +213,40 @@ export async function handleKmObservationApi(
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw); const config = KmMemoryProviderConfigSchema.parse(body);
       executeMutation(ctx, 200, 'provider.configured', config.providerId, () => ({ providerId: config.providerId,
         configHash: store!.putMemoryProviderConfig!(config), realTransportEnabled: false }), { afterHash: response => response.configHash }); return true;
+    }
+
+    if (url.pathname === '/api/km/imports' && req.method === 'POST') {
+      if (!store.listKnowledge || !store.createKnowledgeToMemoryImportPreview) throw new Error('km_import_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 201, 'knowledge_to_memory_import.preview', String(body?.config && typeof body.config === 'object' ? (body.config as any).source ?? 'import' : 'import'), () =>
+        createKnowledgeToMemoryImportPreview({
+          store: {
+            listKnowledge: store!.listKnowledge!.bind(store),
+            createKnowledgeToMemoryImportPreview: store!.createKnowledgeToMemoryImportPreview!.bind(store),
+          },
+          config: (body.config ?? body) as any,
+          actorId: ctx.actorId,
+          idempotencyKey: ctx.idempotencyKey,
+        }), { afterHash: response => response.job.configHash }); return true;
+    }
+
+    const importExecute = url.pathname.match(/^\/api\/km\/imports\/([^/]+)\/execute$/);
+    if (importExecute) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.submitKnowledgeToMemoryImportReview || !store.runKnowledgeToMemoryImport) throw new Error('km_import_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'knowledge_to_memory_import.execute', decodeURIComponent(importExecute[1]), () =>
+        executeKnowledgeToMemoryImport({
+          store: {
+            submitKnowledgeToMemoryImportReview: store!.submitKnowledgeToMemoryImportReview!.bind(store),
+            runKnowledgeToMemoryImport: store!.runKnowledgeToMemoryImport!.bind(store),
+          },
+          jobId: decodeURIComponent(importExecute[1]),
+          actorId: ctx.actorId,
+          idempotencyKey: ctx.idempotencyKey,
+          approvalToken: typeof body.approvalToken === 'string' ? body.approvalToken : undefined,
+          maxItems: typeof body.maxItems === 'number' ? body.maxItems : undefined,
+        }), { afterHash: response => response.job.configHash }); return true;
     }
 
     if (url.pathname === '/api/km/backend-migrations' && req.method === 'POST') {
@@ -450,6 +496,17 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/provider-configs') {
       if (!store.listMemoryProviderConfigs) throw new Error('km_provider_configs_unavailable');
       jsonRes(res, 200, { items: store.listMemoryProviderConfigs() }); return true;
+    }
+    if (url.pathname === '/api/km/imports') {
+      if (!store.listKnowledgeToMemoryImportJobs) throw new Error('km_import_unavailable');
+      jsonRes(res, 200, { items: store.listKnowledgeToMemoryImportJobs(positiveInteger(url.searchParams.get('limit'), 20, 100)) }); return true;
+    }
+    const importStatus = url.pathname.match(/^\/api\/km\/imports\/([^/]+)$/);
+    if (importStatus) {
+      if (!store.getKnowledgeToMemoryImportReport) throw new Error('km_import_unavailable');
+      const report = store.getKnowledgeToMemoryImportReport(decodeURIComponent(importStatus[1]));
+      if (!report) throw new Error('km_import_job_not_found');
+      jsonRes(res, 200, report); return true;
     }
     if (url.pathname === '/api/km/backend-runtime') {
       if (!deps.backendRuntimeStatus) throw new Error('km_backend_runtime_unavailable');

@@ -100,7 +100,7 @@ describe('ObservationStore', () => {
   it('uses an isolated botmux-km.sqlite with hardened pragmas', async () => {
     const store = await ObservationStore.open(tempDir());
     expect(store.path.endsWith('botmux-km.sqlite')).toBe(true);
-    expect(store.schemaVersion()).toBe(15);
+    expect(store.schemaVersion()).toBe(16);
     expect(store.pragmas()).toEqual(expect.objectContaining({
       journalMode: 'wal',
       foreignKeys: 1,
