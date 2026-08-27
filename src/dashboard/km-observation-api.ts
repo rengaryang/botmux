@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { jsonRes } from './http.js';
 import { ObservationEventTypeSchema } from '../services/km/observation-schema.js';
@@ -8,6 +9,7 @@ export interface KmObservationApiStore {
   schemaVersion(): number;
   pragmas(): { journalMode: string; foreignKeys: number; busyTimeout: number };
   counts(): { observations: number; quarantined: number; knowledge?: number; memory?: number };
+  distillationBacklogStatus?(): ReturnType<ObservationStore['distillationBacklogStatus']>;
   list(filter: Parameters<ObservationStore['list']>[0]): ReturnType<ObservationStore['list']>;
   get(eventId: string): ReturnType<ObservationStore['get']>;
   listKnowledge?(filter: Parameters<ObservationStore['listKnowledge']>[0]): ReturnType<ObservationStore['listKnowledge']>;
@@ -30,28 +32,39 @@ export interface KmObservationApiStore {
   listMemoryProviderConfigs?(): ReturnType<ObservationStore['listMemoryProviderConfigs']>;
   putMemoryProviderConfig?(input: Parameters<ObservationStore['putMemoryProviderConfig']>[0]): ReturnType<ObservationStore['putMemoryProviderConfig']>;
   memoryProviderConfigurationHealth?(providerId: string): ReturnType<ObservationStore['memoryProviderConfigurationHealth']>;
+  executeKmMutation?<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string; statusCode: number;
+    action: string; targetRef: string; beforeHash?: string; afterHash?: (response: T) => string | undefined }, operation: () => T):
+    { statusCode: number; response: T; replayed: boolean };
+  listKmConfigAudit?(limit: number): ReturnType<ObservationStore['listKmConfigAudit']>;
+  listMemoryPolicyDecisions?(limit: number): ReturnType<ObservationStore['listMemoryPolicyDecisions']>;
   close(): void;
 }
 
 export interface KmObservationApiDeps {
   enabled: boolean;
+  actorId?: string;
   openStore(): Promise<KmObservationApiStore>;
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
+const MAX_BODY_BYTES = 128 * 1024;
+async function readBody(req: IncomingMessage): Promise<{ body: Record<string, unknown>; raw: string }> {
+  const chunks: Buffer[] = []; let bytes = 0;
+  for await (const chunk of req) { const value = chunk as Buffer; bytes += value.length; if (bytes > MAX_BODY_BYTES) throw new KmApiError(413, 'request_body_too_large'); chunks.push(value); }
+  const raw = Buffer.concat(chunks).toString('utf8');
+  try { return { body: JSON.parse(raw) as Record<string, unknown>, raw }; }
+  catch { throw new KmApiError(400, 'invalid_json'); }
 }
-
-function requireMutationHeaders(req: IncomingMessage): void {
-  if (typeof req.headers['x-km-actor-id'] !== 'string' || !req.headers['x-km-actor-id']!.trim()) throw new Error('reviewer_actor_required');
-  if (typeof req.headers['idempotency-key'] !== 'string' || !req.headers['idempotency-key']!.trim()) throw new Error('idempotency_key_required');
+function mutationContext(req: IncomingMessage, deps: KmObservationApiDeps, route: string, raw: string) {
+  const actorId = deps.actorId?.trim(); if (!actorId) throw new KmApiError(403, 'reviewer_actor_required');
+  const key = req.headers['idempotency-key']; if (typeof key !== 'string' || !key.trim()) throw new KmApiError(400, 'idempotency_key_required');
+  return { actorId, idempotencyKey: key.trim(), route, requestHash: `sha256:${createHash('sha256').update(raw).digest('hex')}` };
 }
 
 function positiveInteger(raw: string | null, fallback: number, max: number): number {
   if (!raw) return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 1) throw new Error('km_observation_invalid_integer');
+  if (!Number.isInteger(value) || value < 1) throw new KmApiError(400, 'km_observation_invalid_integer');
   return Math.min(value, max);
 }
 
@@ -79,6 +92,8 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/injections'
     || url.pathname === '/api/km/profiles'
     || url.pathname === '/api/km/provider-configs'
+    || url.pathname === '/api/km/config-audit'
+    || url.pathname === '/api/km/memory-policy-decisions'
     || /^\/api\/km\/provider-configs\/[^/]+\/health$/.test(url.pathname)
     || /^\/api\/km\/profiles\/[^/]+\/\d+\/state$/.test(url.pathname)
     || /^\/api\/km\/evolution\/proposals\/[^/]+\/decision$/.test(url.pathname);
@@ -90,51 +105,57 @@ export async function handleKmObservationApi(
   let store: KmObservationApiStore | undefined;
   try {
     store = await deps.openStore();
+    const executeMutation = <T>(ctx: ReturnType<typeof mutationContext>, statusCode: number, action: string, targetRef: string,
+      operation: () => T, hashes?: { beforeHash?: string; afterHash?: (response: T) => string | undefined }) => {
+      if (!store!.executeKmMutation) throw new Error('km_mutation_guard_unavailable');
+      const result = store!.executeKmMutation({ ...ctx, statusCode, action, targetRef, beforeHash: hashes?.beforeHash,
+        afterHash: hashes?.afterHash }, operation); jsonRes(res, result.statusCode, result.response);
+    };
+
     const providerHealth = url.pathname.match(/^\/api\/km\/provider-configs\/([^/]+)\/health$/);
     if (providerHealth) {
       if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
       if (!store.memoryProviderConfigurationHealth) throw new Error('km_provider_configs_unavailable');
-      requireMutationHeaders(req);
-      jsonRes(res, 200, store.memoryProviderConfigurationHealth(decodeURIComponent(providerHealth[1]))); return true;
+      const { raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'provider.configuration_health', decodeURIComponent(providerHealth[1]),
+        () => store!.memoryProviderConfigurationHealth!(decodeURIComponent(providerHealth[1]))); return true;
     }
 
     const profileState = url.pathname.match(/^\/api\/km\/profiles\/([^/]+)\/(\d+)\/state$/);
     if (profileState) {
       if (req.method !== 'PATCH') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
       if (!store.setPipelineProfileState) throw new Error('km_profiles_unavailable');
-      requireMutationHeaders(req); const body = await readBody(req);
-      jsonRes(res, 200, store.setPipelineProfileState({ profileId: decodeURIComponent(profileState[1]), revision: Number(profileState[2]),
-        state: String(body.state) as 'draft' | 'shadow' | 'active' | 'retired' })); return true;
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const state = String(body.state); if (!['draft','shadow','retired'].includes(state)) throw new KmApiError(422, 'km_profile_mode_not_open');
+      executeMutation(ctx, 200, 'profile.state_changed', `${decodeURIComponent(profileState[1])}@${profileState[2]}`,
+        () => store!.setPipelineProfileState!({ profileId: decodeURIComponent(profileState[1]), revision: Number(profileState[2]), state: state as any })); return true;
     }
 
     if (url.pathname === '/api/km/profiles' && req.method === 'POST') {
       if (!store.putPipelineProfile) throw new Error('km_profiles_unavailable');
-      requireMutationHeaders(req); const body = await readBody(req);
-      const profile = KmPipelineProfileSchema.parse(body.profile); const state = String(body.state ?? 'draft') as 'draft' | 'shadow' | 'active';
-      const profileHash = store.putPipelineProfile(profile, state); jsonRes(res, 201, { profile, state, profileHash }); return true;
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const profile = KmPipelineProfileSchema.parse(body.profile); if (!['off','shadow'].includes(profile.injectionMode)) throw new KmApiError(422, 'km_profile_mode_not_open');
+      const state = String(body.state ?? 'draft'); if (!['draft','shadow'].includes(state)) throw new KmApiError(422, 'km_profile_state_not_open');
+      executeMutation(ctx, 201, 'profile.created', `${profile.profileId}@${profile.revision}`, () => {
+        const profileHash = store!.putPipelineProfile!(profile, state as 'draft' | 'shadow'); return { profile, state, profileHash, requestedMode: profile.injectionMode, effectiveMode: profile.injectionMode };
+      }, { afterHash: response => response.profileHash }); return true;
     }
 
     if (url.pathname === '/api/km/provider-configs' && req.method === 'PUT') {
       if (!store.putMemoryProviderConfig) throw new Error('km_provider_configs_unavailable');
-      requireMutationHeaders(req); const config = KmMemoryProviderConfigSchema.parse(await readBody(req));
-      jsonRes(res, 200, { providerId: config.providerId, configHash: store.putMemoryProviderConfig(config), realTransportEnabled: false }); return true;
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw); const config = KmMemoryProviderConfigSchema.parse(body);
+      executeMutation(ctx, 200, 'provider.configured', config.providerId, () => ({ providerId: config.providerId,
+        configHash: store!.putMemoryProviderConfig!(config), realTransportEnabled: false }), { afterHash: response => response.configHash }); return true;
     }
 
     const transition = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/state$/);
     if (transition) {
       if (req.method !== 'PATCH') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
       if (!store.transitionKnowledge) throw new Error('km_knowledge_review_unavailable');
-      const idempotencyKey = req.headers['idempotency-key'];
-      if (typeof idempotencyKey !== 'string' || !idempotencyKey.trim()) { jsonRes(res, 400, { error: 'idempotency_key_required' }); return true; }
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
-      const actorId = req.headers['x-km-actor-id'];
-      if (typeof actorId !== 'string' || !actorId.trim()) { jsonRes(res, 403, { error: 'reviewer_actor_required' }); return true; }
-      const item = store.transitionKnowledge({ knowledgeId: decodeURIComponent(transition[1]),
-        toState: String(body.toState) as any, reasonCode: String(body.reasonCode ?? ''), actorId });
-      jsonRes(res, 200, item);
-      return true;
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'knowledge.state_changed', decodeURIComponent(transition[1]), () => store!.transitionKnowledge!({
+        knowledgeId: decodeURIComponent(transition[1]), toState: String(body.toState) as any,
+        reasonCode: String(body.reasonCode ?? ''), actorId: ctx.actorId })); return true;
     }
 
     const dryRun = url.pathname.match(/^\/api\/km\/knowledge\/([^/]+)\/export-dry-run$/);
@@ -149,14 +170,11 @@ export async function handleKmObservationApi(
     if (proposalDecision) {
       if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
       if (!store.decideProposal) throw new Error('km_evolution_decision_unavailable');
-      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
-      const actorId = req.headers['x-km-actor-id'];
-      if (typeof actorId !== 'string' || !actorId.trim()) { jsonRes(res, 403, { error: 'reviewer_actor_required' }); return true; }
-      jsonRes(res, 200, store.decideProposal({ proposalId: decodeURIComponent(proposalDecision[1]),
-        decision: String(body.decision) as any, actorId, grade: String(body.grade) as any,
-        scope: (body.scope ?? {}) as Record<string, unknown>, riskAck: (body.riskAck ?? {}) as Record<string, unknown> }));
-      return true;
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'evolution.decision', decodeURIComponent(proposalDecision[1]), () => store!.decideProposal!({
+        proposalId: decodeURIComponent(proposalDecision[1]), decision: String(body.decision) as any, actorId: ctx.actorId,
+        grade: String(body.grade) as any, scope: (body.scope ?? {}) as Record<string, unknown>,
+        riskAck: (body.riskAck ?? {}) as Record<string, unknown> })); return true;
     }
 
     if (req.method !== 'GET') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
@@ -169,6 +187,14 @@ export async function handleKmObservationApi(
       return true;
     }
 
+    if (url.pathname === '/api/km/config-audit') {
+      if (!store.listKmConfigAudit) throw new Error('km_config_audit_unavailable');
+      jsonRes(res, 200, { items: store.listKmConfigAudit(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/memory-policy-decisions') {
+      if (!store.listMemoryPolicyDecisions) throw new Error('km_memory_policy_decisions_unavailable');
+      jsonRes(res, 200, { items: store.listMemoryPolicyDecisions(positiveInteger(url.searchParams.get('limit'), 50, 100)) }); return true;
+    }
     if (url.pathname === '/api/km/profiles') {
       if (!store.listPipelineProfiles) throw new Error('km_profiles_unavailable');
       jsonRes(res, 200, { items: store.listPipelineProfiles(url.searchParams.get('botAppId') ?? undefined) }); return true;
@@ -218,6 +244,8 @@ export async function handleKmObservationApi(
         schemaVersion: store.schemaVersion(),
         pragmas: store.pragmas(),
         counts: store.counts(),
+        backlog: store.distillationBacklogStatus?.() ?? { queued: 0, retryWait: 0, oldestAgeMs: 0, claimed: 0 },
+        capabilities: { requestedModes: ['off', 'shadow'], effectiveModes: ['off', 'shadow'], livePromptInjection: false, realMemoryTransport: false },
       });
       return true;
     }
@@ -280,7 +308,11 @@ export async function handleKmObservationApi(
 
     jsonRes(res, 404, { error: 'not_found' });
   } catch (error) {
-    jsonRes(res, 400, { error: error instanceof Error ? error.message : 'km_observation_invalid_request' });
+    const message = error instanceof Error ? error.message : 'km_observation_invalid_request';
+    const zodError = error instanceof Error && error.name === 'ZodError';
+    const status = error instanceof KmApiError ? error.status : message === 'km_idempotency_conflict' ? 409
+      : message.includes('not_found') ? 404 : zodError || message.startsWith('km_') ? 422 : 500;
+    jsonRes(res, status, { error: status >= 500 ? 'km_internal_error' : zodError ? 'km_request_schema_invalid' : message });
   } finally {
     store?.close();
   }

@@ -112,6 +112,7 @@ export interface TurnCompletionEventPayload {
   durationMs?: number; usage?: Record<string, unknown>;
   cliId?: string; cliVersion?: string; model?: string; reasoningEffort?: string;
   skillName?: string; skillVersion?: string; workflowId?: string; taskId?: string; parentTaskId?: string;
+  requesterSubjectId?: string;
 }
 
 interface ResponseRow {
@@ -835,6 +836,7 @@ export class SkillFeedbackStore {
       ...(row.skill_name ? { skillName: row.skill_name } : {}), ...(row.skill_version ? { skillVersion: row.skill_version } : {}),
       ...(row.workflow_id ? { workflowId: row.workflow_id } : {}), ...(row.task_id ? { taskId: row.task_id } : {}),
       ...(row.parent_task_id ? { parentTaskId: row.parent_task_id } : {}),
+      ...(row.requester_subject_id ? { requesterSubjectId: row.requester_subject_id } : {}),
     };
     // COALESCE so a terminal that carries no usage/duration (an emitter that
     // could not measure the turn, or a legacy worker predating the timing

@@ -1,11 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 type Health = {
   enabled: boolean;
   schemaVersion: number;
   pragmas: { journalMode: string; foreignKeys: number; busyTimeout: number };
   counts: { observations: number; quarantined: number; knowledge?: number; memory?: number };
+  backlog: { queued: number; retryWait: number; oldestAgeMs: number; claimed: number };
+  capabilities: { requestedModes: string[]; effectiveModes: string[]; livePromptInjection: boolean; realMemoryTransport: boolean };
 };
 
 type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; title: string; confidence: string; freshness: string };
@@ -18,8 +21,10 @@ type ProviderStatus = { providerId: string; kind: string; version: string; statu
 type DistillationJob = { jobId: string; state: string; botAppId: string; profileId: string; attempts: number; lastError?: string };
 type RetrievalAudit = { retrievalRunId: string; botAppId: string; mode: string; candidateCount: number; eligibleCount: number; latencyMs: number };
 type InjectionSnapshot = { snapshotId: string; botAppId: string; mode: string; disposition: string; itemIds: string[]; promptBytes: number };
-type PipelineProfile = { profile: { profileId: string; revision: number; botAppId: string; injectionMode: 'off' | 'shadow' | 'canary' | 'active'; memoryBackends: { writePolicy: string; primary: string; mirrors: string[] }; budgets: { promptTokens: number } }; state: string; profileHash: string; createdAt: string };
+type PipelineProfile = { profile: { profileId: string; revision: number; botAppId: string; injectionMode: 'off' | 'shadow' | 'canary' | 'active'; memoryBackends: { writePolicy: string; primary: string; mirrors: string[] }; budgets: { promptTokens: number } }; state: string; requestedMode: string; effectiveMode: string; profileHash: string; createdAt: string };
 type ProviderConfig = { providerId: 'mem0' | 'hindsight' | 'openviking'; endpoint: string; credentialRef: string; enabled: boolean; realTransportEnabled: false; timeoutMs: number; updatedAt: string };
+type MemoryPolicyDecision = { decisionId: string; sourceEventId: string; memoryId?: string; policyVersion: string; disposition: string; reasonCodes: string[]; evidence: { claimKey?: string; subject?: string }; createdAt: string };
+type ConfigAudit = { auditId: string; actorId: string; action: string; targetRef: string; createdAt: string };
 
 type ObservationEvent = {
   eventId: string;
@@ -43,7 +48,7 @@ async function getJson<T>(path: string): Promise<T> {
 
 async function mutateJson<T>(path: string, method: 'POST' | 'PUT' | 'PATCH', body: unknown): Promise<T> {
   const response = await fetch(path, { method, headers: { 'content-type': 'application/json',
-    'x-km-actor-id': 'dashboard-user', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(body) });
+    ...controlCsrfHeaders(), 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;
 }
@@ -76,6 +81,8 @@ function KmPage(): React.JSX.Element {
   const [injections, setInjections] = useState<InjectionSnapshot[]>([]);
   const [profiles, setProfiles] = useState<PipelineProfile[]>([]);
   const [providerConfigs, setProviderConfigs] = useState<ProviderConfig[]>([]);
+  const [policyDecisions, setPolicyDecisions] = useState<MemoryPolicyDecision[]>([]);
+  const [configAudit, setConfigAudit] = useState<ConfigAudit[]>([]);
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
@@ -83,7 +90,7 @@ function KmPage(): React.JSX.Element {
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList] = await Promise.all([
+      const [h, list, knowledgeList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, policyDecisionList, configAuditList] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -97,6 +104,8 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: InjectionSnapshot[] }>('/api/km/injections?limit=20'),
         getJson<{ items: PipelineProfile[] }>('/api/km/profiles'),
         getJson<{ items: ProviderConfig[] }>('/api/km/provider-configs'),
+        getJson<{ items: MemoryPolicyDecision[] }>('/api/km/memory-policy-decisions?limit=20'),
+        getJson<{ items: ConfigAudit[] }>('/api/km/config-audit?limit=20'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -107,6 +116,7 @@ function KmPage(): React.JSX.Element {
       setSyncStatus(syncList.items);
       setProviders(providerList.items); setJobs(jobList.items); setRetrievals(retrievalList.items); setInjections(injectionList.items);
       setProfiles(profileList.items); setProviderConfigs(providerConfigList.items);
+      setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -168,6 +178,8 @@ function KmPage(): React.JSX.Element {
         <article><span>Schema 版本</span><strong>{health?.schemaVersion ?? '—'}</strong></article>
         <article><span>WAL 模式</span><strong>{health?.pragmas.journalMode ?? '—'}</strong></article>
         <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
+        <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
+        <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
       </section>
 
       <section className="panel">
@@ -189,7 +201,8 @@ function KmPage(): React.JSX.Element {
         <div className="feedback-deliveries">
           {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}</b></div>)}
           {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}</b></div>)}
-          {knowledge.length + memory.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
+          {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
+          {knowledge.length + memory.length + policyDecisions.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
         </div>
       </section>
 
@@ -216,7 +229,7 @@ function KmPage(): React.JSX.Element {
           <input value={profileForm.profileId} onChange={e => setProfileForm({ ...profileForm, profileId: e.target.value })} placeholder="Profile ID（可选）" />
           <input type="number" min="1" value={profileForm.revision} onChange={e => setProfileForm({ ...profileForm, revision: Number(e.target.value) })} title="Revision" />
           <select value={profileForm.injectionMode} onChange={e => setProfileForm({ ...profileForm, injectionMode: e.target.value as typeof profileForm.injectionMode })}>
-            <option value="off">off</option><option value="shadow">shadow</option><option value="canary">canary</option><option value="active">active</option>
+            <option value="off">off</option><option value="shadow">shadow</option>
           </select>
           <input value={profileForm.primary} onChange={e => setProfileForm({ ...profileForm, primary: e.target.value })} placeholder="Primary backend" />
           <input value={profileForm.mirrors} onChange={e => setProfileForm({ ...profileForm, mirrors: e.target.value })} placeholder="Mirrors，逗号分隔" />
@@ -226,8 +239,8 @@ function KmPage(): React.JSX.Element {
         <div className="feedback-deliveries">
           {profiles.map(entry => <div key={`${entry.profile.profileId}@${entry.profile.revision}`}><code>{entry.state}</code>
             <span>{entry.profile.botAppId} · {entry.profile.profileId}@{entry.profile.revision}</span>
-            <span>{entry.profile.memoryBackends.primary} + {entry.profile.memoryBackends.mirrors.join(', ')} · {entry.profile.injectionMode}</span>
-            <b><button onClick={() => void changeProfileState(entry, 'shadow')}>Shadow</button>{' '}<button onClick={() => void changeProfileState(entry, 'active')}>Activate</button>{' '}<button onClick={() => void changeProfileState(entry, 'retired')}>Retire</button></b>
+            <span>{entry.profile.memoryBackends.primary} + {entry.profile.memoryBackends.mirrors.join(', ')} · requested {entry.requestedMode} / effective {entry.effectiveMode}</span>
+            <b><button onClick={() => void changeProfileState(entry, 'shadow')}>Shadow</button>{' '}<button onClick={() => void changeProfileState(entry, 'retired')}>Retire</button></b>
           </div>)}
         </div>
         <h3>External Provider Connection</h3>
@@ -244,6 +257,7 @@ function KmPage(): React.JSX.Element {
         <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>只保存 endpoint 与 credential reference；不保存密钥，不发网络请求，realTransportEnabled 固定为 false。</p>
         <div className="feedback-deliveries">
           {providerConfigs.map(config => <div key={config.providerId}><code>{config.providerId}</code><span>{config.endpoint}</span><span>{config.credentialRef} · {config.timeoutMs}ms</span><b>{config.enabled ? 'configured' : 'disabled'} / transport off <button onClick={() => void checkProvider(config.providerId)}>检查</button></b></div>)}
+          {configAudit.map(item => <div key={item.auditId}><code>audit</code><span>{item.action} · {item.targetRef}</span><span>{item.actorId}</span><b>{item.createdAt}</b></div>)}
         </div>
       </section>
 

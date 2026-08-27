@@ -9,7 +9,7 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -151,6 +151,26 @@ const PHASE8_SCHEMA = `
     to_profile_json TEXT NOT NULL CHECK(json_valid(to_profile_json)), state TEXT NOT NULL CHECK(state IN ('draft','backfilling','comparing','ready','cutover','rolled_back','failed')),
     checkpoint TEXT, stats_json TEXT NOT NULL CHECK(json_valid(stats_json)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   );
+`;
+
+const PHASE11_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_mutation_idempotency (
+    actor_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, route TEXT NOT NULL, request_hash TEXT NOT NULL,
+    status_code INTEGER NOT NULL, response_json TEXT NOT NULL CHECK(json_valid(response_json)), created_at TEXT NOT NULL,
+    PRIMARY KEY(actor_id,idempotency_key)
+  );
+  CREATE TABLE IF NOT EXISTS km_config_audit (
+    audit_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, action TEXT NOT NULL, target_ref TEXT NOT NULL,
+    before_hash TEXT, after_hash TEXT, request_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_config_audit_created ON km_config_audit(created_at DESC,audit_id);
+  CREATE TABLE IF NOT EXISTS km_memory_policy_decisions (
+    decision_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL, memory_id TEXT,
+    policy_version TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN ('reject','propose','activate')),
+    reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json)), evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    created_at TEXT NOT NULL, UNIQUE(source_event_id,policy_version,evidence_json)
+  );
+  CREATE INDEX IF NOT EXISTS km_memory_policy_decisions_created ON km_memory_policy_decisions(created_at DESC,decision_id);
 `;
 
 const PHASE10_SCHEMA = `
@@ -574,6 +594,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 8) this.migrateToPhase8();
     if (this.schemaVersion() < 9) this.migrateToPhase9();
     if (this.schemaVersion() < 10) this.migrateToPhase10();
+    if (this.schemaVersion() < 11) this.migrateToPhase11();
     this.validateSchema();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   }
@@ -614,6 +635,18 @@ export class ObservationStore {
       knowledge: Number((this.db.prepare('SELECT COUNT(*) AS count FROM knowledge_items').get() as any).count),
       memory: Number((this.db.prepare('SELECT COUNT(*) AS count FROM memory_items').get() as any).count),
     };
+  }
+
+  distillationBacklogStatus(now = Date.now()): { queued: number; retryWait: number; oldestAgeMs: number; claimed: number } {
+    const row = this.db.prepare(`SELECT
+      SUM(CASE WHEN state='queued' THEN 1 ELSE 0 END) queued,
+      SUM(CASE WHEN state='retry_wait' THEN 1 ELSE 0 END) retry_wait,
+      SUM(CASE WHEN claim_token IS NOT NULL THEN 1 ELSE 0 END) claimed,
+      MIN(CASE WHEN state IN ('queued','retry_wait') THEN created_at END) oldest
+      FROM distillation_jobs`).get() as any;
+    const oldestMs = row.oldest ? Date.parse(row.oldest) : now;
+    return { queued: Number(row.queued ?? 0), retryWait: Number(row.retry_wait ?? 0), claimed: Number(row.claimed ?? 0),
+      oldestAgeMs: Math.max(0, now - oldestMs) };
   }
 
   /** Nonblocking hot-path append. A competing process holding SQLite's write
@@ -850,7 +883,7 @@ export class ObservationStore {
       if (!input.actorId.trim() || input.actorId === 'system') throw new Error('km_knowledge_inferred_requires_human_review');
     }
     const now = new Date().toISOString();
-    this.db.exec('BEGIN IMMEDIATE;');
+    this.db.exec('SAVEPOINT km_knowledge_transition;');
     try {
       this.db.prepare('UPDATE knowledge_items SET state=?,updated_at=? WHERE knowledge_id=?')
         .run(input.toState, now, input.knowledgeId);
@@ -859,9 +892,9 @@ export class ObservationStore {
         VALUES(?,?,?,?,?,?,?,?)
       `).run(kmId('hist'), input.knowledgeId, current.state, input.toState,
         requireText(input.reasonCode, 'knowledge_reason'), requireText(input.actorId, 'actor_id'), input.evidenceEventId ?? null, now);
-      this.db.exec('COMMIT;');
+      this.db.exec('RELEASE km_knowledge_transition;');
     } catch (error) {
-      try { this.db.exec('ROLLBACK;'); } catch { /* transaction may already be closed */ }
+      try { this.db.exec('ROLLBACK TO km_knowledge_transition; RELEASE km_knowledge_transition;'); } catch { /* savepoint may already be closed */ }
       throw error;
     }
     return this.getKnowledge(input.knowledgeId)!;
@@ -1156,15 +1189,15 @@ export class ObservationStore {
     const approvalId = kmId('approval');
     const now = new Date().toISOString();
     const state = input.decision === 'approved' ? 'approved' : input.decision === 'rejected' ? 'rejected' : 'draft';
-    this.db.exec('BEGIN IMMEDIATE;');
+    this.db.exec('SAVEPOINT km_proposal_decision;');
     try {
       this.db.prepare(`INSERT INTO approval_decisions(approval_id,proposal_id,grade,decision,actor_id,scope_json,risk_ack_json,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(approvalId, input.proposalId, input.grade, input.decision,
         requireText(input.actorId, 'approval_actor'), JSON.stringify(input.scope), JSON.stringify(input.riskAck ?? {}), now);
       this.db.prepare('UPDATE evolution_proposals SET state=?,approved_by=?,updated_at=? WHERE proposal_id=?')
         .run(state, input.decision === 'approved' ? input.actorId : null, now, input.proposalId);
-      this.db.exec('COMMIT;');
-    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch { /* closed */ } throw error; }
+      this.db.exec('RELEASE km_proposal_decision;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_proposal_decision; RELEASE km_proposal_decision;'); } catch { /* closed */ } throw error; }
     return { approvalId, state };
   }
 
@@ -1279,18 +1312,46 @@ export class ObservationStore {
       .run(descriptor.id, descriptor.kind, descriptor.version, JSON.stringify(descriptor), 'validated', new Date().toISOString());
   }
 
+  executeKmMutation<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string; statusCode: number;
+    action: string; targetRef: string; beforeHash?: string; afterHash?: (response: T) => string | undefined }, operation: () => T): { statusCode: number; response: T; replayed: boolean } {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const row = this.db.prepare(`SELECT route,request_hash,status_code,response_json FROM km_mutation_idempotency WHERE actor_id=? AND idempotency_key=?`)
+        .get(input.actorId, input.idempotencyKey) as any;
+      if (row) {
+        if (row.route !== input.route || row.request_hash !== input.requestHash) throw new Error('km_idempotency_conflict');
+        this.db.exec('COMMIT;');
+        return { statusCode: Number(row.status_code), response: JSON.parse(row.response_json) as T, replayed: true };
+      }
+      const response = operation(); const now = new Date().toISOString();
+      this.db.prepare(`INSERT INTO km_mutation_idempotency(actor_id,idempotency_key,route,request_hash,status_code,response_json,created_at)
+        VALUES(?,?,?,?,?,?,?)`).run(input.actorId, input.idempotencyKey, input.route, input.requestHash, input.statusCode, JSON.stringify(response), now);
+      this.db.prepare(`INSERT INTO km_config_audit(audit_id,actor_id,action,target_ref,before_hash,after_hash,request_hash,idempotency_key,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(`kma_${randomUUID().replaceAll('-', '')}`, input.actorId, input.action, input.targetRef,
+        input.beforeHash ?? null, input.afterHash?.(response) ?? null, input.requestHash, input.idempotencyKey, now);
+      this.db.exec('COMMIT;');
+      return { statusCode: input.statusCode, response, replayed: false };
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  listKmConfigAudit(limit: number): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT * FROM km_config_audit ORDER BY created_at DESC,audit_id DESC LIMIT ?`).all(Math.max(1,Math.min(limit,500))) as any[])
+      .map(row => ({ auditId: row.audit_id, actorId: row.actor_id, action: row.action, targetRef: row.target_ref,
+        ...(row.before_hash ? { beforeHash: row.before_hash } : {}), ...(row.after_hash ? { afterHash: row.after_hash } : {}), createdAt: row.created_at }));
+  }
+
   putPipelineProfile(profileInput: KmPipelineProfile, state: 'draft' | 'shadow' | 'active' = 'draft'): string {
     const profile = KmPipelineProfileSchema.parse(profileInput);
     const json = JSON.stringify(profile);
     const hash = sha256(json);
     const now = new Date().toISOString();
-    this.db.exec('BEGIN IMMEDIATE;');
+    this.db.exec('SAVEPOINT km_profile_put;');
     try {
       if (state === 'active') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='active'`).run(profile.botAppId);
       this.db.prepare(`INSERT INTO km_pipeline_profiles(profile_id,revision,bot_app_id,profile_json,profile_hash,state,created_at)
         VALUES(?,?,?,?,?,?,?)`).run(profile.profileId, profile.revision, profile.botAppId, json, hash, state, now);
-      this.db.exec('COMMIT;');
-    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+      this.db.exec('RELEASE km_profile_put;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_profile_put; RELEASE km_profile_put;'); } catch {} throw error; }
     return hash;
   }
 
@@ -1298,19 +1359,21 @@ export class ObservationStore {
     const rows = (botAppId
       ? this.db.prepare(`SELECT * FROM km_pipeline_profiles WHERE bot_app_id=? ORDER BY created_at DESC`).all(botAppId)
       : this.db.prepare(`SELECT * FROM km_pipeline_profiles ORDER BY created_at DESC`).all()) as any[];
-    return rows.map(row => ({ profile: KmPipelineProfileSchema.parse(JSON.parse(row.profile_json)), profileHash: row.profile_hash,
-      state: row.state, createdAt: row.created_at }));
+    return rows.map(row => { const profile = KmPipelineProfileSchema.parse(JSON.parse(row.profile_json)); return {
+      profile, profileHash: row.profile_hash, state: row.state, requestedMode: profile.injectionMode,
+      effectiveMode: profile.injectionMode === 'off' ? 'off' : 'shadow', createdAt: row.created_at,
+    }; });
   }
 
   setPipelineProfileState(input: { profileId: string; revision: number; state: 'draft' | 'shadow' | 'active' | 'retired' }): Record<string, unknown> {
     const row = this.db.prepare(`SELECT bot_app_id FROM km_pipeline_profiles WHERE profile_id=? AND revision=?`).get(input.profileId, input.revision) as any;
     if (!row) throw new Error('km_pipeline_profile_not_found');
-    this.db.exec('BEGIN IMMEDIATE;');
+    this.db.exec('SAVEPOINT km_profile_state;');
     try {
       if (input.state === 'active') this.db.prepare(`UPDATE km_pipeline_profiles SET state='retired' WHERE bot_app_id=? AND state='active'`).run(row.bot_app_id);
       this.db.prepare(`UPDATE km_pipeline_profiles SET state=? WHERE profile_id=? AND revision=?`).run(input.state, input.profileId, input.revision);
-      this.db.exec('COMMIT;');
-    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+      this.db.exec('RELEASE km_profile_state;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_profile_state; RELEASE km_profile_state;'); } catch {} throw error; }
     return this.listPipelineProfiles(row.bot_app_id).find(value => (value.profile as KmPipelineProfile).profileId === input.profileId
       && (value.profile as KmPipelineProfile).revision === input.revision)!;
   }
@@ -1346,6 +1409,20 @@ export class ObservationStore {
     const credentialAvailable = kind === 'env' ? Boolean(env[value]?.trim()) : kind === 'file' ? existsSync(value) : false;
     return { providerId: config.providerId, status: !config.enabled ? 'disabled' : credentialAvailable ? 'configuration_ready' : 'credential_missing',
       endpointValid: true, credentialAvailable, transportChecked: false, realTransportEnabled: false, updatedAt: row.updated_at };
+  }
+
+  recordMemoryPolicyDecision(input: { sourceEventId: string; memoryId?: string; policyVersion: string;
+    disposition: 'reject' | 'propose' | 'activate'; reasonCodes: string[]; evidence: Record<string, unknown> }): string {
+    const evidenceJson = JSON.stringify(input.evidence); const id = `mpd_${createHash('sha256').update(`${input.sourceEventId}|${input.policyVersion}|${evidenceJson}`).digest('hex')}`;
+    this.db.prepare(`INSERT OR IGNORE INTO km_memory_policy_decisions(decision_id,source_event_id,memory_id,policy_version,disposition,reason_codes_json,evidence_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?)`).run(id,input.sourceEventId,input.memoryId ?? null,input.policyVersion,input.disposition,JSON.stringify(input.reasonCodes),evidenceJson,new Date().toISOString());
+    return id;
+  }
+
+  listMemoryPolicyDecisions(limit: number): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT * FROM km_memory_policy_decisions ORDER BY created_at DESC,decision_id DESC LIMIT ?`).all(Math.max(1,Math.min(limit,500))) as any[])
+      .map(row => ({ decisionId: row.decision_id, sourceEventId: row.source_event_id, ...(row.memory_id ? { memoryId: row.memory_id } : {}),
+        policyVersion: row.policy_version, disposition: row.disposition, reasonCodes: JSON.parse(row.reason_codes_json), evidence: JSON.parse(row.evidence_json), createdAt: row.created_at }));
   }
 
   createDistillationJob(input: { sourceEventId: string; profile: KmPipelineProfile; evidenceContext?: Record<string, unknown>; now?: number }): { jobId: string; created: boolean } {
@@ -1496,6 +1573,16 @@ export class ObservationStore {
     }
   }
 
+  private migrateToPhase11(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 11) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE11_SCHEMA);
+      this.db.exec('PRAGMA user_version=11;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
   private migrateToPhase10(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -1615,6 +1702,9 @@ export class ObservationStore {
       'retrieval_results',
       'prompt_injection_snapshots',
       'km_memory_provider_configs',
+      'km_mutation_idempotency',
+      'km_config_audit',
+      'km_memory_policy_decisions',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

@@ -81,6 +81,7 @@ export function observationFromTurnCompletion(input: TurnCompletionEventPayload)
       ...(input.cliVersion ? { cliVersion: input.cliVersion } : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      ...(input.requesterSubjectId ? { requesterSubjectId: input.requesterSubjectId } : {}),
     },
     createdAt: input.time,
   });
