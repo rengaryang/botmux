@@ -40,6 +40,7 @@ export interface KmObservationApiStore {
   listKmConfigAudit?(limit: number): ReturnType<ObservationStore['listKmConfigAudit']>;
   listMemoryPolicyDecisions?(limit: number): ReturnType<ObservationStore['listMemoryPolicyDecisions']>;
   retrievalQualitySummary?(): ReturnType<ObservationStore['retrievalQualitySummary']>;
+  evalEvolutionStatus?(): ReturnType<ObservationStore['evalEvolutionStatus']>;
   close(): void;
 }
 
@@ -266,6 +267,7 @@ export async function handleKmObservationApi(
         pragmas: store.pragmas(),
         counts: store.counts(),
         backlog: store.distillationBacklogStatus?.() ?? { queued: 0, retryWait: 0, oldestAgeMs: 0, claimed: 0 },
+        evalEvolution: store.evalEvolutionStatus?.() ?? { evalRuns: 0, failingEvalRuns: 0, reviewPendingProposals: 0 },
         capabilities: { requestedModes: ['off', 'shadow'], effectiveModes: ['off', 'shadow'], livePromptInjection: false, realMemoryTransport: false },
       });
       return true;

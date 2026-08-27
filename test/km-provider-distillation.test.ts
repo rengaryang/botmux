@@ -24,6 +24,10 @@ describe('KM provider SPI and durable distillation', () => {
   it('validates descriptors and bot-scoped profiles', () => {
     expect(KmProviderDescriptorSchema.parse({ id: 'mem0', kind: 'memory-backend', version: '1', contractVersion: 1,
       capabilities: ['put', 'retrieve'], execution: 'service', deterministic: false, supportsShadow: true, maxBatchSize: 50 }).id).toBe('mem0');
+    expect(KmProviderDescriptorSchema.parse({ id: 'km-quality-evaluators-v1', kind: 'evaluator', version: '1', contractVersion: 1,
+      capabilities: ['artifact-completeness'], execution: 'in-process', deterministic: true, supportsShadow: true, maxBatchSize: 100 }).kind).toBe('evaluator');
+    expect(KmProviderDescriptorSchema.parse({ id: 'km-evolution-planner-v1', kind: 'evolution-planner', version: '1', contractVersion: 1,
+      capabilities: ['review-pending-only'], execution: 'in-process', deterministic: true, supportsShadow: true, maxBatchSize: 25 }).kind).toBe('evolution-planner');
     expect(KmPipelineProfileSchema.parse(profile).botAppId).toBe('bot-1');
     expect(() => KmProviderDescriptorSchema.parse({})).toThrow();
     expect(() => KmPipelineProfileSchema.parse({ ...profile, shadowExtractors: [profile.primaryExtractor] })).toThrow(/primary cannot also be shadow/);

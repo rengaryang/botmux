@@ -87,6 +87,7 @@ import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-com
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
 import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
+import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-evolution-runtime.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -22068,6 +22069,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   kmRecoveryStartupTimer.unref?.();
   const kmDistillationRecoveryTimer = setInterval(drainKmDistillation, 30_000);
   kmDistillationRecoveryTimer.unref?.();
+  let kmEvalEvolutionRunning = false;
+  const runKmEvalEvolutionWorker = () => {
+    if (kmEvalEvolutionRunning || !isKmObservationEnabled() || !isKmAutoEvalEnabled()) return;
+    kmEvalEvolutionRunning = true;
+    void runKmEvalEvolutionOnce({ dataDir: config.session.dataDir, maxTargets: 100 })
+      .then(result => {
+        if (result.createdEvalRuns > 0 || result.createdProposals > 0) {
+          logger.info(`[km-eval-evolution] evaluated=${result.createdEvalRuns} proposals=${result.createdProposals}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-eval-evolution] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmEvalEvolutionRunning = false; });
+  };
+  const kmEvalStartupTimer = setTimeout(runKmEvalEvolutionWorker, 5_000 + idx * 750);
+  kmEvalStartupTimer.unref?.();
+  const kmEvalEvolutionTimer = setInterval(runKmEvalEvolutionWorker, 60_000);
+  kmEvalEvolutionTimer.unref?.();
 
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
@@ -22934,6 +22952,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(maintenanceHeartbeat);
     if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
     clearInterval(kmDistillationRecoveryTimer);
+    if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
+    clearInterval(kmEvalEvolutionTimer);
     clearInterval(docCommentPollTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
@@ -23166,6 +23186,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
     clearInterval(kmDistillationRecoveryTimer);
+    if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
+    clearInterval(kmEvalEvolutionTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
