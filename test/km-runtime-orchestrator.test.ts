@@ -169,6 +169,27 @@ describe('KM runtime orchestrator', () => {
     reopened.close();
   });
 
+  it('uses process.env consistently for the allowlist when daemon callers omit env', async () => {
+    const dir = tempDir(); const store = await ObservationStore.open(dir);
+    store.upsertMemory({ state: 'active', scope: 'bot', subject: 'bot', claimKey: 'style', claimText: 'Use concise bullets', confidence: 'observed',
+      privacyClass: 'internal', sourceRefs: [{ kind: 'api', ref: 'evt' }] });
+    store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'process-env-canary', revision: 1, injectionMode: 'canary' }, 'shadow');
+    store.close();
+    process.env.BOTMUX_KM_LIVE_INJECTION_ENABLED = 'true';
+    process.env.BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED = 'true';
+    process.env.BOTMUX_KM_CANARY_BOT_APP_IDS = 'other-bot, bot';
+
+    const result = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's-process-env', turnId: 't-process-env',
+      queryText: 'bullets', promptContent: 'hello' });
+    expect(result.injected).toBe(true);
+    expect(result.promptContent).toContain('Use concise bullets');
+    const reopened = await ObservationStore.open(dir);
+    expect(reopened.listInjectionSnapshots(1)).toEqual([expect.objectContaining({
+      requestedMode: 'canary', effectiveMode: 'canary', disposition: 'injected',
+    })]);
+    reopened.close();
+  });
+
   it('does not require the shadow retrieval gate once the explicit live gates pass', async () => {
     const dir = tempDir(); const store = await ObservationStore.open(dir);
     store.upsertMemory({ state: 'active', scope: 'bot', subject: 'bot', claimKey: 'style', claimText: 'Use concise bullets', confidence: 'observed',

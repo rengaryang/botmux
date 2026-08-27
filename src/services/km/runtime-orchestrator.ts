@@ -197,7 +197,8 @@ export async function composePromptMemoryForTurn(input: {
   dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string; promptContent: string;
   env?: NodeJS.ProcessEnv; providers?: MemoryBackendProvider[]; providerTimeoutMs?: number;
 }): Promise<{ promptContent: string; injected: boolean; reason?: string }> {
-  if (!isKmRetrievalShadowEnabled(input.env) && !isKmLiveInjectionEnabled(input.env)) {
+  const env = input.env ?? process.env;
+  if (!isKmRetrievalShadowEnabled(env) && !isKmLiveInjectionEnabled(env)) {
     return { promptContent: input.promptContent, injected: false, reason: 'retrieval_gate_disabled' };
   }
   const started = Date.now(); const store = await ObservationStore.open(input.dataDir);
@@ -218,9 +219,9 @@ export async function composePromptMemoryForTurn(input: {
       botAppId: input.botAppId,
       userId: input.userId,
       requestedMode,
-      effectiveModeAuthorized: isKmEffectiveModeAuthorized(input.env),
-      liveInjectionEnabled: isKmLiveInjectionEnabled(input.env),
-      canaryBotIds: parseBotAllowlist(input.env?.BOTMUX_KM_CANARY_BOT_APP_IDS),
+      effectiveModeAuthorized: isKmEffectiveModeAuthorized(env),
+      liveInjectionEnabled: isKmLiveInjectionEnabled(env),
+      canaryBotIds: parseBotAllowlist(env.BOTMUX_KM_CANARY_BOT_APP_IDS),
       promptTokenBudget: profile?.budgets.promptTokens ?? 1_800,
     });
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
