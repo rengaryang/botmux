@@ -8,6 +8,7 @@ type Health = {
   pragmas: { journalMode: string; foreignKeys: number; busyTimeout: number };
   counts: { observations: number; quarantined: number; knowledge?: number; memory?: number };
   backlog: { queued: number; retryWait: number; oldestAgeMs: number; claimed: number };
+  evalEvolution: { evalRuns: number; failingEvalRuns: number; reviewPendingProposals: number; latestEvalAt?: string; latestProposalAt?: string };
   capabilities: { requestedModes: string[]; effectiveModes: string[]; livePromptInjection: boolean; realMemoryTransport: boolean };
 };
 
@@ -207,6 +208,9 @@ function KmPage(): React.JSX.Element {
         <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
         <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
         <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
+        <article><span>Eval 运行</span><strong>{health?.evalEvolution.evalRuns ?? '—'}</strong></article>
+        <article><span>失败 Eval</span><strong>{health?.evalEvolution.failingEvalRuns ?? '—'}</strong></article>
+        <article><span>待审提案</span><strong>{health?.evalEvolution.reviewPendingProposals ?? '—'}</strong></article>
         <article><span>Retrieval 零命中</span><strong>{retrievalQuality ? `${retrievalQuality.zeroHits}/${retrievalQuality.runs}` : '—'}</strong></article>
         <article><span>Retrieval 直接命中</span><strong>{retrievalQuality?.directHits ?? '—'}</strong></article>
         <article><span>Retrieval 归一命中</span><strong>{retrievalQuality?.normalizedHits ?? '—'}</strong></article>

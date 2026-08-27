@@ -4,6 +4,7 @@ import type { KnowledgeCandidateInput, MemoryUpsertInput } from './observation-s
 export const KmProviderKindSchema = z.enum([
   'source', 'window-resolver', 'extractor', 'canonicalizer', 'knowledge-router',
   'memory-policy', 'memory-backend', 'retriever', 'reranker', 'prompt-composer', 'exporter',
+  'evaluator', 'evolution-planner',
 ]);
 export type KmProviderKind = z.infer<typeof KmProviderKindSchema>;
 

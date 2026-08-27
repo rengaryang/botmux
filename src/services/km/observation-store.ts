@@ -176,6 +176,13 @@ const PHASE13_SCHEMA = `
     SET requested_mode=COALESCE(requested_mode,mode), effective_mode=COALESCE(effective_mode,mode);
 `;
 
+const PHASE14_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS eval_results_run_verdict ON eval_results(eval_run_id,verdict);
+  CREATE INDEX IF NOT EXISTS evolution_proposals_review_dedupe ON evolution_proposals(
+    state,proposal_type,target_ref,evidence_refs_json,proposed_action_json
+  );
+`;
+
 const PHASE11_SCHEMA = `
   CREATE TABLE IF NOT EXISTS km_mutation_idempotency (
     actor_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, route TEXT NOT NULL, request_hash TEXT NOT NULL,
@@ -579,6 +586,34 @@ export interface EvolutionProposalInput {
   proposedAction: Record<string, unknown>; risk: Record<string, unknown>; rollback: Record<string, unknown>; createdBy: string;
 }
 
+export interface KmEvalEvolutionStatus {
+  evalRuns: number;
+  failingEvalRuns: number;
+  reviewPendingProposals: number;
+  latestEvalAt?: string;
+  latestProposalAt?: string;
+}
+
+export interface KmEvalTarget {
+  sourceKind: 'distillation-job' | 'retrieval-run' | 'prompt-injection' | 'memory-policy-decision' | 'workflow-artifact';
+  targetType: 'turn' | 'workflow-artifact' | 'knowledge' | 'memory' | 'skill' | 'sync-batch' | 'proposal';
+  targetId: string;
+  sourceRef: { kind: 'sqlite-row' | 'workflow-artifact'; ref: string; sha256?: string | null };
+  payload: Record<string, unknown>;
+}
+
+export interface KmEvalMetricWindow {
+  metricKey: string;
+  totalCount: number;
+  passCount: number;
+  warnCount: number;
+  failCount: number;
+  failRatio: number;
+  failedTargetIds: string[];
+  evidenceRefs: unknown[];
+  windowHash: string;
+}
+
 export interface KnowledgeExportDryRun {
   knowledgeId: string;
   targetLayer: KnowledgeLayer;
@@ -757,6 +792,28 @@ const BUILTIN_KM_PROVIDER_DESCRIPTORS: readonly KmProviderDescriptor[] = [
     deterministic: true,
     supportsShadow: true,
     maxBatchSize: 50,
+  },
+  {
+    id: 'km-quality-evaluators-v1',
+    kind: 'evaluator',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['artifact-completeness', 'distillation-quality', 'retrieval-quality', 'memory-policy-quality', 'local-only'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 100,
+  },
+  {
+    id: 'km-evolution-planner-v1',
+    kind: 'evolution-planner',
+    version: '1',
+    contractVersion: 1,
+    capabilities: ['review-pending-only', 'threshold-gated', 'dedupe-by-evidence-window', 'no-auto-apply'],
+    execution: 'in-process',
+    deterministic: true,
+    supportsShadow: true,
+    maxBatchSize: 25,
   },
 ];
 
@@ -1407,6 +1464,177 @@ export class ObservationStore {
     return id;
   }
 
+  listPendingEvalTargets(input: { limit: number }): KmEvalTarget[] {
+    const limit = Math.max(1, Math.min(input.limit, 500));
+    const targets: KmEvalTarget[] = [];
+    const push = (target: KmEvalTarget): void => {
+      if (targets.length < limit) targets.push(target);
+    };
+
+    const distillationRows = this.db.prepare(`
+      SELECT job_id,source_event_id,bot_app_id,profile_id,profile_revision,state,attempts,last_error,output_hash,created_at,updated_at
+      FROM distillation_jobs j
+      WHERE state IN ('completed','inconclusive','failed','quarantined')
+        AND NOT EXISTS (
+          SELECT 1 FROM eval_runs r
+          WHERE r.evaluator_name='km.distillation-quality' AND r.evaluator_version='v1'
+            AND r.target_type='turn' AND r.target_id=j.job_id
+        )
+      ORDER BY updated_at ASC,job_id ASC LIMIT ?
+    `).all(limit) as any[];
+    for (const row of distillationRows) push({
+      sourceKind: 'distillation-job',
+      targetType: 'turn',
+      targetId: row.job_id,
+      sourceRef: { kind: 'sqlite-row', ref: `distillation_jobs:${row.job_id}` },
+      payload: {
+        jobId: row.job_id,
+        sourceEventId: row.source_event_id,
+        botAppId: row.bot_app_id,
+        profileId: row.profile_id,
+        profileRevision: row.profile_revision,
+        state: row.state,
+        attempts: Number(row.attempts),
+        ...(row.last_error ? { lastError: row.last_error } : {}),
+        ...(row.output_hash ? { outputHash: row.output_hash } : {}),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      },
+    });
+
+    if (targets.length >= limit) return targets;
+    const retrievalRows = this.db.prepare(`
+      SELECT retrieval_run_id,bot_app_id,session_id,turn_id,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at
+      FROM retrieval_runs q
+      WHERE NOT EXISTS (
+        SELECT 1 FROM eval_runs r
+        WHERE r.evaluator_name='km.retrieval-quality' AND r.evaluator_version='v1'
+          AND r.target_type='turn' AND r.target_id=q.retrieval_run_id
+      )
+      ORDER BY created_at ASC,retrieval_run_id ASC LIMIT ?
+    `).all(limit - targets.length) as any[];
+    for (const row of retrievalRows) push({
+      sourceKind: 'retrieval-run',
+      targetType: 'turn',
+      targetId: row.retrieval_run_id,
+      sourceRef: { kind: 'sqlite-row', ref: `retrieval_runs:${row.retrieval_run_id}` },
+      payload: {
+        retrievalRunId: row.retrieval_run_id,
+        botAppId: row.bot_app_id,
+        sessionId: row.session_id,
+        ...(row.turn_id ? { turnId: row.turn_id } : {}),
+        mode: row.mode,
+        candidateCount: Number(row.candidate_count),
+        eligibleCount: Number(row.eligible_count),
+        latencyMs: Number(row.latency_ms),
+        warnings: JSON.parse(row.warnings_json),
+        createdAt: row.created_at,
+      },
+    });
+
+    if (targets.length >= limit) return targets;
+    const injectionRows = this.db.prepare(`
+      SELECT snapshot_id,retrieval_run_id,bot_app_id,mode,requested_mode,effective_mode,disposition,item_ids_json,prompt_hash,prompt_bytes,reason,created_at
+      FROM prompt_injection_snapshots s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM eval_runs r
+        WHERE r.evaluator_name='km.injection-safety' AND r.evaluator_version='v1'
+          AND r.target_type='turn' AND r.target_id=s.snapshot_id
+      )
+      ORDER BY created_at ASC,snapshot_id ASC LIMIT ?
+    `).all(limit - targets.length) as any[];
+    for (const row of injectionRows) push({
+      sourceKind: 'prompt-injection',
+      targetType: 'turn',
+      targetId: row.snapshot_id,
+      sourceRef: { kind: 'sqlite-row', ref: `prompt_injection_snapshots:${row.snapshot_id}` },
+      payload: {
+        snapshotId: row.snapshot_id,
+        retrievalRunId: row.retrieval_run_id,
+        botAppId: row.bot_app_id,
+        mode: row.mode,
+        requestedMode: row.requested_mode ?? row.mode,
+        effectiveMode: row.effective_mode ?? row.mode,
+        disposition: row.disposition,
+        itemIds: JSON.parse(row.item_ids_json),
+        ...(row.prompt_hash ? { promptHash: row.prompt_hash } : {}),
+        promptBytes: Number(row.prompt_bytes),
+        ...(row.reason ? { reason: row.reason } : {}),
+        createdAt: row.created_at,
+      },
+    });
+
+    if (targets.length >= limit) return targets;
+    const memoryRows = this.db.prepare(`
+      SELECT decision_id,source_event_id,memory_id,policy_version,disposition,reason_codes_json,evidence_json,created_at
+      FROM km_memory_policy_decisions d
+      WHERE NOT EXISTS (
+        SELECT 1 FROM eval_runs r
+        WHERE r.evaluator_name='km.memory-policy-quality' AND r.evaluator_version='v1'
+          AND r.target_type='memory' AND r.target_id=d.decision_id
+      )
+      ORDER BY created_at ASC,decision_id ASC LIMIT ?
+    `).all(limit - targets.length) as any[];
+    for (const row of memoryRows) push({
+      sourceKind: 'memory-policy-decision',
+      targetType: 'memory',
+      targetId: row.decision_id,
+      sourceRef: { kind: 'sqlite-row', ref: `km_memory_policy_decisions:${row.decision_id}` },
+      payload: {
+        decisionId: row.decision_id,
+        sourceEventId: row.source_event_id,
+        ...(row.memory_id ? { memoryId: row.memory_id } : {}),
+        policyVersion: row.policy_version,
+        disposition: row.disposition,
+        reasonCodes: JSON.parse(row.reason_codes_json),
+        evidence: JSON.parse(row.evidence_json),
+        createdAt: row.created_at,
+      },
+    });
+
+    if (targets.length >= limit) return targets;
+    const artifactRows = this.db.prepare(`
+      SELECT event_id,event_json
+      FROM observation_events o
+      WHERE event_type='workflow.artifact.produced'
+        AND NOT EXISTS (
+          SELECT 1 FROM eval_runs r
+          WHERE r.evaluator_name='km.workflow-artifact-quality' AND r.evaluator_version='v1'
+            AND r.target_type='workflow-artifact' AND r.target_id=o.event_id
+        )
+      ORDER BY local_seq ASC,event_id ASC LIMIT ?
+    `).all(limit - targets.length) as any[];
+    for (const row of artifactRows) {
+      const event = ObservationEventSchema.parse(JSON.parse(row.event_json));
+      push({
+        sourceKind: 'workflow-artifact',
+        targetType: 'workflow-artifact',
+        targetId: row.event_id,
+        sourceRef: {
+          kind: 'workflow-artifact',
+          ref: String(event.provenance.sourceRefs[0]?.ref ?? row.event_id),
+          sha256: event.content.hash,
+        },
+        payload: {
+          eventId: event.eventId,
+          botAppId: event.identity.botAppId,
+          sessionId: event.identity.sessionId,
+          workflowId: event.identity.workflowId,
+          nodeId: event.identity.nodeId,
+          attemptId: event.identity.attemptId,
+          outputKey: event.payload.outputKey,
+          path: event.payload.path,
+          kind: event.payload.kind,
+          bytes: event.payload.bytes,
+          sha256: typeof event.content.hash === 'string' ? event.content.hash.replace(/^sha256:/u, '') : undefined,
+          promptRequirements: Array.isArray(event.payload.promptRequirements) ? event.payload.promptRequirements : [],
+          coveredRequirements: Array.isArray(event.payload.coveredRequirements) ? event.payload.coveredRequirements : [],
+        },
+      });
+    }
+    return targets;
+  }
+
   getMemory(memoryId: string): MemoryItem | null {
     const row = this.db.prepare('SELECT * FROM memory_items WHERE memory_id=?').get(memoryId) as any;
     return row ? this.memoryFromRow(row) : null;
@@ -1576,6 +1804,28 @@ export class ObservationStore {
       createdAt: row.created_at, updatedAt: row.updated_at }));
   }
 
+  evalEvolutionStatus(): KmEvalEvolutionStatus {
+    const evalRow = this.db.prepare(`
+      SELECT COUNT(*) eval_runs,
+        SUM(CASE WHEN EXISTS (
+          SELECT 1 FROM eval_results x WHERE x.eval_run_id=r.eval_run_id AND x.verdict='fail'
+        ) THEN 1 ELSE 0 END) failing_eval_runs,
+        MAX(r.updated_at) latest_eval_at
+      FROM eval_runs r
+    `).get() as any;
+    const proposalRow = this.db.prepare(`
+      SELECT COUNT(*) review_pending_proposals,MAX(updated_at) latest_proposal_at
+      FROM evolution_proposals WHERE state='review_pending'
+    `).get() as any;
+    return {
+      evalRuns: Number(evalRow.eval_runs ?? 0),
+      failingEvalRuns: Number(evalRow.failing_eval_runs ?? 0),
+      reviewPendingProposals: Number(proposalRow.review_pending_proposals ?? 0),
+      ...(evalRow.latest_eval_at ? { latestEvalAt: String(evalRow.latest_eval_at) } : {}),
+      ...(proposalRow.latest_proposal_at ? { latestProposalAt: String(proposalRow.latest_proposal_at) } : {}),
+    };
+  }
+
   createEvolutionProposal(input: EvolutionProposalInput): string {
     if (input.evidenceRefs.length === 0) throw new Error('km_evolution_evidence_required');
     const now = new Date().toISOString();
@@ -1588,6 +1838,22 @@ export class ObservationStore {
       JSON.stringify(input.evidenceRefs), JSON.stringify(input.proposedAction), JSON.stringify(input.risk),
       JSON.stringify(input.rollback), requireText(input.createdBy, 'proposal_creator'), now, now);
     return proposalId;
+  }
+
+  findReviewPendingEvolutionProposal(input: { proposalType: EvolutionProposalInput['proposalType']; targetRef: string; evidenceRefs: unknown[]; proposedAction: Record<string, unknown> }): string | undefined {
+    const evidence = JSON.stringify(input.evidenceRefs);
+    const action = JSON.stringify(input.proposedAction);
+    const row = this.db.prepare(`SELECT proposal_id FROM evolution_proposals
+      WHERE state='review_pending' AND proposal_type=? AND target_ref=? AND evidence_refs_json=? AND proposed_action_json=?
+      ORDER BY created_at DESC,proposal_id DESC LIMIT 1`)
+      .get(input.proposalType, input.targetRef, evidence, action) as { proposal_id: string } | undefined;
+    return row?.proposal_id;
+  }
+
+  createEvolutionProposalOnce(input: EvolutionProposalInput): { proposalId: string; created: boolean } {
+    const existing = this.findReviewPendingEvolutionProposal(input);
+    if (existing) return { proposalId: existing, created: false };
+    return { proposalId: this.createEvolutionProposal(input), created: true };
   }
 
   decideProposal(input: {
@@ -1954,6 +2220,56 @@ export class ObservationStore {
       filteredState: Number(row.filtered_state ?? 0), avgLatencyMs: Math.round(Number(row.avg_latency_ms ?? 0)) };
   }
 
+  evalMetricWindows(input: { metricKeys: string[]; minCount: number; sinceEvalRunId?: string }): KmEvalMetricWindow[] {
+    if (input.metricKeys.length === 0) return [];
+    const placeholders = input.metricKeys.map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT r.eval_run_id,r.target_type,r.target_id,x.metric_key,x.verdict,x.source_refs_json
+      FROM eval_runs r JOIN eval_results x ON x.eval_run_id=r.eval_run_id
+      WHERE r.state='accepted' AND x.metric_key IN (${placeholders})
+      ORDER BY r.updated_at DESC,r.eval_run_id DESC
+      LIMIT 1000
+    `).all(...input.metricKeys) as any[];
+    const grouped = new Map<string, { totalCount: number; passCount: number; warnCount: number; failCount: number; failedTargetIds: string[]; evidenceRefs: unknown[] }>();
+    for (const row of rows) {
+      const group = grouped.get(row.metric_key) ?? { totalCount: 0, passCount: 0, warnCount: 0, failCount: 0, failedTargetIds: [], evidenceRefs: [] };
+      group.totalCount += 1;
+      if (row.verdict === 'pass') group.passCount += 1;
+      else if (row.verdict === 'warn') group.warnCount += 1;
+      else if (row.verdict === 'fail') {
+        group.failCount += 1;
+        if (group.failedTargetIds.length < 20) group.failedTargetIds.push(String(row.target_id));
+      }
+      const refs = parseJsonArray(row.source_refs_json);
+      for (const ref of refs) {
+        if (group.evidenceRefs.length < 20) group.evidenceRefs.push(ref);
+      }
+      grouped.set(row.metric_key, group);
+    }
+    return [...grouped.entries()]
+      .filter(([, group]) => group.totalCount >= Math.max(1, input.minCount))
+      .map(([metricKey, group]) => {
+        const windowHash = sha256(JSON.stringify({
+          metricKey,
+          totalCount: group.totalCount,
+          failCount: group.failCount,
+          failedTargetIds: group.failedTargetIds,
+          evidenceRefs: group.evidenceRefs,
+        }));
+        return {
+          metricKey,
+          totalCount: group.totalCount,
+          passCount: group.passCount,
+          warnCount: group.warnCount,
+          failCount: group.failCount,
+          failRatio: group.totalCount === 0 ? 0 : group.failCount / group.totalCount,
+          failedTargetIds: group.failedTargetIds,
+          evidenceRefs: group.evidenceRefs,
+          windowHash,
+        };
+      });
+  }
+
   retrievalRetentionPreview(cutoffIso: string): { cutoff: string; eligibleRuns: number } {
     const cutoff = new Date(cutoffIso); if (!Number.isFinite(cutoff.getTime())) throw new Error('km_retention_cutoff_invalid');
     const normalized = cutoff.toISOString();
@@ -2090,6 +2406,7 @@ export class ObservationStore {
       add('filtered_scope_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_scope_count INTEGER NOT NULL DEFAULT 0;');
       add('filtered_privacy_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_privacy_count INTEGER NOT NULL DEFAULT 0;');
       add('filtered_state_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_state_count INTEGER NOT NULL DEFAULT 0;');
+      this.db.exec(PHASE14_SCHEMA);
       this.db.exec('PRAGMA user_version=14;');
       this.db.exec('COMMIT;');
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }

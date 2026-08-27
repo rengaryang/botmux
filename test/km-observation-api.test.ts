@@ -48,6 +48,7 @@ describe('KM observation dashboard API', () => {
       pragmas: { journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 },
       counts: { observations: 3, quarantined: 1, knowledge: 2, memory: 4 },
       backlog: { queued: 0, retryWait: 0, oldestAgeMs: 0, claimed: 0 },
+      evalEvolution: { evalRuns: 0, failingEvalRuns: 0, reviewPendingProposals: 0 },
       capabilities: { requestedModes: ['off', 'shadow'], effectiveModes: ['off', 'shadow'], livePromptInjection: false, realMemoryTransport: false },
     }]);
     expect(close).toHaveBeenCalledOnce();
