@@ -26,7 +26,7 @@ import {
   type KmRetentionRuntimeStatus,
 } from './retention-policy.js';
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -36,11 +36,20 @@ const KNOWLEDGE_STATES = [
 const MEMORY_STATES = [
   'proposed', 'active', 'stale', 'conflicted', 'shadowed', 'expired', 'revoked', 'purged_local',
 ] as const;
+const KNOWLEDGE_TO_MEMORY_IMPORT_JOB_STATES = [
+  'preview', 'review_pending', 'running', 'completed', 'partial', 'failed',
+] as const;
+const KNOWLEDGE_TO_MEMORY_IMPORT_ITEM_STATES = [
+  'pending', 'imported', 'deduped', 'conflicted', 'skipped', 'failed',
+] as const;
 
 export type KnowledgeState = typeof KNOWLEDGE_STATES[number];
 export type MemoryState = typeof MEMORY_STATES[number];
+export type KnowledgeToMemoryImportJobState = typeof KNOWLEDGE_TO_MEMORY_IMPORT_JOB_STATES[number];
+export type KnowledgeToMemoryImportItemState = typeof KNOWLEDGE_TO_MEMORY_IMPORT_ITEM_STATES[number];
 export type KnowledgeLayer = 'L1' | 'L2' | 'L3' | 'L4' | 'reviewed-only';
 export type MemoryScope = 'user' | 'bot' | 'workspace' | 'project' | 'skill' | 'environment' | 'team';
+export type ImportableMemoryScope = Exclude<MemoryScope, 'user' | 'bot'>;
 export type KmConfidence = 'observed' | 'inferred';
 export type KmPrivacyClass = 'public-to-team' | 'internal' | 'sensitive' | 'secret-reference-only';
 
@@ -272,6 +281,68 @@ const PHASE15_SCHEMA = `
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS km_shadow_readiness_reports_created ON km_shadow_readiness_reports(created_at DESC,report_id DESC);
+`;
+
+const PHASE16_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_import_jobs (
+    job_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('preview','review_pending','running','completed','partial','failed')),
+    config_json TEXT NOT NULL CHECK(json_valid(config_json)),
+    config_hash TEXT NOT NULL,
+    checkpoint TEXT,
+    source_count INTEGER NOT NULL DEFAULT 0,
+    eligible_count INTEGER NOT NULL DEFAULT 0,
+    imported_count INTEGER NOT NULL DEFAULT 0,
+    deduped_count INTEGER NOT NULL DEFAULT 0,
+    conflict_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    outbox_enqueued_count INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    approved_by TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS km_import_jobs_state_updated ON km_import_jobs(state,updated_at DESC,job_id DESC);
+
+  CREATE TABLE IF NOT EXISTS km_import_items (
+    import_item_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES km_import_jobs(job_id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('knowledge_item','markdown_file')),
+    source_id TEXT NOT NULL,
+    source_ref_json TEXT NOT NULL CHECK(json_valid(source_ref_json)),
+    source_hash TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','imported','deduped','conflicted','skipped','failed')),
+    reason_code TEXT,
+    scope TEXT NOT NULL CHECK(scope IN ('workspace','project','skill','environment','team')),
+    subject TEXT NOT NULL,
+    claim_key TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK(confidence IN ('observed','inferred')),
+    privacy_class TEXT NOT NULL CHECK(privacy_class IN ('public-to-team','internal','sensitive','secret-reference-only')),
+    freshness TEXT NOT NULL CHECK(freshness IN ('fresh','stale','purged','unknown')),
+    memory_id TEXT REFERENCES memory_items(memory_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_id,source_kind,source_id,content_hash)
+  );
+  CREATE INDEX IF NOT EXISTS km_import_items_job_state ON km_import_items(job_id,state,import_item_id);
+  CREATE INDEX IF NOT EXISTS km_import_items_target ON km_import_items(scope,subject,claim_key,state);
+
+  CREATE TABLE IF NOT EXISTS km_import_audit (
+    audit_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES km_import_jobs(job_id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    details_json TEXT NOT NULL CHECK(json_valid(details_json)),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_import_audit_job_created ON km_import_audit(job_id,created_at,audit_id);
 `;
 
 const PHASE11_SCHEMA = `
@@ -591,6 +662,112 @@ export interface MemoryBackendBindingCompareReport {
   samples: Array<{ memoryId: string; reason: 'missing' | 'content_hash_mismatch' | 'state_not_active'; fromContentHash?: string; toContentHash?: string; toState?: string }>;
 }
 
+export interface KnowledgeToMemoryImportConfig {
+  source: 'knowledge-items' | 'markdown-files' | 'mixed';
+  allowlistedRoots: string[];
+  markdownFiles?: string[];
+  defaultScope: ImportableMemoryScope;
+  defaultSubject: string;
+  scopeByLayer?: Partial<Record<KnowledgeLayer, ImportableMemoryScope>>;
+  subjectByLayer?: Partial<Record<KnowledgeLayer, string>>;
+  enqueueBackendOutbox?: boolean;
+  backendProviderIds?: string[];
+  batchSize?: number;
+}
+
+export interface KnowledgeToMemoryImportJob {
+  jobId: string;
+  idempotencyKey: string;
+  state: KnowledgeToMemoryImportJobState;
+  config: KnowledgeToMemoryImportConfig;
+  configHash: string;
+  checkpoint?: string;
+  sourceCount: number;
+  eligibleCount: number;
+  importedCount: number;
+  dedupedCount: number;
+  conflictCount: number;
+  skippedCount: number;
+  failedCount: number;
+  outboxEnqueuedCount: number;
+  createdBy: string;
+  approvedBy?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface KnowledgeToMemoryImportItem {
+  importItemId: string;
+  jobId: string;
+  sourceKind: 'knowledge_item' | 'markdown_file';
+  sourceId: string;
+  sourceRef: Record<string, unknown>;
+  sourceHash: string;
+  contentHash: string;
+  state: KnowledgeToMemoryImportItemState;
+  reasonCode?: string;
+  scope: ImportableMemoryScope;
+  subject: string;
+  claimKey: string;
+  claimText: string;
+  confidence: KmConfidence;
+  privacyClass: KmPrivacyClass;
+  freshness: KnowledgeItem['freshness'];
+  memoryId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KnowledgeToMemoryImportItemInput {
+  sourceKind: KnowledgeToMemoryImportItem['sourceKind'];
+  sourceId: string;
+  sourceRef: Record<string, unknown>;
+  sourceHash: string;
+  contentHash: string;
+  state?: KnowledgeToMemoryImportItemState;
+  reasonCode?: string;
+  scope: ImportableMemoryScope;
+  subject: string;
+  claimKey: string;
+  claimText: string;
+  confidence: KmConfidence;
+  privacyClass: KmPrivacyClass;
+  freshness: KnowledgeItem['freshness'];
+}
+
+export interface KnowledgeToMemoryImportStats {
+  sourceCount: number;
+  eligibleCount: number;
+  importedCount: number;
+  dedupedCount: number;
+  conflictCount: number;
+  skippedCount: number;
+  failedCount: number;
+  outboxEnqueuedCount: number;
+}
+
+export interface KnowledgeToMemoryImportPreviewInput {
+  idempotencyKey: string;
+  actorId: string;
+  config: KnowledgeToMemoryImportConfig;
+  items: KnowledgeToMemoryImportItemInput[];
+}
+
+export interface KnowledgeToMemoryImportRunInput {
+  jobId: string;
+  actorId: string;
+  maxItems?: number;
+}
+
+export interface KnowledgeToMemoryImportReport {
+  job: KnowledgeToMemoryImportJob;
+  items: KnowledgeToMemoryImportItem[];
+  audit: Array<{ auditId: string; action: string; actorId: string; details: Record<string, unknown>; createdAt: string }>;
+}
+
 export interface MemoryUpsertInput {
   memoryId?: string;
   state?: 'proposed' | 'active';
@@ -821,7 +998,7 @@ function quarantineId(): string {
   return `q_${randomUUID().replaceAll('-', '')}`;
 }
 
-function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready'): string {
+function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready' | 'kmi' | 'kmii' | 'kmia'): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
@@ -1016,6 +1193,104 @@ function assertReviewedDistillationSourceRefs(sourceRefs: unknown[]): void {
     }
     if (!sourceRef) throw new Error('km_golden_source_ref_required');
   }
+}
+
+function normalizeImportScope(value: unknown, field: string): ImportableMemoryScope {
+  const scope = requireText(String(value ?? ''), field);
+  if (!['workspace','project','skill','environment','team'].includes(scope)) throw new Error(`km_${field}_invalid`);
+  return scope as ImportableMemoryScope;
+}
+
+function normalizeKnowledgeToMemoryImportConfig(input: KnowledgeToMemoryImportConfig): KnowledgeToMemoryImportConfig {
+  const source = input.source;
+  if (!['knowledge-items','markdown-files','mixed'].includes(source)) throw new Error('km_import_source_invalid');
+  const allowlistedRoots = [...new Set(input.allowlistedRoots.map(root => resolve(requireText(root, 'import_allowlisted_root'))))]
+    .sort((a, b) => a.localeCompare(b));
+  if (allowlistedRoots.length === 0) throw new Error('km_import_allowlist_required');
+  const markdownFiles = input.markdownFiles?.map(file => resolve(requireText(file, 'import_markdown_file')))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .sort((a, b) => a.localeCompare(b));
+  const scopeByLayer: KnowledgeToMemoryImportConfig['scopeByLayer'] = {};
+  for (const [layer, scope] of Object.entries(input.scopeByLayer ?? {})) {
+    if (!['L1','L2','L3','L4','reviewed-only'].includes(layer)) throw new Error('km_import_layer_invalid');
+    scopeByLayer[layer as KnowledgeLayer] = normalizeImportScope(scope, 'import_scope_by_layer');
+  }
+  const subjectByLayer: KnowledgeToMemoryImportConfig['subjectByLayer'] = {};
+  for (const [layer, subject] of Object.entries(input.subjectByLayer ?? {})) {
+    if (!['L1','L2','L3','L4','reviewed-only'].includes(layer)) throw new Error('km_import_layer_invalid');
+    subjectByLayer[layer as KnowledgeLayer] = requireText(String(subject), 'import_subject_by_layer');
+  }
+  const backendProviderIds = input.backendProviderIds?.map(provider => requireText(provider, 'import_backend_provider'))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .sort((a, b) => a.localeCompare(b));
+  return {
+    source,
+    allowlistedRoots,
+    ...(markdownFiles ? { markdownFiles } : {}),
+    defaultScope: normalizeImportScope(input.defaultScope, 'import_default_scope'),
+    defaultSubject: requireText(input.defaultSubject, 'import_default_subject'),
+    ...(Object.keys(scopeByLayer).length ? { scopeByLayer } : {}),
+    ...(Object.keys(subjectByLayer).length ? { subjectByLayer } : {}),
+    enqueueBackendOutbox: input.enqueueBackendOutbox === true,
+    ...(backendProviderIds ? { backendProviderIds } : {}),
+    batchSize: Math.max(1, Math.min(input.batchSize ?? 50, 100)),
+  };
+}
+
+function normalizeKnowledgeToMemoryImportItems(
+  jobId: string,
+  items: KnowledgeToMemoryImportItemInput[],
+): Array<KnowledgeToMemoryImportItem & { jobId: string }> {
+  const seen = new Set<string>();
+  const now = new Date().toISOString();
+  const normalized: Array<KnowledgeToMemoryImportItem & { jobId: string }> = [];
+  for (const raw of items) {
+    const sourceKind = raw.sourceKind;
+    if (sourceKind !== 'knowledge_item' && sourceKind !== 'markdown_file') throw new Error('km_import_source_kind_invalid');
+    const sourceId = requireText(raw.sourceId, 'import_source_id');
+    const sourceHash = requireText(raw.sourceHash, 'import_source_hash');
+    const contentHash = requireText(raw.contentHash, 'import_content_hash');
+    const claimKey = requireText(raw.claimKey, 'import_claim_key');
+    const claimText = requireText(raw.claimText, 'import_claim_text');
+    const dedupeKey = `${sourceKind}|${sourceId}|${contentHash}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    const inputState = raw.state ?? 'pending';
+    if (!KNOWLEDGE_TO_MEMORY_IMPORT_ITEM_STATES.includes(inputState)) throw new Error('km_import_item_state_invalid');
+    const state = inputState === 'skipped' || raw.confidence === 'inferred'
+      || raw.privacyClass === 'sensitive' || raw.privacyClass === 'secret-reference-only'
+      || raw.freshness !== 'fresh'
+      ? 'skipped'
+      : inputState;
+    const reasonCode = raw.reasonCode ?? (state === 'skipped'
+      ? raw.confidence === 'inferred' ? 'inferred_not_auto_imported'
+        : raw.privacyClass === 'sensitive' || raw.privacyClass === 'secret-reference-only' ? 'privacy_not_auto_imported'
+          : raw.freshness !== 'fresh' ? 'freshness_not_importable'
+            : 'source_not_importable'
+      : undefined);
+    const importItemId = `kmii_${createHash('sha256').update(`${jobId}|${dedupeKey}`).digest('hex')}`;
+    normalized.push({
+      importItemId,
+      jobId,
+      sourceKind,
+      sourceId,
+      sourceRef: raw.sourceRef,
+      sourceHash,
+      contentHash,
+      state,
+      ...(reasonCode ? { reasonCode } : {}),
+      scope: normalizeImportScope(raw.scope, 'import_item_scope'),
+      subject: requireText(raw.subject, 'import_item_subject'),
+      claimKey,
+      claimText,
+      confidence: raw.confidence,
+      privacyClass: raw.privacyClass,
+      freshness: raw.freshness,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  return normalized;
 }
 
 const KNOWLEDGE_TRANSITIONS: Readonly<Record<KnowledgeState, readonly KnowledgeState[]>> = {
@@ -1222,6 +1497,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 13) this.migrateToPhase13();
     if (this.schemaVersion() < 14) this.migrateToPhase14();
     if (this.schemaVersion() < 15) this.migrateToPhase15();
+    if (this.schemaVersion() < 16) this.migrateToPhase16();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -1740,6 +2016,149 @@ export class ObservationStore {
         nextAttemptAt: row.next_attempt_at, ...(row.claimed_at ? { claimedAt: row.claimed_at } : {}),
         ...(row.last_error ? { lastError: row.last_error } : {}), createdAt: row.created_at, updatedAt: row.updated_at,
       }));
+  }
+
+  createKnowledgeToMemoryImportPreview(input: KnowledgeToMemoryImportPreviewInput): KnowledgeToMemoryImportReport {
+    const actorId = requireText(input.actorId, 'import_actor');
+    const idempotencyKey = requireText(input.idempotencyKey, 'import_idempotency_key');
+    const config = normalizeKnowledgeToMemoryImportConfig(input.config);
+    const configJson = canonicalJsonStringify(config);
+    const configHash = sha256(configJson);
+    const existing = this.db.prepare('SELECT * FROM km_import_jobs WHERE idempotency_key=?').get(idempotencyKey) as any;
+    if (existing) {
+      if (existing.config_hash !== configHash) throw new Error('km_import_idempotency_conflict');
+      return this.getKnowledgeToMemoryImportReport(existing.job_id)!;
+    }
+
+    const now = new Date().toISOString();
+    const jobId = `kmi_${createHash('sha256').update(`${idempotencyKey}|${configHash}`).digest('hex')}`;
+    const normalizedItems = normalizeKnowledgeToMemoryImportItems(jobId, input.items);
+    const stats = this.computeKnowledgeToMemoryImportStats(normalizedItems);
+    this.db.exec('SAVEPOINT km_import_preview;');
+    try {
+      this.db.prepare(`INSERT INTO km_import_jobs(
+        job_id,idempotency_key,state,config_json,config_hash,checkpoint,source_count,eligible_count,imported_count,
+        deduped_count,conflict_count,skipped_count,failed_count,outbox_enqueued_count,created_by,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(jobId, idempotencyKey, 'preview', configJson, configHash, null,
+        stats.sourceCount, stats.eligibleCount, 0, 0, 0, stats.skippedCount, stats.failedCount, 0, actorId, now, now);
+      const insert = this.db.prepare(`INSERT INTO km_import_items(
+        import_item_id,job_id,source_kind,source_id,source_ref_json,source_hash,content_hash,state,reason_code,
+        scope,subject,claim_key,claim_text,confidence,privacy_class,freshness,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const item of normalizedItems) insert.run(item.importItemId, jobId, item.sourceKind, item.sourceId,
+        JSON.stringify(item.sourceRef), item.sourceHash, item.contentHash, item.state, item.reasonCode ?? null,
+        item.scope, item.subject, item.claimKey, item.claimText, item.confidence, item.privacyClass, item.freshness, now, now);
+      this.insertKnowledgeToMemoryImportAudit(jobId, 'preview.created', actorId, {
+        configHash,
+        sourceCount: stats.sourceCount,
+        eligibleCount: stats.eligibleCount,
+        skippedCount: stats.skippedCount,
+      }, now);
+      this.db.exec('RELEASE km_import_preview;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK TO km_import_preview; RELEASE km_import_preview;'); } catch {}
+      throw error;
+    }
+    return this.getKnowledgeToMemoryImportReport(jobId)!;
+  }
+
+  submitKnowledgeToMemoryImportReview(input: { jobId: string; actorId: string }): KnowledgeToMemoryImportJob {
+    const actorId = requireText(input.actorId, 'import_actor');
+    const job = this.getKnowledgeToMemoryImportJob(input.jobId);
+    if (!job) throw new Error('km_import_job_not_found');
+    if (job.state === 'review_pending' || job.state === 'completed' || job.state === 'partial') return job;
+    if (job.state !== 'preview') throw new Error(`km_import_invalid_review_state:${job.state}`);
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_import_review;');
+    try {
+      this.db.prepare(`UPDATE km_import_jobs SET state='review_pending',approved_by=?,updated_at=? WHERE job_id=?`)
+        .run(actorId, now, input.jobId);
+      this.insertKnowledgeToMemoryImportAudit(input.jobId, 'review.approved', actorId, {}, now);
+      this.db.exec('RELEASE km_import_review;');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK TO km_import_review; RELEASE km_import_review;'); } catch {}
+      throw error;
+    }
+    return this.getKnowledgeToMemoryImportJob(input.jobId)!;
+  }
+
+  runKnowledgeToMemoryImport(input: KnowledgeToMemoryImportRunInput): KnowledgeToMemoryImportReport {
+    const actorId = requireText(input.actorId, 'import_actor');
+    const job = this.getKnowledgeToMemoryImportJob(input.jobId);
+    if (!job) throw new Error('km_import_job_not_found');
+    if (job.state === 'completed') return this.getKnowledgeToMemoryImportReport(input.jobId)!;
+    if (!['review_pending','partial','failed','running'].includes(job.state)) throw new Error(`km_import_execution_requires_review:${job.state}`);
+    const config = normalizeKnowledgeToMemoryImportConfig(job.config);
+    const limit = Math.max(1, Math.min(input.maxItems ?? config.batchSize ?? 50, 100));
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_import_run;');
+    try {
+      this.db.prepare(`UPDATE km_import_jobs SET state='running',approved_by=COALESCE(approved_by,?),started_at=COALESCE(started_at,?),updated_at=?,last_error=NULL WHERE job_id=?`)
+        .run(actorId, now, now, input.jobId);
+      this.insertKnowledgeToMemoryImportAudit(input.jobId, 'execution.started', actorId, { limit }, now);
+      const rows = this.db.prepare(`SELECT * FROM km_import_items
+        WHERE job_id=? AND state IN ('pending','failed')
+        ORDER BY import_item_id ASC LIMIT ?`).all(input.jobId, limit) as any[];
+      for (const row of rows) {
+        try {
+          this.applyKnowledgeToMemoryImportItem(row, config, actorId, now);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.markKnowledgeToMemoryImportItem(String(row.import_item_id), 'failed', message.slice(0, 200), undefined, now);
+        }
+      }
+      this.refreshKnowledgeToMemoryImportJob(input.jobId, rows.at(-1)?.import_item_id ? String(rows.at(-1).import_item_id) : job.checkpoint, now);
+      this.insertKnowledgeToMemoryImportAudit(input.jobId, 'execution.finished', actorId, { processed: rows.length }, now);
+      this.db.exec('RELEASE km_import_run;');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        this.db.exec('ROLLBACK TO km_import_run;');
+        this.db.prepare(`UPDATE km_import_jobs SET state='failed',last_error=?,updated_at=? WHERE job_id=?`)
+          .run(message.slice(0, 500), new Date().toISOString(), input.jobId);
+        this.db.exec('RELEASE km_import_run;');
+      } catch {
+        try { this.db.exec('ROLLBACK TO km_import_run; RELEASE km_import_run;'); } catch {}
+      }
+      throw error;
+    }
+    return this.getKnowledgeToMemoryImportReport(input.jobId)!;
+  }
+
+  getKnowledgeToMemoryImportJob(jobId: string): KnowledgeToMemoryImportJob | null {
+    const row = this.db.prepare('SELECT * FROM km_import_jobs WHERE job_id=?').get(jobId) as any;
+    return row ? this.knowledgeToMemoryImportJobFromRow(row) : null;
+  }
+
+  listKnowledgeToMemoryImportJobs(limit: number): KnowledgeToMemoryImportJob[] {
+    const rows = this.db.prepare('SELECT * FROM km_import_jobs ORDER BY updated_at DESC,job_id DESC LIMIT ?')
+      .all(Math.max(1, Math.min(limit, 100))) as any[];
+    return rows.map(row => this.knowledgeToMemoryImportJobFromRow(row));
+  }
+
+  listKnowledgeToMemoryImportItems(input: { jobId: string; limit?: number; state?: KnowledgeToMemoryImportItemState }): KnowledgeToMemoryImportItem[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const rows = input.state
+      ? this.db.prepare(`SELECT * FROM km_import_items WHERE job_id=? AND state=? ORDER BY import_item_id ASC LIMIT ?`).all(input.jobId, input.state, limit) as any[]
+      : this.db.prepare(`SELECT * FROM km_import_items WHERE job_id=? ORDER BY import_item_id ASC LIMIT ?`).all(input.jobId, limit) as any[];
+    return rows.map(row => this.knowledgeToMemoryImportItemFromRow(row));
+  }
+
+  getKnowledgeToMemoryImportReport(jobId: string): KnowledgeToMemoryImportReport | null {
+    const job = this.getKnowledgeToMemoryImportJob(jobId);
+    if (!job) return null;
+    const auditRows = this.db.prepare(`SELECT * FROM km_import_audit WHERE job_id=? ORDER BY created_at ASC,audit_id ASC`).all(jobId) as any[];
+    return {
+      job,
+      items: this.listKnowledgeToMemoryImportItems({ jobId, limit: 500 }),
+      audit: auditRows.map(row => ({
+        auditId: row.audit_id,
+        action: row.action,
+        actorId: row.actor_id,
+        details: parseJsonRecord(row.details_json),
+        createdAt: row.created_at,
+      })),
+    };
   }
 
   listMemoryForBackendMigration(input: { afterMemoryId?: string; limit: number }): MemoryItem[] {
@@ -3102,6 +3521,185 @@ export class ObservationStore {
     };
   }
 
+  private knowledgeToMemoryImportJobFromRow(row: any): KnowledgeToMemoryImportJob {
+    return {
+      jobId: row.job_id,
+      idempotencyKey: row.idempotency_key,
+      state: row.state,
+      config: normalizeKnowledgeToMemoryImportConfig(JSON.parse(row.config_json)),
+      configHash: row.config_hash,
+      ...(row.checkpoint ? { checkpoint: row.checkpoint } : {}),
+      sourceCount: Number(row.source_count),
+      eligibleCount: Number(row.eligible_count),
+      importedCount: Number(row.imported_count),
+      dedupedCount: Number(row.deduped_count),
+      conflictCount: Number(row.conflict_count),
+      skippedCount: Number(row.skipped_count),
+      failedCount: Number(row.failed_count),
+      outboxEnqueuedCount: Number(row.outbox_enqueued_count),
+      createdBy: row.created_by,
+      ...(row.approved_by ? { approvedBy: row.approved_by } : {}),
+      ...(row.last_error ? { lastError: row.last_error } : {}),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      ...(row.started_at ? { startedAt: row.started_at } : {}),
+      ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    };
+  }
+
+  private knowledgeToMemoryImportItemFromRow(row: any): KnowledgeToMemoryImportItem {
+    return {
+      importItemId: row.import_item_id,
+      jobId: row.job_id,
+      sourceKind: row.source_kind,
+      sourceId: row.source_id,
+      sourceRef: parseJsonRecord(row.source_ref_json),
+      sourceHash: row.source_hash,
+      contentHash: row.content_hash,
+      state: row.state,
+      ...(row.reason_code ? { reasonCode: row.reason_code } : {}),
+      scope: row.scope,
+      subject: row.subject,
+      claimKey: row.claim_key,
+      claimText: row.claim_text,
+      confidence: row.confidence,
+      privacyClass: row.privacy_class,
+      freshness: row.freshness,
+      ...(row.memory_id ? { memoryId: row.memory_id } : {}),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private computeKnowledgeToMemoryImportStats(items: Array<Pick<KnowledgeToMemoryImportItem, 'state'>>): KnowledgeToMemoryImportStats {
+    return {
+      sourceCount: items.length,
+      eligibleCount: items.filter(item => item.state === 'pending').length,
+      importedCount: items.filter(item => item.state === 'imported').length,
+      dedupedCount: items.filter(item => item.state === 'deduped').length,
+      conflictCount: items.filter(item => item.state === 'conflicted').length,
+      skippedCount: items.filter(item => item.state === 'skipped').length,
+      failedCount: items.filter(item => item.state === 'failed').length,
+      outboxEnqueuedCount: 0,
+    };
+  }
+
+  private insertKnowledgeToMemoryImportAudit(jobId: string, action: string, actorId: string, details: Record<string, unknown>, now: string): void {
+    this.db.prepare(`INSERT INTO km_import_audit(audit_id,job_id,action,actor_id,details_json,created_at)
+      VALUES(?,?,?,?,?,?)`).run(kmId('kmia'), jobId, action, actorId, JSON.stringify(details), now);
+  }
+
+  private applyKnowledgeToMemoryImportItem(row: any, config: KnowledgeToMemoryImportConfig, actorId: string, now: string): void {
+    const item = this.knowledgeToMemoryImportItemFromRow(row);
+    if (item.state !== 'pending' && item.state !== 'failed') return;
+    if (item.confidence === 'inferred') {
+      this.markKnowledgeToMemoryImportItem(item.importItemId, 'skipped', 'inferred_not_auto_imported', undefined, now);
+      return;
+    }
+    if (item.privacyClass === 'sensitive' || item.privacyClass === 'secret-reference-only') {
+      this.markKnowledgeToMemoryImportItem(item.importItemId, 'skipped', 'privacy_not_auto_imported', undefined, now);
+      return;
+    }
+    if (item.freshness !== 'fresh') {
+      this.markKnowledgeToMemoryImportItem(item.importItemId, 'skipped', 'freshness_not_importable', undefined, now);
+      return;
+    }
+    const existing = this.db.prepare('SELECT * FROM memory_items WHERE scope=? AND subject=? AND claim_key=?')
+      .get(item.scope, item.subject, item.claimKey) as any;
+    if (existing && existing.claim_text === item.claimText) {
+      this.markKnowledgeToMemoryImportItem(item.importItemId, 'deduped', 'identical_claim_exists', existing.memory_id, now);
+      this.insertTraceEdgeInTransaction({ fromType: item.sourceKind, fromId: item.sourceId, toType: 'memory', toId: existing.memory_id, edgeType: 'superseded' }, now);
+      return;
+    }
+    if (existing) {
+      this.markKnowledgeToMemoryImportItem(item.importItemId, 'conflicted', 'active_claim_conflict', existing.memory_id, now);
+      this.insertTraceEdgeInTransaction({ fromType: item.sourceKind, fromId: item.sourceId, toType: 'memory', toId: existing.memory_id, edgeType: 'conflicted' }, now);
+      return;
+    }
+    const memoryId = `mem_${createHash('sha256').update(`${item.scope}|${item.subject}|${item.claimKey}|${item.contentHash}`).digest('hex')}`;
+    const sourceRefs = [{
+      kind: 'km-import',
+      ref: `${item.sourceKind}:${item.sourceId}`,
+      jobId: item.jobId,
+      sourceHash: item.sourceHash,
+      contentHash: item.contentHash,
+      sourceRef: item.sourceRef,
+    }];
+    this.db.prepare(`INSERT INTO memory_items(
+      memory_id,state,scope,subject,claim_key,claim_text,confidence,source_refs_json,
+      ttl_expires_at,review_after,sync_policy,privacy_class,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(memoryId, 'active', item.scope, item.subject, item.claimKey, item.claimText,
+      item.confidence, JSON.stringify(sourceRefs), null, null, 'local-only', item.privacyClass, now, now);
+    this.db.prepare(`INSERT INTO memory_state_history(history_id,memory_id,from_state,to_state,reason_code,actor_id,evidence_event_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?)`).run(kmId('hist'), memoryId, null, 'active', 'km_import_active', actorId, null, now);
+    this.markKnowledgeToMemoryImportItem(item.importItemId, 'imported', 'imported_active', memoryId, now);
+    this.insertTraceEdgeInTransaction({ fromType: item.sourceKind, fromId: item.sourceId, toType: 'memory', toId: memoryId, edgeType: 'produced' }, now);
+    if (config.enqueueBackendOutbox === true) {
+      for (const providerId of config.backendProviderIds ?? []) {
+        const payload = {
+          memoryId,
+          scope: item.scope,
+          subject: item.subject,
+          claimKey: item.claimKey,
+          claimText: item.claimText,
+          contentHash: item.contentHash,
+        };
+        const payloadJson = JSON.stringify(payload);
+        const payloadHash = sha256(payloadJson);
+        const outboxId = `mout_${createHash('sha256').update(`${memoryId}|${providerId}|put|${payloadHash}`).digest('hex')}`;
+        this.db.prepare(`INSERT OR IGNORE INTO memory_backend_outbox(
+          outbox_id,memory_id,provider_id,operation,payload_json,payload_hash,status,next_attempt_at,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(outboxId, memoryId, providerId, 'put', payloadJson, payloadHash, Date.now(), now, now);
+      }
+    }
+  }
+
+  private markKnowledgeToMemoryImportItem(
+    importItemId: string,
+    state: KnowledgeToMemoryImportItemState,
+    reasonCode: string,
+    memoryId: string | undefined,
+    now: string,
+  ): void {
+    this.db.prepare(`UPDATE km_import_items SET state=?,reason_code=?,memory_id=?,updated_at=? WHERE import_item_id=?`)
+      .run(state, reasonCode, memoryId ?? null, now, importItemId);
+  }
+
+  private insertTraceEdgeInTransaction(input: TraceEdgeInput, now: string): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO trace_edges(edge_id,from_type,from_id,to_type,to_id,edge_type,evidence_event_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?)
+    `).run(kmId('edge'), requireText(input.fromType, 'trace_from_type'), requireText(input.fromId, 'trace_from_id'),
+      requireText(input.toType, 'trace_to_type'), requireText(input.toId, 'trace_to_id'), input.edgeType, input.evidenceEventId ?? null, now);
+  }
+
+  private refreshKnowledgeToMemoryImportJob(jobId: string, checkpoint: string | undefined, now: string): void {
+    const row = this.db.prepare(`SELECT
+      COUNT(*) source_count,
+      SUM(CASE WHEN state IN ('pending','imported','deduped','conflicted') THEN 1 ELSE 0 END) eligible_count,
+      SUM(CASE WHEN state='imported' THEN 1 ELSE 0 END) imported_count,
+      SUM(CASE WHEN state='deduped' THEN 1 ELSE 0 END) deduped_count,
+      SUM(CASE WHEN state='conflicted' THEN 1 ELSE 0 END) conflict_count,
+      SUM(CASE WHEN state='skipped' THEN 1 ELSE 0 END) skipped_count,
+      SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END) failed_count,
+      SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END) pending_count
+      FROM km_import_items WHERE job_id=?`).get(jobId) as any;
+    const outbox = this.db.prepare(`SELECT COUNT(*) count FROM memory_backend_outbox
+      WHERE memory_id IN (SELECT memory_id FROM km_import_items WHERE job_id=? AND memory_id IS NOT NULL)`).get(jobId) as any;
+    const pending = Number(row.pending_count ?? 0);
+    const failed = Number(row.failed_count ?? 0);
+    const imported = Number(row.imported_count ?? 0);
+    const deduped = Number(row.deduped_count ?? 0);
+    const conflicted = Number(row.conflict_count ?? 0);
+    const skipped = Number(row.skipped_count ?? 0);
+    const finalState: KnowledgeToMemoryImportJobState = pending > 0 || failed > 0 ? 'partial' : 'completed';
+    const anyOutcome = imported + deduped + conflicted + skipped + failed > 0;
+    this.db.prepare(`UPDATE km_import_jobs SET state=?,checkpoint=?,source_count=?,eligible_count=?,imported_count=?,deduped_count=?,
+      conflict_count=?,skipped_count=?,failed_count=?,outbox_enqueued_count=?,updated_at=?,completed_at=? WHERE job_id=?`)
+      .run(finalState, checkpoint ?? null, Number(row.source_count ?? 0), Number(row.eligible_count ?? 0), imported, deduped,
+        conflicted, skipped, failed, Number(outbox.count ?? 0), now, finalState === 'completed' && anyOutcome ? now : null, jobId);
+  }
+
   private goldenCaseFromRow(row: any): KmGoldenCase {
     return {
       caseId: row.case_id,
@@ -3301,6 +3899,16 @@ export class ObservationStore {
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
+  private migrateToPhase16(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 16) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE16_SCHEMA);
+      this.db.exec('PRAGMA user_version=16;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
   private migrateToPhase11(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -3439,6 +4047,9 @@ export class ObservationStore {
       'km_shadow_comparisons',
       'km_shadow_review_labels',
       'km_shadow_readiness_reports',
+      'km_import_jobs',
+      'km_import_items',
+      'km_import_audit',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

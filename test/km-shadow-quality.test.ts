@@ -43,7 +43,7 @@ describe('KM golden set and Pi shadow quality', () => {
   it('migrates schema v15 and keeps the shadow quality scheduler default-off', async () => {
     const dir = tempDir();
     const store = await ObservationStore.open(dir);
-    expect(store.schemaVersion()).toBe(15);
+    expect(store.schemaVersion()).toBe(16);
     store.close();
     expect(isKmShadowQualityEnabled({} as NodeJS.ProcessEnv)).toBe(false);
     await expect(runKmShadowQualityOnce({ dataDir: dir, env: {} as NodeJS.ProcessEnv })).resolves.toEqual({
