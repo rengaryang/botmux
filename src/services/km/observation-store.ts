@@ -10,8 +10,22 @@ import {
   type ObservationEventType,
 } from './observation-schema.js';
 import { normalizeRetrievalQuery, scoreNormalizedQuery } from './retrieval-quality.js';
+import {
+  DEFAULT_RETENTION_POLICIES,
+  KM_RETENTION_POLICY_VERSION,
+  ageDays,
+  buildRetentionSloMetrics,
+  finalizeRetentionPlan,
+  totalEligible,
+  worstSloState,
+  type KmRetentionDomain,
+  type KmRetentionDomainPreview,
+  type KmRetentionPlan,
+  type KmRetentionReportSummary,
+  type KmRetentionRuntimeStatus,
+} from './retention-policy.js';
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -181,6 +195,19 @@ const PHASE14_SCHEMA = `
   CREATE INDEX IF NOT EXISTS evolution_proposals_review_dedupe ON evolution_proposals(
     state,proposal_type,target_ref,evidence_refs_json,proposed_action_json
   );
+`;
+
+const PHASE15_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_retention_reports (
+    report_id TEXT PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    holder_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    plan_json TEXT NOT NULL CHECK(json_valid(plan_json)),
+    report_hash TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_retention_reports_completed ON km_retention_reports(completed_at DESC,report_id DESC);
 `;
 
 const PHASE11_SCHEMA = `
@@ -634,6 +661,11 @@ function sha256(value: string): string {
   return `sha256:${createHash('sha256').update(value).digest('hex')}`;
 }
 
+function fileBytes(path: string): number {
+  try { return lstatSync(path).size; }
+  catch { return 0; }
+}
+
 function payloadHash(event: ObservationEvent): string {
   return sha256(JSON.stringify(event.payload));
 }
@@ -655,6 +687,147 @@ function requireText(value: string, field: string): string {
 function parseJsonArray(value: string): unknown[] {
   const parsed = JSON.parse(value);
   return Array.isArray(parsed) ? parsed : [];
+}
+
+interface RetentionDomainSpec {
+  table: string;
+  idColumn: string;
+  ageColumn: string;
+  protectedReasons: Record<string, string>;
+}
+
+interface OutboxStatusCounts {
+  pending: number;
+  inflight: number;
+  failed: number;
+}
+
+function retentionSpec(domain: KmRetentionDomain): RetentionDomainSpec {
+  const legalHold = (column: string) => `(${column} LIKE '%\"legalHold\":true%' OR ${column} LIKE '%\"legal_hold\"%' OR ${column} LIKE '%legal-hold%')`;
+  switch (domain) {
+    case 'observations':
+      return {
+        table: 'observation_events',
+        idColumn: 'event_id',
+        ageColumn: 'created_at',
+        protectedReasons: {
+          legal_hold: legalHold('event_json'),
+          referenced_evidence: `event_id IN (SELECT parent_event_id FROM observation_parents)
+            OR event_id IN (SELECT source_event_id FROM distillation_jobs)
+            OR event_id IN (SELECT evidence_event_id FROM trace_edges WHERE evidence_event_id IS NOT NULL)`,
+          quarantine_evidence: 'event_id IN (SELECT event_id FROM quarantine_events)',
+        },
+      };
+    case 'knowledge':
+      return {
+        table: 'knowledge_items',
+        idColumn: 'knowledge_id',
+        ageColumn: 'updated_at',
+        protectedReasons: {
+          active_review_state: `state IN ('approved','exported','review_pending','candidate','conflict')`,
+          legal_hold: legalHold('source_refs_json'),
+        },
+      };
+    case 'memory':
+      return {
+        table: 'memory_items',
+        idColumn: 'memory_id',
+        ageColumn: 'updated_at',
+        protectedReasons: {
+          active_or_pending: `state IN ('active','proposed','conflicted')`,
+          legal_hold: legalHold('source_refs_json'),
+        },
+      };
+    case 'retrieval':
+      return {
+        table: 'retrieval_runs',
+        idColumn: 'retrieval_run_id',
+        ageColumn: 'created_at',
+        protectedReasons: {
+          referenced_by_injection: 'retrieval_run_id IN (SELECT retrieval_run_id FROM prompt_injection_snapshots)',
+          referenced_by_eval: `retrieval_run_id IN (SELECT target_id FROM eval_runs
+            WHERE evaluator_name='km.retrieval-quality' AND target_type='turn')`,
+        },
+      };
+    case 'injection':
+      return {
+        table: 'prompt_injection_snapshots',
+        idColumn: 'snapshot_id',
+        ageColumn: 'created_at',
+        protectedReasons: {
+          injected_live: `disposition='injected'`,
+          referenced_by_eval: `snapshot_id IN (SELECT target_id FROM eval_runs
+            WHERE evaluator_name='km.injection-safety' AND target_type='turn')`,
+        },
+      };
+    case 'trace':
+      return {
+        table: 'trace_edges',
+        idColumn: 'edge_id',
+        ageColumn: 'created_at',
+        protectedReasons: {
+          causal_evidence: 'evidence_event_id IS NOT NULL',
+          active_decision: `edge_type IN ('approved','conflicted','synced')`,
+        },
+      };
+    case 'eval':
+      return {
+        table: 'eval_runs',
+        idColumn: 'eval_run_id',
+        ageColumn: 'updated_at',
+        protectedReasons: {
+          active_or_quality_evidence: `state IN ('queued','running','accepted')`,
+        },
+      };
+    case 'evolution':
+      return {
+        table: 'evolution_proposals',
+        idColumn: 'proposal_id',
+        ageColumn: 'updated_at',
+        protectedReasons: {
+          active_or_approved: `state IN ('review_pending','approved','executing','applied','verified')`,
+          legal_hold: legalHold('evidence_refs_json') + ` OR ${legalHold('risk_json')} OR ${legalHold('rollback_json')}`,
+        },
+      };
+    case 'distillation':
+      return {
+        table: 'distillation_jobs',
+        idColumn: 'job_id',
+        ageColumn: 'updated_at',
+        protectedReasons: {
+          active_pending_or_retry: `state IN ('queued','resolving','extracting','normalizing','gating','persisted','retry_wait','quarantined')`,
+          source_evidence: 'source_event_id IN (SELECT event_id FROM observation_events)',
+          legal_hold: legalHold('evidence_context_json'),
+        },
+      };
+    case 'sync-outbox':
+      return {
+        table: 'sync_outbox',
+        idColumn: 'outbox_id',
+        ageColumn: 'created_at',
+        protectedReasons: {
+          pending_inflight_retry_or_quarantine: `status IN ('pending','inflight','failed','quarantined')`,
+        },
+      };
+    case 'backend-outbox':
+      return {
+        table: 'memory_backend_outbox',
+        idColumn: 'outbox_id',
+        ageColumn: 'updated_at',
+        protectedReasons: {
+          pending_inflight_retry_or_quarantine: `status IN ('pending','inflight','failed','quarantined')`,
+        },
+      };
+    case 'quarantine-evidence':
+      return {
+        table: 'quarantine_events',
+        idColumn: 'quarantine_id',
+        ageColumn: 'created_at',
+        protectedReasons: {
+          all_quarantine_evidence: '1=1',
+        },
+      };
+  }
 }
 
 const KNOWLEDGE_TRANSITIONS: Readonly<Record<KnowledgeState, readonly KnowledgeState[]>> = {
@@ -849,6 +1022,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 12) this.migrateToPhase12();
     if (this.schemaVersion() < 13) this.migrateToPhase13();
     if (this.schemaVersion() < 14) this.migrateToPhase14();
+    if (this.schemaVersion() < 15) this.migrateToPhase15();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -2274,22 +2448,220 @@ export class ObservationStore {
   retrievalRetentionPreview(cutoffIso: string): { cutoff: string; eligibleRuns: number } {
     const cutoff = new Date(cutoffIso); if (!Number.isFinite(cutoff.getTime())) throw new Error('km_retention_cutoff_invalid');
     const normalized = cutoff.toISOString();
-    const row = this.db.prepare(`SELECT COUNT(*) count FROM retrieval_runs WHERE created_at<?`).get(normalized) as any;
+    const spec = retentionSpec('retrieval');
+    const protectedSql = this.retentionProtectedSql(spec);
+    const row = this.db.prepare(`SELECT COUNT(*) count FROM retrieval_runs WHERE created_at<? AND NOT (${protectedSql})`).get(normalized) as any;
     return { cutoff: normalized, eligibleRuns: Number(row.count ?? 0) };
   }
 
-  purgeRetrievalAudit(input: { cutoffIso: string; expectedEligibleRuns: number; actorId: string; reason: string }): number {
-    const preview = this.retrievalRetentionPreview(input.cutoffIso);
-    if (preview.eligibleRuns !== input.expectedEligibleRuns) throw new Error('km_retention_preview_conflict');
-    requireText(input.actorId,'retention_actor'); requireText(input.reason,'retention_reason');
-    this.db.exec('BEGIN IMMEDIATE;');
-    try {
-      const changes = Number(this.db.prepare(`DELETE FROM retrieval_runs WHERE created_at<?`).run(preview.cutoff).changes);
-      this.db.prepare(`INSERT INTO km_config_audit(audit_id,actor_id,action,target_ref,before_hash,after_hash,request_hash,idempotency_key,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?)`).run(`kma_${randomUUID().replaceAll('-', '')}`,input.actorId,'retrieval.retention_purge',preview.cutoff,null,null,
-        sha256(JSON.stringify({ expectedEligibleRuns: input.expectedEligibleRuns, reason: input.reason })),'retention-worker',new Date().toISOString());
-      this.db.exec('COMMIT;'); return changes;
-    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  kmRetentionPreview(input: { now?: number; sampleLimit?: number } = {}): KmRetentionPlan {
+    const now = input.now ?? Date.now();
+    const generatedAt = new Date(now).toISOString();
+    const sampleLimit = Math.max(0, Math.min(input.sampleLimit ?? 10, 50));
+    const domains = Object.keys(DEFAULT_RETENTION_POLICIES)
+      .map(domain => this.retentionDomainPreview(domain as KmRetentionDomain, now, sampleLimit));
+    const dbBytes = fileBytes(this.path);
+    const walBytes = fileBytes(`${this.path}-wal`);
+    const backlog = this.distillationBacklogStatus(now);
+    const syncOutbox = this.outboxStatusCounts('sync_outbox');
+    const backendOutbox = this.outboxStatusCounts('memory_backend_outbox');
+    const quarantine = this.quarantineCounts();
+    const providerQuality = this.providerQuality();
+    const retrievalQuality = this.retrievalQualitySummary();
+    const slo = buildRetentionSloMetrics({
+      dbBytes,
+      walBytes,
+      distillationOldestAgeMs: backlog.oldestAgeMs,
+      syncPending: syncOutbox.pending,
+      syncInflight: syncOutbox.inflight,
+      syncFailed: syncOutbox.failed,
+      backendPending: backendOutbox.pending,
+      backendInflight: backendOutbox.inflight,
+      backendFailed: backendOutbox.failed,
+      observationQuarantine: quarantine.observations,
+      syncQuarantine: quarantine.sync,
+      backendQuarantine: quarantine.backend,
+      unavailableProviders: providerQuality.unavailableProviders,
+      retrievalRuns: retrievalQuality.runs,
+      retrievalZeroHits: retrievalQuality.zeroHits,
+      retrievalAvgLatencyMs: retrievalQuality.avgLatencyMs,
+    });
+    return finalizeRetentionPlan({
+      policyVersion: KM_RETENTION_POLICY_VERSION,
+      generatedAt,
+      dryRunOnly: true,
+      destructiveActionsAvailable: false,
+      domains,
+      db: { dbBytes, walBytes, totalBytes: dbBytes + walBytes },
+      operational: {
+        backlog: {
+          distillationQueued: backlog.queued,
+          distillationRetryWait: backlog.retryWait,
+          distillationOldestAgeMs: backlog.oldestAgeMs,
+          distillationClaimed: backlog.claimed,
+          syncPending: syncOutbox.pending,
+          syncInflight: syncOutbox.inflight,
+          syncFailed: syncOutbox.failed,
+          backendPending: backendOutbox.pending,
+          backendInflight: backendOutbox.inflight,
+          backendFailed: backendOutbox.failed,
+        },
+        quarantine,
+        retry: {
+          distillationRetryWait: backlog.retryWait,
+          syncFailed: syncOutbox.failed,
+          backendFailed: backendOutbox.failed,
+        },
+        providerQuality,
+        retrievalQuality,
+      },
+      slo,
+    });
+  }
+
+  recordKmRetentionShadowReport(input: { holderId: string; now?: number; sampleLimit?: number }): KmRetentionReportSummary {
+    const startedAt = new Date(input.now ?? Date.now()).toISOString();
+    const plan = this.kmRetentionPreview({ now: input.now, sampleLimit: input.sampleLimit });
+    const completedAt = plan.generatedAt;
+    const reportId = `kmret_${createHash('sha256').update(`${input.holderId}|${plan.planHash}|${completedAt}`).digest('hex')}`;
+    this.db.prepare(`INSERT OR IGNORE INTO km_retention_reports(report_id,policy_version,holder_id,started_at,completed_at,plan_json,report_hash)
+      VALUES(?,?,?,?,?,?,?)`).run(reportId, plan.policyVersion, requireText(input.holderId, 'retention_holder'),
+      startedAt, completedAt, JSON.stringify(plan), plan.planHash);
+    return {
+      reportId,
+      policyVersion: plan.policyVersion,
+      holderId: input.holderId,
+      startedAt,
+      completedAt,
+      reportHash: plan.planHash,
+      totalEligible: totalEligible(plan),
+      worstSloState: worstSloState(plan.slo),
+    };
+  }
+
+  kmRetentionStatus(input: { enabled?: boolean; leaseName?: string; now?: number; reportLimit?: number; sampleLimit?: number } = {}): KmRetentionRuntimeStatus {
+    const reports = this.listKmRetentionReports(input.reportLimit ?? 30);
+    return {
+      enabled: Boolean(input.enabled),
+      leaseName: input.leaseName ?? 'km-retention-shadow',
+      latestPlan: this.kmRetentionPreview({ now: input.now, sampleLimit: input.sampleLimit }),
+      reports,
+      trend: reports.map(report => {
+        const row = this.db.prepare('SELECT plan_json FROM km_retention_reports WHERE report_id=?').get(report.reportId) as { plan_json: string } | undefined;
+        const plan = row ? JSON.parse(row.plan_json) as KmRetentionPlan : undefined;
+        return {
+          reportId: report.reportId,
+          completedAt: report.completedAt,
+          totalEligible: report.totalEligible,
+          worstSloState: report.worstSloState,
+          dbBytes: plan?.db.dbBytes ?? 0,
+          walBytes: plan?.db.walBytes ?? 0,
+        };
+      }),
+    };
+  }
+
+  listKmRetentionReports(limit: number): KmRetentionReportSummary[] {
+    const rows = this.db.prepare(`SELECT report_id,policy_version,holder_id,started_at,completed_at,plan_json,report_hash
+      FROM km_retention_reports ORDER BY completed_at DESC,report_id DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 100))) as any[];
+    return rows.map(row => {
+      const plan = JSON.parse(row.plan_json) as KmRetentionPlan;
+      return {
+        reportId: row.report_id,
+        policyVersion: row.policy_version,
+        holderId: row.holder_id,
+        startedAt: row.started_at,
+        completedAt: row.completed_at,
+        reportHash: row.report_hash,
+        totalEligible: totalEligible(plan),
+        worstSloState: worstSloState(plan.slo),
+      };
+    });
+  }
+
+  private retentionDomainPreview(domain: KmRetentionDomain, nowMs: number, sampleLimit: number): KmRetentionDomainPreview {
+    const policy = DEFAULT_RETENTION_POLICIES[domain];
+    const spec = retentionSpec(domain);
+    const cutoff = new Date(nowMs - policy.retentionDays * 86_400_000).toISOString();
+    const protectedSql = this.retentionProtectedSql(spec);
+    const total = this.db.prepare(`SELECT COUNT(*) count FROM ${spec.table}`).get() as any;
+    const oldest = this.db.prepare(`SELECT MIN(${spec.ageColumn}) oldest FROM ${spec.table}`).get() as any;
+    const protectedCount = this.db.prepare(`SELECT COUNT(*) count FROM ${spec.table} WHERE ${protectedSql}`).get() as any;
+    const eligible = this.db.prepare(`SELECT COUNT(*) count FROM ${spec.table} WHERE ${spec.ageColumn}<? AND NOT (${protectedSql})`).get(cutoff) as any;
+    const eligibleRows = this.db.prepare(`SELECT ${spec.idColumn} id,${spec.ageColumn} created_at FROM ${spec.table}
+      WHERE ${spec.ageColumn}<? AND NOT (${protectedSql}) ORDER BY ${spec.ageColumn} ASC,${spec.idColumn} ASC LIMIT ?`)
+      .all(cutoff, sampleLimit) as any[];
+    const oldestEligible = this.db.prepare(`SELECT MIN(${spec.ageColumn}) oldest FROM ${spec.table}
+      WHERE ${spec.ageColumn}<? AND NOT (${protectedSql})`).get(cutoff) as any;
+    return {
+      domain,
+      table: spec.table,
+      tier: policy.tier,
+      retentionDays: policy.retentionDays,
+      cutoff,
+      totalCount: Number(total.count ?? 0),
+      eligibleCount: Number(eligible.count ?? 0),
+      protectedCount: Number(protectedCount.count ?? 0),
+      oldestRecordAgeDays: ageDays(nowMs, oldest.oldest ? String(oldest.oldest) : undefined),
+      oldestEligibleAgeDays: ageDays(nowMs, oldestEligible.oldest ? String(oldestEligible.oldest) : undefined),
+      protectedReasonCounts: this.retentionProtectedReasonCounts(spec),
+      eligibleSamples: eligibleRows.map(row => ({
+        id: String(row.id),
+        createdAt: String(row.created_at),
+        ageDays: ageDays(nowMs, String(row.created_at)),
+        reason: `older_than_${policy.retentionDays}d_and_unprotected`,
+      })),
+    };
+  }
+
+  private retentionProtectedSql(spec: RetentionDomainSpec): string {
+    const clauses = Object.values(spec.protectedReasons);
+    return clauses.length > 0 ? clauses.map(clause => `(${clause})`).join(' OR ') : '0=1';
+  }
+
+  private retentionProtectedReasonCounts(spec: RetentionDomainSpec): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const [reason, sql] of Object.entries(spec.protectedReasons)) {
+      const row = this.db.prepare(`SELECT COUNT(*) count FROM ${spec.table} WHERE ${sql}`).get() as any;
+      counts[reason] = Number(row.count ?? 0);
+    }
+    return counts;
+  }
+
+  private outboxStatusCounts(table: 'sync_outbox' | 'memory_backend_outbox'): OutboxStatusCounts {
+    const row = this.db.prepare(`SELECT
+      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+      SUM(CASE WHEN status='inflight' THEN 1 ELSE 0 END) inflight,
+      SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed
+      FROM ${table}`).get() as any;
+    return {
+      pending: Number(row.pending ?? 0),
+      inflight: Number(row.inflight ?? 0),
+      failed: Number(row.failed ?? 0),
+    };
+  }
+
+  private quarantineCounts(): KmRetentionPlan['operational']['quarantine'] {
+    const observations = this.db.prepare('SELECT COUNT(*) count FROM quarantine_events').get() as any;
+    const sync = this.db.prepare('SELECT COUNT(*) count FROM sync_quarantine WHERE resolved_at IS NULL').get() as any;
+    const backend = this.db.prepare(`SELECT COUNT(*) count FROM memory_backend_outbox WHERE status='quarantined'`).get() as any;
+    return {
+      observations: Number(observations.count ?? 0),
+      sync: Number(sync.count ?? 0),
+      backend: Number(backend.count ?? 0),
+    };
+  }
+
+  private providerQuality(): KmRetentionPlan['operational']['providerQuality'] {
+    const row = this.db.prepare(`SELECT COUNT(*) configured,
+      SUM(CASE WHEN status NOT IN ('validated','ready','ok') THEN 1 ELSE 0 END) unavailable
+      FROM km_provider_registry`).get() as any;
+    const backend = this.db.prepare(`SELECT COUNT(*) quarantined FROM memory_backend_outbox WHERE status='quarantined'`).get() as any;
+    return {
+      configuredProviders: Number(row.configured ?? 0),
+      unavailableProviders: Number(row.unavailable ?? 0),
+      quarantinedBackendOutbox: Number(backend.quarantined ?? 0),
+    };
   }
 
   private knowledgeFromRow(row: any): KnowledgeItem {
@@ -2409,6 +2781,16 @@ export class ObservationStore {
       add('filtered_state_count', 'ALTER TABLE retrieval_runs ADD COLUMN filtered_state_count INTEGER NOT NULL DEFAULT 0;');
       this.db.exec(PHASE14_SCHEMA);
       this.db.exec('PRAGMA user_version=14;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  private migrateToPhase15(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 15) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE15_SCHEMA);
+      this.db.exec('PRAGMA user_version=15;');
       this.db.exec('COMMIT;');
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
@@ -2546,6 +2928,7 @@ export class ObservationStore {
       'km_config_audit',
       'km_memory_policy_decisions',
       'km_runtime_leases',
+      'km_retention_reports',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

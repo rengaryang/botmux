@@ -5,6 +5,7 @@ import { ObservationEventTypeSchema } from '../services/km/observation-schema.js
 import { KmMemoryProviderConfigSchema, KmPipelineProfileSchema } from '../services/km/provider-spi.js';
 import type { ObservationStore } from '../services/km/observation-store.js';
 import type { KmBackendRuntimeStatus } from '../services/km/memory-backend-runtime.js';
+import type { KmRetentionRuntimeStatus } from '../services/km/retention-runtime.js';
 import { compareMemoryBackendMigration, enqueueMemoryBackendMigrationBackfill } from '../services/km/memory-backend-migration.js';
 import {
   createKnowledgeExportJob,
@@ -59,6 +60,8 @@ export interface KmObservationApiStore {
   listMemoryPolicyDecisions?(limit: number): ReturnType<ObservationStore['listMemoryPolicyDecisions']>;
   retrievalQualitySummary?(): ReturnType<ObservationStore['retrievalQualitySummary']>;
   evalEvolutionStatus?(): ReturnType<ObservationStore['evalEvolutionStatus']>;
+  kmRetentionStatus?(input?: Parameters<ObservationStore['kmRetentionStatus']>[0]): ReturnType<ObservationStore['kmRetentionStatus']>;
+  listKmRetentionReports?(limit: number): ReturnType<ObservationStore['listKmRetentionReports']>;
   close(): void;
 }
 
@@ -68,6 +71,7 @@ export interface KmObservationApiDeps {
   dataDir?: string;
   openStore(): Promise<KmObservationApiStore>;
   backendRuntimeStatus?(): Promise<KmBackendRuntimeStatus>;
+  retentionRuntimeStatus?(): Promise<KmRetentionRuntimeStatus>;
 }
 
 class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -126,6 +130,8 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/config-audit'
     || url.pathname === '/api/km/memory-policy-decisions'
     || url.pathname === '/api/km/retrieval/quality'
+    || url.pathname === '/api/km/retention'
+    || url.pathname === '/api/km/retention/reports'
     || /^\/api\/km\/provider-configs\/[^/]+\/health$/.test(url.pathname)
     || /^\/api\/km\/backend-migrations\/[^/]+\/(backfill|compare)$/.test(url.pathname)
     || /^\/api\/km\/profiles\/[^/]+\/\d+\/state$/.test(url.pathname)
@@ -317,6 +323,18 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/retrieval/quality') {
       if (!store.retrievalQualitySummary) throw new Error('km_retrieval_quality_unavailable');
       jsonRes(res, 200, store.retrievalQualitySummary()); return true;
+    }
+    if (url.pathname === '/api/km/retention') {
+      if (deps.retentionRuntimeStatus) jsonRes(res, 200, await deps.retentionRuntimeStatus());
+      else {
+        if (!store.kmRetentionStatus) throw new Error('km_retention_unavailable');
+        jsonRes(res, 200, store.kmRetentionStatus({ enabled: false }));
+      }
+      return true;
+    }
+    if (url.pathname === '/api/km/retention/reports') {
+      if (!store.listKmRetentionReports) throw new Error('km_retention_unavailable');
+      jsonRes(res, 200, { items: store.listKmRetentionReports(positiveInteger(url.searchParams.get('limit'), 30, 100)) }); return true;
     }
     if (url.pathname === '/api/km/config-audit') {
       if (!store.listKmConfigAudit) throw new Error('km_config_audit_unavailable');

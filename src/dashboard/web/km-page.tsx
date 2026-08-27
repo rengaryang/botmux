@@ -53,6 +53,40 @@ type RetrievalQuality = {
   filteredState: number;
   avgLatencyMs: number;
 };
+type RetentionStatus = {
+  enabled: boolean;
+  leaseName: string;
+  latestPlan: {
+    policyVersion: string;
+    generatedAt: string;
+    dryRunOnly: true;
+    destructiveActionsAvailable: false;
+    domains: Array<{
+      domain: string;
+      table: string;
+      tier: string;
+      retentionDays: number;
+      cutoff: string;
+      totalCount: number;
+      eligibleCount: number;
+      protectedCount: number;
+      oldestRecordAgeDays: number;
+      oldestEligibleAgeDays: number;
+    }>;
+    db: { dbBytes: number; walBytes: number; totalBytes: number };
+    operational: {
+      backlog: Record<string, number>;
+      quarantine: Record<string, number>;
+      retry: Record<string, number>;
+      providerQuality: Record<string, number>;
+      retrievalQuality: Record<string, number>;
+    };
+    slo: Array<{ key: string; state: 'ok' | 'warn' | 'critical'; value: number; warnAt: number; criticalAt: number; unit: string }>;
+    planHash: string;
+  };
+  reports: Array<{ reportId: string; completedAt: string; totalEligible: number; worstSloState: string; reportHash: string }>;
+  trend: Array<{ reportId: string; completedAt: string; totalEligible: number; worstSloState: string; dbBytes: number; walBytes: number }>;
+};
 
 type ObservationEvent = {
   eventId: string;
@@ -117,6 +151,7 @@ function KmPage(): React.JSX.Element {
   const [policyDecisions, setPolicyDecisions] = useState<MemoryPolicyDecision[]>([]);
   const [configAudit, setConfigAudit] = useState<ConfigAudit[]>([]);
   const [retrievalQuality, setRetrievalQuality] = useState<RetrievalQuality>();
+  const [retention, setRetention] = useState<RetentionStatus>();
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
@@ -124,7 +159,7 @@ function KmPage(): React.JSX.Element {
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, exportList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality] = await Promise.all([
+      const [h, list, knowledgeList, exportList, memoryList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -145,6 +180,7 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: MemoryPolicyDecision[] }>('/api/km/memory-policy-decisions?limit=20'),
         getJson<{ items: ConfigAudit[] }>('/api/km/config-audit?limit=20'),
         getJson<RetrievalQuality>('/api/km/retrieval/quality'),
+        getJson<RetentionStatus>('/api/km/retention'),
       ]);
       setHealth(h);
       setEvents(list.items);
@@ -158,6 +194,7 @@ function KmPage(): React.JSX.Element {
       setProfiles(profileList.items); setProviderConfigs(providerConfigList.items);
       setBackendRuntime(backendRuntimeStatus); setBackendOutbox(backendOutboxList.items); setBackendMigrations(backendMigrationList.items);
       setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items); setRetrievalQuality(quality);
+      setRetention(retentionStatus);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -265,6 +302,38 @@ function KmPage(): React.JSX.Element {
         <article><span>Retrieval 隐私过滤</span><strong>{retrievalQuality?.filteredPrivacy ?? '—'}</strong></article>
         <article><span>Retrieval 状态过滤</span><strong>{retrievalQuality?.filteredState ?? '—'}</strong></article>
         <article><span>Retrieval 均延迟</span><strong>{retrievalQuality ? `${retrievalQuality.avgLatencyMs}ms` : '—'}</strong></article>
+        <article><span>Retention Shadow</span><strong>{retention?.enabled ? '已开启' : '未开启'}</strong></article>
+        <article><span>可归档预览</span><strong>{retention ? retention.latestPlan.domains.reduce((sum, item) => sum + item.eligibleCount, 0) : '—'}</strong></article>
+        <article><span>KM DB+WAL</span><strong>{retention ? `${Math.round(retention.latestPlan.db.totalBytes / 1024)} KiB` : '—'}</strong></article>
+        <article><span>SLO 状态</span><strong>{retention ? retention.latestPlan.slo.find(item => item.state === 'critical')?.state ?? retention.latestPlan.slo.find(item => item.state === 'warn')?.state ?? 'ok' : '—'}</strong></article>
+      </section>
+
+      <section className="panel">
+        <h2>Retention / GC Preview（只读）</h2>
+        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          策略只生成 eligibility preview 和 shadow report；没有 purge/apply 按钮，BOTMUX_KM_AUTO_GC_ENABLED 不会触发删除。
+        </p>
+        <div className="feedback-deliveries">
+          {retention?.latestPlan.domains.map(domain => <div key={domain.domain}>
+            <code>{domain.tier}</code>
+            <span>{domain.domain} · {domain.table}</span>
+            <span>total {domain.totalCount} · protected {domain.protectedCount} · eligible {domain.eligibleCount}</span>
+            <b>{domain.retentionDays}d · oldest {domain.oldestRecordAgeDays}d</b>
+          </div>)}
+          {retention?.latestPlan.slo.map(metric => <div key={metric.key}>
+            <code>SLO</code>
+            <span>{metric.key}</span>
+            <span>{metric.value} {metric.unit} · warn {metric.warnAt} · critical {metric.criticalAt}</span>
+            <b>{metric.state}</b>
+          </div>)}
+          {retention?.reports.slice(0, 5).map(report => <div key={report.reportId}>
+            <code>report</code>
+            <span>{report.completedAt}</span>
+            <span>{report.reportHash}</span>
+            <b>{report.totalEligible} · {report.worstSloState}</b>
+          </div>)}
+          {!retention && <p style={{ color: 'var(--text-dim)' }}>Retention 状态暂不可用。</p>}
+        </div>
       </section>
 
       <section className="panel">

@@ -88,6 +88,7 @@ import { observationFromTurnCompletion } from './services/km/observation-produce
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
 import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
 import { isKmBackendWorkerEnabled, kmBackendWorkerIntervalMs, kmBackendWorkerStartupDelayMs, runKmBackendWorkerOnce } from './services/km/memory-backend-runtime.js';
+import { isKmRetentionShadowEnabled, kmRetentionShadowIntervalMs, kmRetentionShadowStartupDelayMs, runKmRetentionShadowOnce } from './services/km/retention-runtime.js';
 import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-evolution-runtime.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -22104,6 +22105,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   kmEvalStartupTimer.unref?.();
   const kmEvalEvolutionTimer = setInterval(runKmEvalEvolutionWorker, 60_000);
   kmEvalEvolutionTimer.unref?.();
+  let kmRetentionShadowRunning = false;
+  const runKmRetentionShadow = () => {
+    if (kmRetentionShadowRunning || !isKmObservationEnabled() || !isKmRetentionShadowEnabled()) return;
+    kmRetentionShadowRunning = true;
+    void runKmRetentionShadowOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.report) {
+          logger.info(`[km-retention-shadow] eligible=${result.report.totalEligible} slo=${result.report.worstSloState} report=${result.report.reportId}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-retention-shadow] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmRetentionShadowRunning = false; });
+  };
+  const kmRetentionShadowStartupTimer = setTimeout(runKmRetentionShadow, kmRetentionShadowStartupDelayMs(idx));
+  kmRetentionShadowStartupTimer.unref?.();
+  const kmRetentionShadowTimer = setInterval(runKmRetentionShadow, kmRetentionShadowIntervalMs());
+  kmRetentionShadowTimer.unref?.();
 
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
@@ -22972,6 +22990,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(kmDistillationRecoveryTimer);
     if (kmBackendWorkerStartupTimer) clearTimeout(kmBackendWorkerStartupTimer);
     clearInterval(kmBackendWorkerTimer);
+    if (kmRetentionShadowStartupTimer) clearTimeout(kmRetentionShadowStartupTimer);
+    clearInterval(kmRetentionShadowTimer);
     if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
     clearInterval(kmEvalEvolutionTimer);
     clearInterval(docCommentPollTimer);
@@ -23208,6 +23228,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(kmDistillationRecoveryTimer);
     if (kmBackendWorkerStartupTimer) clearTimeout(kmBackendWorkerStartupTimer);
     clearInterval(kmBackendWorkerTimer);
+    if (kmRetentionShadowStartupTimer) clearTimeout(kmRetentionShadowStartupTimer);
+    clearInterval(kmRetentionShadowTimer);
     if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
     clearInterval(kmEvalEvolutionTimer);
     clearInterval(idleWorkerSweepTimer);
