@@ -66,6 +66,12 @@ const cases: Array<Pick<KmProductionGatePlanRequest, 'actionKind' | 'target' | '
 ];
 
 describe('KM production gate orchestrator', () => {
+  it('allows an explicitly bounded seven-day canary approval TTL', () => {
+    const canary = cases.find(item => item.actionKind === 'prompt-canary')!;
+    const built = buildKmProductionGatePlan({ ...base, ...canary, ttlSeconds: 7 * 24 * 60 * 60 });
+    expect(Date.parse(built.plan.expiresAt) - Date.parse(base.now)).toBe(7 * 24 * 60 * 60 * 1000);
+  });
+
   it('builds and persists deterministic plans for all production action kinds', async () => {
     const store = await ObservationStore.open(tempDir());
     for (const item of cases) {
