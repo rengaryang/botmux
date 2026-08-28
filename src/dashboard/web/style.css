@@ -21758,7 +21758,7 @@ main:has(.workflows-page .v3r-runs-section) {
 main:has(.workflows-page .v3r-runs-section) .workflows-page {
   height: 100%;
   min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -21771,6 +21771,22 @@ main:has(.workflows-page .v3r-runs-section) .v3r-runs-section {
 
 main:has(.workflows-page .v3r-runs-section) .v3r-run-list {
   height: 100%;
+}
+
+@media (max-height: 820px), (max-width: 1180px) {
+  main:has(.workflows-page .v3r-runs-section) {
+    padding-bottom: 24px;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  main:has(.workflows-page .v3r-runs-section) .workflows-page,
+  main:has(.workflows-page .v3r-runs-section) .v3r-runs-section,
+  main:has(.workflows-page .v3r-runs-section) .v3r-run-list {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
 }
 
 @media (max-width: 1180px) {
