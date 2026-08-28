@@ -58,7 +58,7 @@ export function defaultShadowProfile(botAppId: string, cliId = 'pi', model?: str
     sourceProvider: 'observation-source-v1', windowProvider: 'bounded-transcript-window-v1',
     primaryExtractor: 'builtin.rules-v1', shadowExtractors: isKmPiShadowEnabled() ? [`botmux-cli:${cliId}:${model ?? 'default'}`] : [],
     knowledgeRouter: 'builtin.layer-router-v1', memoryPolicy: 'safe-auto-activation-v1',
-    memoryBackends: { writePolicy: 'primary-mirror', primary: 'sqlite', mirrors: ['mem0', 'hindsight', 'openviking'] },
+    memoryBackends: { writePolicy: 'single', primary: 'sqlite', mirrors: [] },
     injectionMode: 'shadow', budgets: { sourceBytes: 262_144, sourceTokens: 32_000, outputClaims: 20, promptTokens: 1_800 },
   };
 }
