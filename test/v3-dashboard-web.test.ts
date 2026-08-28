@@ -14,6 +14,7 @@ import {
   cancelV3Run,
   fetchV3RunDetail,
   fetchV3Runs,
+  fetchWorkflowModelChoices,
   type V3Fetch,
 } from '../src/dashboard/web/v3-api.js';
 import {
@@ -177,6 +178,21 @@ describe('v3 dashboard api helpers', () => {
       view: { runStatus: 'succeeded' },
     });
     expect(calls).toEqual(['/api/v3/runs', '/api/v3/runs/run%2Fid%20with%20space']);
+  });
+
+  it('reads structured provider/model choices and preserves the legacy models list', async () => {
+    const result = await fetchWorkflowModelChoices('pi', async () => response(true, 200, {
+      models: ['bytedance-hybrid/glm-5.3'],
+      choices: [{ value: 'bytedance-hybrid/glm-5.3', provider: 'bytedance-hybrid', model: 'glm-5.3', label: 'glm-5.3 · bytedance-hybrid' }],
+      source: 'live',
+      detectedAt: 42,
+    }));
+    expect(result).toEqual({
+      models: ['bytedance-hybrid/glm-5.3'],
+      choices: [{ value: 'bytedance-hybrid/glm-5.3', provider: 'bytedance-hybrid', model: 'glm-5.3', label: 'glm-5.3 · bytedance-hybrid' }],
+      source: 'live',
+      detectedAt: 42,
+    });
   });
 
   it('returns empty/non-ok results without probing a retired v2 surface', async () => {

@@ -22,6 +22,14 @@ describe('Workflow execution profiles', () => {
     expect(executionProfileToSnapshot(updated)).toMatchObject({ larkAppId: 'profile:code-fast', directCli: true, cliId: 'codex', model: 'gpt-code-2', workingDir: root });
   });
 
+  it('persists provider metadata and freezes a provider-qualified Pi model', () => {
+    const root = dir(); const store = new WorkflowExecutionProfileStore(join(root, 'profiles.json'));
+    const saved = store.put({ profileId: 'pi-glm', displayName: 'Pi GLM', cli: 'pi', provider: 'bytedance-hybrid', model: 'glm-5.3', workingDir: root, costTier: 'low' });
+    expect(saved).toMatchObject({ provider: 'bytedance-hybrid', model: 'bytedance-hybrid/glm-5.3' });
+    expect(executionProfileToSnapshot(saved)).toMatchObject({ provider: 'bytedance-hybrid', model: 'bytedance-hybrid/glm-5.3', directCli: true });
+    expect(() => store.put({ ...saved, provider: 'codex-lb' })).toThrow(/provider_model_mismatch/);
+  });
+
   it('validates executionProfile as mutually exclusive with legacy bot', () => {
     expect(validateDag({ schemaVersion: 2, runId: 'profile-dag', nodes: [{ id: 'code', type: 'goal', goal: '实现代码', executionProfile: 'code-fast' }] }).nodes[0]).toMatchObject({ executionProfile: 'code-fast' });
     expect(() => validateDag({ schemaVersion: 2, runId: 'bad-profile-dag', nodes: [{ id: 'code', type: 'goal', goal: '实现代码', executionProfile: 'code-fast', bot: 'legacy' }] })).toThrow(/cannot set both/);

@@ -4,7 +4,7 @@ import { SectionHeader } from './dashboard-components.js';
 import { confirm } from './confirm-modal.js';
 import { useT } from './react-hooks.js';
 import { ui } from './ui.js';
-import { cancelV3Run, disableWorkflowExecutionProfile, fetchV3RunDetail, fetchV3Runs, fetchWorkflowExecutionProfiles, saveWorkflowExecutionProfile } from './v3-api.js';
+import { cancelV3Run, disableWorkflowExecutionProfile, fetchV3RunDetail, fetchV3Runs, fetchWorkflowExecutionProfiles, fetchWorkflowModelChoices, saveWorkflowExecutionProfile, type WorkflowModelChoice } from './v3-api.js';
 import type { WorkflowExecutionProfile } from '../../workflows/v3/execution-profile-store.js';
 import {
   V3_DECISION_LABEL,
@@ -117,16 +117,36 @@ function V3ListPage(): React.JSX.Element {
   const [profiles, setProfiles] = useState<WorkflowExecutionProfile[]>([]);
   const [goal, setGoal] = useState('');
   const [recommendations, setRecommendations] = useState<Array<{ profileId: string; score: number; coldStart: boolean; reasons: string[] }>>([]);
-  const [form, setForm] = useState({ profileId: '', displayName: '', cli: 'pi', model: '', workingDir: '/data00/repo', costTier: 'medium' });
+  const [form, setForm] = useState({ profileId: '', displayName: '', cli: 'pi', provider: '', model: '', workingDir: '/data00/repo', costTier: 'medium' });
+  const [modelChoices, setModelChoices] = useState<WorkflowModelChoice[]>([]);
+  const [modelSource, setModelSource] = useState<'loading' | 'static' | 'live' | 'error'>('loading');
   const [profileNotice, setProfileNotice] = useState('');
   const refreshProfiles = useCallback(async () => {
     const result = await fetchWorkflowExecutionProfiles(goal); setProfiles(result.profiles); setRecommendations(result.recommendations);
   }, [goal]);
   useEffect(() => { void refreshProfiles(); }, [refreshProfiles]);
+  useEffect(() => {
+    let disposed = false;
+    setModelChoices([]);
+    setModelSource('loading');
+    void fetchWorkflowModelChoices(form.cli).then(result => {
+      if (disposed) return;
+      setModelChoices(result.choices);
+      setModelSource(result.choices.length ? result.source : 'error');
+      setForm(current => {
+        if (current.cli !== form.cli) return current;
+        const selected = result.choices.find(choice => choice.value === current.model);
+        return selected ? { ...current, provider: selected.provider ?? '' } : { ...current, provider: '', model: '' };
+      });
+    }).catch(() => { if (!disposed) { setModelChoices([]); setModelSource('error'); } });
+    return () => { disposed = true; };
+  }, [form.cli]);
+  const providers = useMemo(() => [...new Set(modelChoices.map(choice => choice.provider).filter((item): item is string => Boolean(item)))], [modelChoices]);
+  const visibleModels = useMemo(() => form.provider ? modelChoices.filter(choice => choice.provider === form.provider) : modelChoices.filter(choice => !choice.provider || providers.length === 0), [form.provider, modelChoices, providers.length]);
   const saveProfile = useCallback(async () => {
     try {
       await saveWorkflowExecutionProfile({
-        ...form, schemaVersion: 1, enabled: true, revision: 1, updatedAt: new Date().toISOString(),
+        ...form, provider: form.provider || undefined, model: form.model || undefined, schemaVersion: 1, enabled: true, revision: 1, updatedAt: new Date().toISOString(),
         sandbox: { enabled: true, network: true, readWrite: [form.workingDir], readOnly: [], deny: [] },
         envPolicy: { inherit: 'safe-host', allow: [], deny: [] }, timeoutPolicy: { defaultSec: 1800, maxSec: 14400 },
       } as WorkflowExecutionProfile);
@@ -153,15 +173,16 @@ function V3ListPage(): React.JSX.Element {
         <div className="v3r-profile-form">
           <input value={form.profileId} onChange={e => setForm({ ...form, profileId: e.target.value })} placeholder="Profile ID" />
           <input value={form.displayName} onChange={e => setForm({ ...form, displayName: e.target.value })} placeholder="显示名称" />
-          <select value={form.cli} onChange={e => setForm({ ...form, cli: e.target.value })}><option>claude-code</option><option>codex</option><option>seed</option><option>traex</option><option>relay</option><option>pi</option></select>
-          <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="Model（可选）" />
+          <select aria-label="Agent / CLI" value={form.cli} onChange={e => setForm({ ...form, cli: e.target.value, provider: '', model: '' })}><option>claude-code</option><option>codex</option><option>seed</option><option>traex</option><option>relay</option><option>pi</option></select>
+          {providers.length ? <select aria-label="Provider" value={form.provider} onChange={e => setForm({ ...form, provider: e.target.value, model: '' })}><option value="">选择 Provider</option>{providers.map(provider => <option key={provider} value={provider}>{provider}</option>)}</select> : <input aria-label="Provider" value="" readOnly placeholder={modelSource === 'loading' ? '正在探测 Provider…' : '由 CLI 管理 Provider'} />}
+          <select aria-label="Model" value={form.model} onChange={e => { const choice = modelChoices.find(item => item.value === e.target.value); setForm({ ...form, provider: choice?.provider ?? form.provider, model: e.target.value }); }} disabled={modelSource === 'loading' || (providers.length > 0 && !form.provider)}><option value="">{modelSource === 'loading' ? '正在探测模型…' : modelSource === 'error' ? '目录不可用，使用 CLI 默认' : '使用 CLI 默认'}</option>{visibleModels.map(choice => <option key={choice.value} value={choice.value}>{choice.label}</option>)}</select>
           <input value={form.workingDir} onChange={e => setForm({ ...form, workingDir: e.target.value })} placeholder="绝对 Working Directory" />
           <select value={form.costTier} onChange={e => setForm({ ...form, costTier: e.target.value })}><option value="low">低成本</option><option value="medium">中成本</option><option value="high">高成本</option></select>
           <button type="button" onClick={() => void saveProfile()} disabled={!form.profileId || !form.workingDir}>保存 Profile</button>
         </div>
         <div className="v3r-recommend-bar"><input value={goal} onChange={e => setGoal(e.target.value)} placeholder="输入任务目标，查看确定性推荐评分" /><button onClick={() => void refreshProfiles()}>评分</button><span>{profileNotice}</span></div>
         <div className="v3r-profile-table-wrap"><table className="v3r-profile-table"><thead><tr><th>Profile</th><th>CLI</th><th>模型</th><th>工作目录</th><th>成本</th><th>推荐分</th><th>历史</th><th>状态</th></tr></thead><tbody>
-          {profiles.map(profile => { const rec = recommendations.find(item => item.profileId === profile.profileId); return <tr key={profile.profileId}><td><strong>{profile.displayName}</strong><small>{profile.profileId} · r{profile.revision}</small></td><td><code>{profile.cli}</code></td><td>{profile.model || 'CLI 默认'}</td><td><code>{profile.workingDir}</code></td><td>{profile.costTier}</td><td>{rec?.score ?? '—'}{rec?.coldStart ? <small> cold start</small> : null}</td><td title={rec?.reasons.join('\n')}>{rec?.reasons[1] ?? '暂无样本'}</td><td>{profile.enabled ? '启用' : '停用'} {profile.enabled ? <button onClick={() => { if (window.confirm(`停用 ${profile.profileId}？`)) void disableWorkflowExecutionProfile(profile.profileId).then(refreshProfiles); }}>停用</button> : null}</td></tr>; })}
+          {profiles.map(profile => { const rec = recommendations.find(item => item.profileId === profile.profileId); return <tr key={profile.profileId}><td><strong>{profile.displayName}</strong><small>{profile.profileId} · r{profile.revision}</small></td><td><code>{profile.cli}</code></td><td>{profile.model || 'CLI 默认'}{profile.provider ? <small>{profile.provider}</small> : null}</td><td><code>{profile.workingDir}</code></td><td>{profile.costTier}</td><td>{rec?.score ?? '—'}{rec?.coldStart ? <small> cold start</small> : null}</td><td title={rec?.reasons.join('\n')}>{rec?.reasons[1] ?? '暂无样本'}</td><td>{profile.enabled ? '启用' : '停用'} {profile.enabled ? <button onClick={() => { if (window.confirm(`停用 ${profile.profileId}？`)) void disableWorkflowExecutionProfile(profile.profileId).then(refreshProfiles); }}>停用</button> : null}</td></tr>; })}
         </tbody></table></div>
       </section>
       <section className="overview-block v3r-runs-section">
@@ -293,7 +314,7 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
       {view ? <section className="overview-block v3r-plan-table-section">
         <SectionHeader title="节点执行计划" hint="Gate-2 冻结后的 CLI / 模型 / 成本 / 超时 / 工作目录 / 风险" />
         <div className="v3r-profile-table-wrap"><table className="v3r-profile-table"><thead><tr><th>节点</th><th>任务</th><th>Profile / CLI</th><th>模型</th><th>预计成本</th><th>超时</th><th>工作目录</th><th>风险 / Gate</th></tr></thead><tbody>
-          {view.nodes.filter(node => !node.loop).map(node => <tr key={node.id}><td><code>{node.id}</code></td><td>{trunc(node.goal ?? 'host/loop', 52)}</td><td>{node.execution?.profileId ?? node.execution?.selector ?? 'host'}<small>{node.execution?.cli ?? 'deterministic'}</small></td><td>{node.execution?.model ?? 'CLI 默认'}</td><td>{node.execution?.costTier ?? '—'}<small>金额需可信价格表</small></td><td>{node.execution ? `${node.execution.timeoutSec}s` : '—'}</td><td><code>{node.execution?.workingDir ?? '—'}</code></td><td>{node.execution?.riskLevel ?? '—'} / {node.execution?.gated ? '需确认' : '无 Gate'}</td></tr>)}
+          {view.nodes.filter(node => !node.loop).map(node => <tr key={node.id}><td><code>{node.id}</code></td><td>{trunc(node.goal ?? 'host/loop', 52)}</td><td>{node.execution?.profileId ?? node.execution?.selector ?? 'host'}<small>{node.execution?.cli ?? 'deterministic'}</small></td><td>{node.execution?.model ?? 'CLI 默认'}{node.execution?.provider ? <small>{node.execution.provider}</small> : null}</td><td>{node.execution?.costTier ?? '—'}<small>金额需可信价格表</small></td><td>{node.execution ? `${node.execution.timeoutSec}s` : '—'}</td><td><code>{node.execution?.workingDir ?? '—'}</code></td><td>{node.execution?.riskLevel ?? '—'} / {node.execution?.gated ? '需确认' : '无 Gate'}</td></tr>)}
         </tbody></table></div>
       </section> : null}
       <div className="v3r-wrap">

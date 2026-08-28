@@ -44,7 +44,7 @@ import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter, traexNativeSubagentHookConfig } from '../src/adapters/cli/traex.js';
-import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath, materializePiTurnBoundaryExtension, PI_PLUGIN_DIR, PI_BUILTIN_SKILLS_DIR } from '../src/adapters/cli/pi.js';
+import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath, materializePiTurnBoundaryExtension, parsePiListModels, PI_PLUGIN_DIR, PI_BUILTIN_SKILLS_DIR } from '../src/adapters/cli/pi.js';
 import registerBotmuxTurnBoundaryExtension from '../src/adapters/cli/pi-turn-boundary-extension.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir, OMP_PLUGIN_DIR } from '../src/adapters/cli/oh-my-pi.js';
@@ -2093,6 +2093,19 @@ describe('pi buildArgs', () => {
     expect(extPath).toBeTruthy();
     expect(existsSync(extPath!)).toBe(true);
     expect(extPath!.endsWith('pi-turn-boundary-extension.js')).toBe(true);
+  });
+
+  it('parses provider-qualified models from Pi model catalogue output', () => {
+    expect(parsePiListModels([
+      'provider          model        context  max-out  thinking  images',
+      'bytedance-hybrid  glm-5.3      500K     65.5K    yes       no',
+      'codex-lb          gpt-5.6-sol  272K     65.5K    yes       yes',
+      'sol-mirror        gpt-5.6-sol  400K     65.5K    yes       yes',
+    ].join('\n'))).toEqual([
+      'bytedance-hybrid/glm-5.3',
+      'codex-lb/gpt-5.6-sol',
+      'sol-mirror/gpt-5.6-sol',
+    ]);
   });
 
   it('pins the configured model instead of inheriting Pi defaults', () => {

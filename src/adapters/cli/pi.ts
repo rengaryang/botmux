@@ -3,6 +3,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
@@ -116,6 +118,28 @@ export function buildPiArgs(opts: {
   // startup, avoiding stdin races while keeping the native TUI visible.
   if (opts.initialPrompt) args.push(opts.initialPrompt);
   return args;
+}
+
+const execFileAsync = promisify(execFile);
+
+/** Parse `pi --list-models`' whitespace table into provider-qualified model
+ * values. Provider qualification is required because the same model id can be
+ * exposed by multiple routes (for example several GPT mirrors). */
+export function parsePiListModels(stdout: string): string[] {
+  const models: string[] = [];
+  const seen = new Set<string>();
+  for (const line of stdout.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed || /^provider\s+model\s+/iu.test(trimmed)) continue;
+    const columns = trimmed.split(/\s+/u);
+    if (columns.length < 2) continue;
+    const provider = columns[0]!;
+    const model = columns[1]!;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(provider) || !/^\S+$/u.test(model)) continue;
+    const qualified = `${provider}/${model}`;
+    if (!seen.has(qualified)) { seen.add(qualified); models.push(qualified); }
+  }
+  return models;
 }
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
@@ -285,6 +309,20 @@ export function createPiAdapter(
 
     buildSessionRenameCommand: (title) => `/name ${title}`,
     passesInitialPromptViaArgs: true,
+
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        const { stdout } = await execFileAsync(bin, ['--list-models'], {
+          timeout: 10_000,
+          maxBuffer: 1024 * 1024,
+          encoding: 'utf8',
+        });
+        const models = parsePiListModels(stdout);
+        return models.length ? models : null;
+      } catch {
+        return null;
+      }
+    },
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.pasteText && pty.sendSpecialKeys) {
