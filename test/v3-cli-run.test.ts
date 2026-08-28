@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { authorizeManualCliRun } from '../src/workflows/v3/cli-run.js';
+import { authorizeManualCliRun, parseV3RunArgs } from '../src/workflows/v3/cli-run.js';
 import type { BotConfig } from '../src/bot-registry.js';
 import type { V3Dag } from '../src/workflows/v3/dag.js';
 import { loadAuthorizedV3Run } from '../src/workflows/v3/run-envelope.js';
@@ -73,6 +73,32 @@ function runTsChild(script: string): {
   });
   return { exited: () => didExit, result };
 }
+
+describe('v3 run CLI concurrency flags', () => {
+  it('显式解析三层并发上限，同时保持默认值由 runtime 管理', () => {
+    const parsed = parseV3RunArgs([
+      'workflow.json', '--max-parallel', '4', '--per-bot-parallel=4', '--per-cli-parallel', '3', '--yes',
+    ]);
+    expect(parsed).toMatchObject({
+      maxParallel: 4,
+      perBotParallel: 4,
+      perCliParallel: 3,
+      autoApproveGates: true,
+    });
+    expect(parseV3RunArgs(['workflow.json'])).toMatchObject({
+      maxParallel: undefined,
+      perBotParallel: undefined,
+      perCliParallel: undefined,
+    });
+  });
+
+  it('拒绝非法或超过全局上限的局部并发值', () => {
+    expect(() => parseV3RunArgs(['workflow.json', '--per-bot-parallel', '0']))
+      .toThrow(/正整数/);
+    expect(() => parseV3RunArgs(['workflow.json', '--max-parallel', '2', '--per-cli-parallel', '3']))
+      .toThrow(/不能大于/);
+  });
+});
 
 describe('v3 manual CLI authorization', () => {
   it('重复启动复用已冻结的 manual_cli envelope，不受新 DAG / bot 配置漂移影响', () => {
