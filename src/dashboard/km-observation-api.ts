@@ -9,10 +9,13 @@ import type { KmRetentionRuntimeStatus } from '../services/km/retention-runtime.
 import { compareMemoryBackendMigration, enqueueMemoryBackendMigrationBackfill } from '../services/km/memory-backend-migration.js';
 import {
   createKnowledgeExportJob,
+  executeKmFormalExport,
   getKnowledgeExportJob,
   listKnowledgeExportJobs,
   planKnowledgeExport,
+  previewKmFormalExport,
   reviewKnowledgeExportJob,
+  rollbackKmFormalExport,
 } from '../services/km/knowledge-export-staging.js';
 import {
   createKnowledgeToMemoryImportPreview,
@@ -149,6 +152,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/exports'
     || /^\/api\/km\/exports\/[^/]+$/.test(url.pathname)
     || /^\/api\/km\/exports\/[^/]+\/review$/.test(url.pathname)
+    || /^\/api\/km\/exports\/[^/]+\/(preview|execute|rollback|status)$/.test(url.pathname)
     || url.pathname === '/api/km/distillation/jobs'
     || url.pathname === '/api/km/retrieval/runs'
     || url.pathname === '/api/km/injections'
@@ -420,6 +424,68 @@ export async function handleKmObservationApi(
       return true;
     }
 
+    const exportPreview = url.pathname.match(/^\/api\/km\/exports\/([^/]+)\/preview$/);
+    if (exportPreview) {
+      if (req.method !== 'GET') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      jsonRes(res, 200, previewKmFormalExport({
+        dataDir: deps.dataDir,
+        jobId: decodeURIComponent(exportPreview[1]),
+        workspaceRoot: url.searchParams.get('workspaceRoot') ?? undefined,
+      }));
+      return true;
+    }
+
+    const exportExecute = url.pathname.match(/^\/api\/km\/exports\/([^/]+)\/execute$/);
+    if (exportExecute) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const confirmationToken = String(body.confirmationToken ?? '').trim();
+      const destinationVersion = String(body.destinationVersion ?? '').trim();
+      const approvalGrade = String(body.approvalGrade ?? 'G2');
+      if (!confirmationToken || !destinationVersion) throw new KmApiError(422, 'km_export_execution_confirmation_required');
+      if (!['G2','G3','G4'].includes(approvalGrade)) throw new KmApiError(422, 'km_export_approval_grade_invalid');
+      executeMutation(ctx, 200, 'knowledge.export_execute', decodeURIComponent(exportExecute[1]), () =>
+        executeKmFormalExport({
+          dataDir: deps.dataDir!,
+          jobId: decodeURIComponent(exportExecute[1]),
+          workspaceRoot: typeof body.workspaceRoot === 'string' ? body.workspaceRoot : undefined,
+          actorId: ctx.actorId,
+          idempotencyKey: ctx.idempotencyKey,
+          approvalGrade: approvalGrade as any,
+          confirmationToken,
+          expectedTargetHash: typeof body.expectedTargetHash === 'string' ? body.expectedTargetHash : null,
+          destinationVersion,
+          maxAttempts: typeof body.maxAttempts === 'number' ? body.maxAttempts : undefined,
+        }), { afterHash: response => response.execution?.afterHash ?? response.plan.file.contentHash });
+      return true;
+    }
+
+    const exportRollback = url.pathname.match(/^\/api\/km\/exports\/([^/]+)\/rollback$/);
+    if (exportRollback) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const confirmationToken = String(body.confirmationToken ?? '').trim();
+      const approvalGrade = String(body.approvalGrade ?? 'G2');
+      if (!confirmationToken) throw new KmApiError(422, 'km_export_rollback_confirmation_required');
+      if (!['G2','G3','G4'].includes(approvalGrade)) throw new KmApiError(422, 'km_export_approval_grade_invalid');
+      executeMutation(ctx, 200, 'knowledge.export_rollback', decodeURIComponent(exportRollback[1]), () =>
+        rollbackKmFormalExport({
+          dataDir: deps.dataDir!,
+          jobId: decodeURIComponent(exportRollback[1]),
+          workspaceRoot: typeof body.workspaceRoot === 'string' ? body.workspaceRoot : undefined,
+          actorId: ctx.actorId,
+          idempotencyKey: ctx.idempotencyKey,
+          approvalGrade: approvalGrade as any,
+          confirmationToken,
+          expectedTargetHash: typeof body.expectedTargetHash === 'string' ? body.expectedTargetHash : undefined,
+          destinationVersion: typeof body.destinationVersion === 'string' ? body.destinationVersion : undefined,
+        }), { afterHash: response => response.execution?.afterHash ?? response.plan.file.contentHash });
+      return true;
+    }
+
     const proposalDecision = url.pathname.match(/^\/api\/km\/evolution\/proposals\/([^/]+)\/decision$/);
     if (proposalDecision) {
       if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
@@ -592,6 +658,13 @@ export async function handleKmObservationApi(
     if (exportStatus) {
       if (!deps.dataDir) throw new Error('km_export_data_dir_required');
       const job = getKnowledgeExportJob(deps.dataDir, decodeURIComponent(exportStatus[1]));
+      if (!job) throw new Error('km_export_job_not_found');
+      jsonRes(res, 200, job); return true;
+    }
+    const exportStatusAlias = url.pathname.match(/^\/api\/km\/exports\/([^/]+)\/status$/);
+    if (exportStatusAlias) {
+      if (!deps.dataDir) throw new Error('km_export_data_dir_required');
+      const job = getKnowledgeExportJob(deps.dataDir, decodeURIComponent(exportStatusAlias[1]));
       if (!job) throw new Error('km_export_job_not_found');
       jsonRes(res, 200, job); return true;
     }

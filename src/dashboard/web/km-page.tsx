@@ -16,8 +16,20 @@ type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; 
 type KnowledgeExportJob = {
   jobId: string;
   state: string;
-  plan: { knowledgeId: string; targetLayer: string; allowed: boolean; destination: { relativePath: string; writeMode: string }; reasonCodes: string[]; diff: { status: string; lines: string[] } };
+  plan: { knowledgeId: string; targetLayer: string; allowed: boolean; destination: { relativePath: string; writeMode: string; adapterId?: string; adapterKind?: string }; reasonCodes: string[]; diff: { status: string; lines: string[] } };
   manifest?: { contentHash: string; stagedFile?: string };
+  execution?: { state: string; afterHash: string | null; destination: { root: string; relativePath: string }; precondition: { destinationVersion: string } };
+};
+type KnowledgeExportPreview = {
+  jobId: string;
+  allowed: boolean;
+  reasonCodes: string[];
+  confirmationToken: string;
+  adapter: { adapterId: string; kind: string; commandPlan: string[] };
+  destination: { root: string; relativePath: string; absolutePath: string };
+  precondition: { currentTargetHash: string | null; destinationVersion: string };
+  patch: { deterministicPatchHash: string; status: string; lines: string[] };
+  risk: { mutatesWorkspace: boolean; network: false; gitPush: false; fixtureOnly: boolean };
 };
 type MemoryItem = { memoryId: string; state: string; scope: string; subject: string; claimKey: string; confidence: string };
 type ImportJob = {
@@ -163,6 +175,7 @@ function KmPage(): React.JSX.Element {
   const [typeFilter, setTypeFilter] = useState<string>('');
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
   const [exportJobs, setExportJobs] = useState<KnowledgeExportJob[]>([]);
+  const [exportPreviews, setExportPreviews] = useState<Record<string, KnowledgeExportPreview>>({});
   const [memory, setMemory] = useState<MemoryItem[]>([]);
   const [importJobs, setImportJobs] = useState<ImportJob[]>([]);
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
@@ -298,6 +311,42 @@ function KmPage(): React.JSX.Element {
         reasonCode: decision === 'approved' ? 'manual_review_approved' : 'manual_review_rejected',
       });
       setNotice(decision === 'approved' ? '已写入 staging outbox，未修改正式知识目录' : '导出审核单已拒绝');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const previewFormalExport = async (job: KnowledgeExportJob) => {
+    try {
+      const preview = await getJson<KnowledgeExportPreview>(`/api/km/exports/${encodeURIComponent(job.jobId)}/preview`);
+      setExportPreviews(prev => ({ ...prev, [job.jobId]: preview }));
+      setNotice(preview.allowed ? `执行预览已生成：${preview.patch.status}` : `执行仍被阻断：${preview.reasonCodes.join(', ')}`);
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const executeFormalExport = async (job: KnowledgeExportJob) => {
+    const preview = exportPreviews[job.jobId];
+    if (!preview) return;
+    if (!window.confirm(`确认执行 ${job.jobId}？目标：${preview.destination.relativePath}`)) return;
+    try {
+      await mutateJson(`/api/km/exports/${encodeURIComponent(job.jobId)}/execute`, 'POST', {
+        confirmationToken: preview.confirmationToken,
+        approvalGrade: 'G2',
+        expectedTargetHash: preview.precondition.currentTargetHash,
+        destinationVersion: preview.precondition.destinationVersion,
+      });
+      setNotice(`KM 正式导出已执行：${job.jobId}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const rollbackFormalExport = async (job: KnowledgeExportJob) => {
+    const preview = exportPreviews[job.jobId] ?? await getJson<KnowledgeExportPreview>(`/api/km/exports/${encodeURIComponent(job.jobId)}/preview`);
+    if (!window.confirm(`确认回滚 ${job.jobId}？目标：${preview.destination.relativePath}`)) return;
+    try {
+      await mutateJson(`/api/km/exports/${encodeURIComponent(job.jobId)}/rollback`, 'POST', {
+        confirmationToken: preview.confirmationToken,
+        approvalGrade: 'G2',
+        expectedTargetHash: job.execution?.afterHash ?? preview.precondition.currentTargetHash,
+        destinationVersion: preview.precondition.destinationVersion,
+      });
+      setNotice(`KM 正式导出已回滚：${job.jobId}`);
       await load();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
@@ -553,10 +602,21 @@ function KmPage(): React.JSX.Element {
       <section className="panel">
         <h2>Knowledge Export Staging</h2>
         <div className="feedback-deliveries">
-          {exportJobs.map(job => <div key={job.jobId}><code>{job.plan.targetLayer}</code><span>{job.plan.destination.relativePath}</span><span>{job.plan.diff.status} · {job.plan.reasonCodes.join(', ') || 'ready'}</span><b>{job.state}{' '}
-            {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'approved')}>Approve</button>}{' '}
-            {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'rejected')}>Reject</button>}
-          </b></div>)}
+          {exportJobs.map(job => {
+            const preview = exportPreviews[job.jobId];
+            return <div key={job.jobId}>
+              <code>{job.plan.targetLayer}</code>
+              <span>{job.plan.destination.relativePath}</span>
+              <span>{preview ? `${preview.patch.status} · ${preview.allowed ? 'ready' : preview.reasonCodes.join(', ')}` : `${job.plan.diff.status} · ${job.plan.reasonCodes.join(', ') || 'ready'}`}</span>
+              <b>{job.state}{' '}
+                {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'approved')}>Approve</button>}{' '}
+                {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'rejected')}>Reject</button>}{' '}
+                {(job.state === 'staged' || job.state === 'executing') && <button onClick={() => void previewFormalExport(job)}>Preview</button>}{' '}
+                {preview?.allowed && (job.state === 'staged' || job.state === 'executing') && <button onClick={() => void executeFormalExport(job)}>Execute</button>}{' '}
+                {job.state === 'applied' && <button onClick={() => void rollbackFormalExport(job)}>Rollback</button>}
+              </b>
+            </div>;
+          })}
           {exportJobs.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无导出审核单。</p>}
         </div>
       </section>

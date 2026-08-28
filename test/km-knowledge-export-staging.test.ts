@@ -1,14 +1,17 @@
-import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { KnowledgeItem } from '../src/services/km/observation-store.js';
 import {
   createKnowledgeExportJob,
+  executeKmFormalExport,
   getKnowledgeExportJob,
   listKnowledgeExportJobs,
   planKnowledgeExport,
+  previewKmFormalExport,
   reviewKnowledgeExportJob,
+  rollbackKmFormalExport,
 } from '../src/services/km/knowledge-export-staging.js';
 
 function tmpDataDir(): string {
@@ -156,5 +159,253 @@ describe('KM approved knowledge export staging', () => {
     expect(rejected.state).toBe('rejected');
     expect(getKnowledgeExportJob(dataDir, created.jobId)?.manifest).toBeUndefined();
     expect(() => statSync(join(dataDir, 'km-export-staging', 'staged', created.plan.file.relativePath))).toThrow();
+  });
+
+  it('previews and executes approved L2 exports in fixture workspaces only with exact preconditions', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const preview = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    expect(preview.allowed).toBe(true);
+    expect(preview.adapter.kind).toBe('plain-markdown');
+    expect(preview.risk).toEqual({ mutatesWorkspace: true, network: false, gitPush: false, fixtureOnly: true });
+    expect(preview.precondition.currentTargetHash).toBeNull();
+    expect(preview.patch.status).toBe('new');
+
+    const applied = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-1',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+      now: '2026-08-27T02:00:00.000Z',
+    });
+    expect(applied.state).toBe('applied');
+    expect(applied.execution).toMatchObject({ state: 'applied', beforeHash: null, afterHash: staged.plan.file.contentHash });
+    expect(readFileSync(preview.destination.absolutePath, 'utf8')).toContain('Require approval before environment writes.');
+
+    const replay = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-1',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+      now: '2026-08-27T02:05:00.000Z',
+    });
+    expect(replay.updatedAt).toBe(applied.updatedAt);
+  });
+
+  it('exposes every formal destination adapter and blocks command-plan adapters from direct writes', () => {
+    const dataDir = tmpDataDir();
+    const expected = {
+      L1: { kind: 'command-plan', adapterId: 'l1-wiki-command-plan-v1' },
+      L2: { kind: 'plain-markdown', adapterId: 'l2-staging-plain-markdown-v1' },
+      L3: { kind: 'command-plan', adapterId: 'l3-skill-command-plan-v1' },
+      L4: { kind: 'command-plan', adapterId: 'l4-reference-command-plan-v1' },
+    } as const;
+    for (const [layer, adapter] of Object.entries(expected)) {
+      const created = createKnowledgeExportJob({ dataDir, knowledge: item({ knowledgeId: `kn_adapter_${layer}`, targetLayer: layer as KnowledgeItem['targetLayer'] }), actorId: 'reviewer',
+        idempotencyKey: `create-${layer}` });
+      const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+        idempotencyKey: `review-${layer}`, reasonCode: 'manual_review_approved' });
+      const preview = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+      expect(preview.adapter).toMatchObject(adapter);
+      expect(preview.adapter.commandPlan.length).toBeGreaterThan(0);
+      if (layer === 'L2') expect(preview.allowed).toBe(true);
+      else expect(preview.reasonCodes).toContain('command_plan_adapter_no_direct_write');
+    }
+  });
+
+  it('keeps production roots blocked until enabled and exactly allowlisted', () => {
+    const dataDir = tmpDataDir();
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'botmux-prod-root-'));
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+
+    const blocked = previewKmFormalExport({ dataDir, jobId: staged.jobId, workspaceRoot, env: { BOTMUX_KM_FORMAL_EXPORT_ENABLED: 'false',
+      BOTMUX_KM_FORMAL_EXPORT_ALLOWED_ROOTS: workspaceRoot } });
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.reasonCodes).toContain('formal_export_not_allowlisted');
+
+    const allowed = previewKmFormalExport({ dataDir, jobId: staged.jobId, workspaceRoot, env: { BOTMUX_KM_FORMAL_EXPORT_ENABLED: 'true',
+      BOTMUX_KM_FORMAL_EXPORT_ALLOWED_ROOTS: workspaceRoot } });
+    expect(allowed.allowed).toBe(true);
+    expect(allowed.risk.fixtureOnly).toBe(false);
+  });
+
+  it('detects stale destination preconditions before mutation', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const preview = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    const target = preview.destination.absolutePath;
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'manual edit');
+
+    const conflict = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-conflict',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+    });
+    expect(conflict.state).toBe('conflict');
+    expect(readFileSync(target, 'utf8')).toBe('manual edit');
+
+    const refreshed = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    const applied = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-after-conflict',
+      approvalGrade: 'G2',
+      confirmationToken: refreshed.confirmationToken,
+      expectedTargetHash: refreshed.precondition.currentTargetHash,
+      destinationVersion: refreshed.precondition.destinationVersion,
+    });
+    expect(applied.state).toBe('applied');
+  });
+
+  it('detects stale destination versions before mutation', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const preview = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    writeFileSync(join(preview.destination.root, '.botmux-km-destination.json'), JSON.stringify({ version: 'next' }));
+
+    const conflict = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-version-conflict',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+    });
+    expect(conflict.state).toBe('conflict');
+    expect(() => statSync(preview.destination.absolutePath)).toThrow();
+  });
+
+  it('rejects tampered traversal target paths before destination writes', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const jobFile = join(dataDir, 'km-export-staging', 'jobs', `${staged.jobId}.json`);
+    const tampered = JSON.parse(readFileSync(jobFile, 'utf8')) as any;
+    tampered.plan.destination.relativePath = '../escape.md';
+    writeFileSync(jobFile, JSON.stringify(tampered, null, 2));
+    expect(() => previewKmFormalExport({ dataDir, jobId: staged.jobId })).toThrow('km_export_path_escape');
+    expect(() => statSync(join(dataDir, 'escape.md'))).toThrow();
+  });
+
+  it('rejects symlink ancestors in the destination path', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'botmux-km-export-symlink-'));
+    mkdirSync(workspaceRoot, { recursive: true });
+    symlinkSync(tmpdir(), join(workspaceRoot, 'l2-staging'));
+    expect(() => previewKmFormalExport({ dataDir, jobId: staged.jobId, workspaceRoot })).toThrow('km_export_symlink_rejected');
+  });
+
+  it('resumes a prepared execution and rolls back newly created files', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const preview = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    expect(() => executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-resume',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+      simulateCrashAfterPrepare: true,
+    })).toThrow('km_export_simulated_crash_after_prepare');
+    expect(getKnowledgeExportJob(dataDir, staged.jobId)?.state).toBe('executing');
+
+    const applied = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-resume',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+    });
+    expect(applied.state).toBe('applied');
+    const target = preview.destination.absolutePath;
+    expect(readFileSync(target, 'utf8')).toContain('Require approval before environment writes.');
+
+    const rolledBack = rollbackKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'rollback-1',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+    });
+    expect(rolledBack.state).toBe('rolled_back');
+    expect(() => statSync(target)).toThrow();
+  });
+
+  it('restores previous destination content during rollback', () => {
+    const dataDir = tmpDataDir();
+    const created = createKnowledgeExportJob({ dataDir, knowledge: item({ targetLayer: 'L2' }), actorId: 'reviewer',
+      idempotencyKey: 'create-1' });
+    const staged = reviewKnowledgeExportJob({ dataDir, jobId: created.jobId, decision: 'approved', actorId: 'reviewer',
+      idempotencyKey: 'review-1', reasonCode: 'manual_review_approved' });
+    const previewRoot = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    const target = previewRoot.destination.absolutePath;
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'previous content');
+    const preview = previewKmFormalExport({ dataDir, jobId: staged.jobId });
+    const applied = executeKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'execute-restore',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+      expectedTargetHash: preview.precondition.currentTargetHash,
+      destinationVersion: preview.precondition.destinationVersion,
+    });
+    expect(applied.execution?.backupFile).toBeTruthy();
+    rollbackKmFormalExport({
+      dataDir,
+      jobId: staged.jobId,
+      actorId: 'reviewer',
+      idempotencyKey: 'rollback-restore',
+      approvalGrade: 'G2',
+      confirmationToken: preview.confirmationToken,
+    });
+    expect(readFileSync(target, 'utf8')).toBe('previous content');
   });
 });
