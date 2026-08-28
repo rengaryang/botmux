@@ -6,6 +6,7 @@ import { ObservationStore, type MemoryScope } from '../src/services/km/observati
 import { normalizeRetrievalQuery } from '../src/services/km/retrieval-quality.js';
 import { composePromptMemoryForTurn, defaultShadowProfile, runRetrievalShadow } from '../src/services/km/runtime-orchestrator.js';
 import { planPromptMemory, type PromptMemoryCandidate } from '../src/services/km/prompt-memory.js';
+import { approveKmProductionGatePlan, buildKmProductionGatePlan } from '../src/services/km/production-gate.js';
 
 const dirs: string[] = [];
 function tempDir(): string { const dir = mkdtempSync(join(tmpdir(), 'botmux-km-retrieval-quality-')); dirs.push(dir); return dir; }
@@ -140,6 +141,20 @@ describe('KM retrieval normalization and visibility', () => {
     store.upsertMemory({ state: 'active', scope: 'user', subject: 'u1', claimKey: 'own.language',
       claimText: 'Prefer Chinese response', confidence: 'observed', privacyClass: 'internal', sourceRefs });
     store.putPipelineProfile({ ...defaultShadowProfile('bot-1'), profileId: 'active-quality', revision: 1, injectionMode: 'active' }, 'shadow');
+    const now = new Date();
+    const gate = buildKmProductionGatePlan({
+      actionKind: 'prompt-canary',
+      target: { botAppId: 'bot-1', window: { start: new Date(now.getTime() - 60_000).toISOString(), end: new Date(now.getTime() + 60 * 60_000).toISOString() } },
+      scope: { botAppId: 'bot-1', sessionClass: 'manual-canary' },
+      actorId: 'operator-1', riskAck: { acknowledged: true, ticket: 'KM-QUALITY' }, confirmationToken: 'quality-token',
+      ttlSeconds: 3600, now: now.toISOString(),
+    });
+    store.createProductionGatePlan(gate.plan);
+    approveKmProductionGatePlan(store, {
+      planId: gate.plan.planId, actorId: 'operator-2', approvalGrade: 'G2', confirmationToken: 'quality-token',
+      previewHash: gate.plan.previewHash, riskAck: { acknowledged: true, ticket: 'KM-QUALITY' },
+      now: new Date(now.getTime() + 1_000).toISOString(),
+    });
     store.close();
     const result = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot-1', sessionId: 's1', turnId: 't1', userId: 'u1',
       queryText: 'response language', promptContent: 'hello', env: {

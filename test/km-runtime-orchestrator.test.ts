@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ObservationStore } from '../src/services/km/observation-store.js';
 import { boundedEvidenceWindow, composePromptMemoryForTurn, defaultShadowProfile, drainDistillationJobs, enqueueAutomaticDistillation, isKmAutoDistillationEnabled, isKmRetrievalShadowEnabled, resolveBoundedTranscriptWindow, runOneDistillationJob, runRetrievalShadow } from '../src/services/km/runtime-orchestrator.js';
+import { approveKmProductionGatePlan, buildKmProductionGatePlan } from '../src/services/km/production-gate.js';
 import { observationFromTurnCompletion } from '../src/services/km/observation-producers.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import type { ObservationEvent } from '../src/services/km/observation-schema.js';
@@ -127,11 +128,36 @@ describe('KM runtime orchestrator', () => {
     store.close();
   });
 
+  async function approvePromptCanary(store: ObservationStore, botAppId = 'bot'): Promise<void> {
+    const now = new Date();
+    const gate = buildKmProductionGatePlan({
+      actionKind: 'prompt-canary',
+      target: { botAppId, window: { start: new Date(now.getTime() - 60_000).toISOString(), end: new Date(now.getTime() + 60 * 60_000).toISOString() } },
+      scope: { botAppId, sessionClass: 'manual-canary' },
+      actorId: 'operator-1',
+      riskAck: { acknowledged: true, ticket: 'KM-CANARY-TEST' },
+      confirmationToken: 'approval-token',
+      ttlSeconds: 3600,
+      now: now.toISOString(),
+    });
+    store.createProductionGatePlan(gate.plan);
+    approveKmProductionGatePlan(store, {
+      planId: gate.plan.planId,
+      actorId: 'operator-2',
+      approvalGrade: 'G2',
+      confirmationToken: 'approval-token',
+      previewHash: gate.plan.previewHash,
+      riskAck: { acknowledged: true, ticket: 'KM-CANARY-TEST' },
+      now: new Date(now.getTime() + 1_000).toISOString(),
+    });
+  }
+
   it('composes live prompt memory only after all canary gates pass and audits requested/effective mode', async () => {
     const dir = tempDir(); const store = await ObservationStore.open(dir);
     store.upsertMemory({ state: 'active', scope: 'user', subject: 'u1', claimKey: 'language', claimText: 'Prefer Chinese', confidence: 'observed',
       privacyClass: 'internal', sourceRefs: [{ kind: 'api', ref: 'evt' }] });
     store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'canary', revision: 1, injectionMode: 'canary' }, 'shadow');
+    await approvePromptCanary(store);
     store.close();
 
     const blocked = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't1', userId: 'u1',
@@ -174,6 +200,7 @@ describe('KM runtime orchestrator', () => {
     store.upsertMemory({ state: 'active', scope: 'bot', subject: 'bot', claimKey: 'style', claimText: 'Use concise bullets', confidence: 'observed',
       privacyClass: 'internal', sourceRefs: [{ kind: 'api', ref: 'evt' }] });
     store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'process-env-canary', revision: 1, injectionMode: 'canary' }, 'shadow');
+    await approvePromptCanary(store);
     store.close();
     process.env.BOTMUX_KM_LIVE_INJECTION_ENABLED = 'true';
     process.env.BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED = 'true';
@@ -195,6 +222,7 @@ describe('KM runtime orchestrator', () => {
     store.upsertMemory({ state: 'active', scope: 'bot', subject: 'bot', claimKey: 'style', claimText: 'Use concise bullets', confidence: 'observed',
       privacyClass: 'internal', sourceRefs: [{ kind: 'api', ref: 'evt' }] });
     store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'active-live', revision: 1, injectionMode: 'active' }, 'shadow');
+    await approvePromptCanary(store);
     store.close();
     const result = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't-live',
       queryText: 'bullets', promptContent: 'hello', env: {

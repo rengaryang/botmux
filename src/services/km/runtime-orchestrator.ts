@@ -242,6 +242,16 @@ export async function composePromptMemoryForTurn(input: {
     } else if (input.providers?.length) {
       warnings.push('federated_retrieval_gate_disabled');
     }
+    const canaryApprovalPresent = store.listProductionGatePlans({ limit: 200, actionKind: 'prompt-canary' }).some(plan => {
+      if (plan.state !== 'approved' && plan.state !== 'executing') return false;
+      const target = plan.target as { botAppId?: unknown; window?: { start?: unknown; end?: unknown } };
+      if (target.botAppId !== input.botAppId) return false;
+      if (typeof target.window?.start !== 'string' || typeof target.window?.end !== 'string') return false;
+      const now = Date.now();
+      return Date.parse(plan.expiresAt) > now
+        && Date.parse(target.window.start) <= now
+        && Date.parse(target.window.end) > now;
+    });
     const composed = composeLivePromptMemory(input.promptContent, candidates, {
       botAppId: input.botAppId,
       userId: input.userId,
@@ -251,7 +261,7 @@ export async function composePromptMemoryForTurn(input: {
       teamId: input.teamId,
       workspaceId: input.workspaceId,
       requestedMode,
-      effectiveModeAuthorized: isKmEffectiveModeAuthorized(env),
+      effectiveModeAuthorized: isKmEffectiveModeAuthorized(env) && canaryApprovalPresent,
       liveInjectionEnabled: isKmLiveInjectionEnabled(env),
       canaryBotIds: parseBotAllowlist(env.BOTMUX_KM_CANARY_BOT_APP_IDS),
       promptTokenBudget: profile?.budgets.promptTokens ?? 1_800,

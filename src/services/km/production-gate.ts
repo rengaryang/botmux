@@ -187,7 +187,7 @@ export function buildKmProductionGatePlan(input: KmProductionGatePlanRequest): K
   const actionKind = normalizeActionKind(input.actionKind);
   const actorId = requireNonEmpty(input.actorId, 'actor');
   const now = parseIso(input.now ?? new Date().toISOString(), 'now');
-  const ttlSeconds = Math.max(60, Math.min(Math.trunc(input.ttlSeconds ?? 900), 86_400));
+  const ttlSeconds = Math.max(60, Math.min(Math.trunc(input.ttlSeconds ?? 900), 31 * 86_400));
   const expiresAt = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
   const target = normalizeTarget(actionKind, input.target);
   const scope = normalizeScope(input.scope);
