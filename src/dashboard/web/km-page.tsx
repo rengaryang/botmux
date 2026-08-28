@@ -168,6 +168,11 @@ type ProductionGatePlan = {
 type ProductionGateAudit = { auditId: string; planId: string; action: string; fromState?: string; toState: string; actorId: string; details: Record<string, unknown>; createdAt: string };
 type ProductionGateKillState = { enabled: boolean; reason: string; actorId: string; updatedAt: string };
 type ProductionGateList = { items: ProductionGatePlan[]; killSwitch: ProductionGateKillState };
+type CanaryRuntimeStatus = {
+  runtime: { active: boolean; planId?: string; botAppId: string; window?: { start: string; end: string }; reason: string };
+  restartRequired: false;
+  autoFallback: 'shadow';
+};
 
 type ObservationEvent = {
   eventId: string;
@@ -258,6 +263,8 @@ function KmPage(): React.JSX.Element {
   const [productionGateKill, setProductionGateKill] = useState<ProductionGateKillState>();
   const [productionGateAudit, setProductionGateAudit] = useState<ProductionGateAudit[]>([]);
   const [productionGateHandoff, setProductionGateHandoff] = useState<Record<string, unknown>>();
+  const [canaryRuntime, setCanaryRuntime] = useState<CanaryRuntimeStatus>();
+  const [canaryStep, setCanaryStep] = useState(1);
   const [goldenCases, setGoldenCases] = useState<GoldenCase[]>([]);
   const [shadowComparisons, setShadowComparisons] = useState<ShadowComparison[]>([]);
   const [shadowReadiness, setShadowReadiness] = useState<ShadowReadiness>();
@@ -276,6 +283,15 @@ function KmPage(): React.JSX.Element {
     ttlSeconds: 900,
     confirmationToken: '',
     approvalGrade: 'G2',
+  });
+  const [canaryForm, setCanaryForm] = useState({
+    botAppId: 'cli_aacca607f9ccdcf8',
+    durationHours: 168,
+    sessionClass: 'dashboard-canary-wizard',
+    riskAcknowledged: false,
+    rollbackCriteria: '隐私或作用域异常、错误率上升、延迟显著回归时立即回落 Shadow',
+    confirmationToken: '',
+    planId: '',
   });
 
   const load = async (type?: string) => {
@@ -334,6 +350,12 @@ function KmPage(): React.JSX.Element {
       setRetention(retentionStatus);
       setGoldenCases(goldenList.items); setShadowComparisons(comparisonList.items); setShadowReadiness(readiness);
       setDashboardMetrics(metricsResult.ok ? metricsResult.metrics : undefined);
+      const activeCanary = productionGateList.items.find(plan => plan.actionKind === 'prompt-canary' && plan.state === 'executing');
+      const botAppId = String((activeCanary?.target as { botAppId?: unknown } | undefined)?.botAppId ?? canaryForm.botAppId).trim();
+      if (botAppId) {
+        try { setCanaryRuntime(await getJson<CanaryRuntimeStatus>(`/api/km/canary-release/status?botAppId=${encodeURIComponent(botAppId)}`)); }
+        catch { setCanaryRuntime(undefined); }
+      }
       if (!metricsResult.ok) console.warn('KM dashboard metrics API unavailable, using fallback model', metricsResult.error);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -501,6 +523,47 @@ function KmPage(): React.JSX.Element {
       targetJson: JSON.stringify(targets[actionKind], null, 2),
       approvalGrade: actionKind === 'retention-purge' ? 'G4' : actionKind === 'formal-knowledge-export' || actionKind === 'prompt-canary' ? 'G2' : 'G3',
     }));
+  };
+  const createCanaryPlan = async () => {
+    if (!canaryForm.botAppId.trim() || !canaryForm.riskAcknowledged) return;
+    const start = new Date();
+    const end = new Date(start.getTime() + canaryForm.durationHours * 60 * 60 * 1000);
+    const riskAck = { acknowledged: true, rollbackCriteria: canaryForm.rollbackCriteria, source: 'dashboard-canary-wizard' };
+    try {
+      const response = await mutateJson<{ plan: ProductionGatePlan; confirmationToken: string }>('/api/km/production-gates', 'POST', {
+        actionKind: 'prompt-canary',
+        target: { botAppId: canaryForm.botAppId.trim(), window: { start: start.toISOString(), end: end.toISOString() } },
+        scope: { botAppId: canaryForm.botAppId.trim(), sessionClass: canaryForm.sessionClass },
+        riskAck,
+        ttlSeconds: Math.max(60, Math.ceil(canaryForm.durationHours * 3600)),
+      });
+      setCanaryForm(form => ({ ...form, planId: response.plan.planId, confirmationToken: response.confirmationToken }));
+      setCanaryStep(3);
+      setNotice(`Canary 影响预览已冻结：${response.plan.previewHash}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const activateCanary = async () => {
+    const plan = productionGates.find(item => item.planId === canaryForm.planId);
+    if (!plan || !window.confirm(`确认仅对 ${canaryForm.botAppId} 开启 ${canaryForm.durationHours} 小时 live Canary？到期自动回落 Shadow。`)) return;
+    try {
+      const result = await mutateJson<{ runtime: CanaryRuntimeStatus['runtime'] }>('/api/km/canary-release/activate', 'POST', {
+        planId: plan.planId, approvalGrade: 'G2', confirmationToken: canaryForm.confirmationToken,
+        previewHash: plan.previewHash, riskAck: plan.riskAck,
+      });
+      setCanaryRuntime({ runtime: result.runtime, restartRequired: false, autoFallback: 'shadow' });
+      setCanaryStep(4);
+      setNotice(`Canary 已生效：${plan.planId}，无需重启服务`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const rollbackCanary = async () => {
+    const planId = canaryRuntime?.runtime.planId;
+    if (!planId || !window.confirm('确认立即停止 live Canary 并回落 Shadow？')) return;
+    try {
+      await mutateJson(`/api/km/canary-release/${encodeURIComponent(planId)}/rollback`, 'POST', { reason: 'dashboard_operator_rollback' });
+      setCanaryStep(1); setNotice('Canary 已回落 Shadow，无需重启服务'); await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const createProductionGate = async () => {
     try {
@@ -852,7 +915,41 @@ function KmPage(): React.JSX.Element {
       </TabOnly>
 
       <TabOnly tab="production">
-        <KmSection title="Production Gates（Intent Only）" description="这里只生成不可执行计划、审批记录和 inert intent；高风险动作不出现在总览。" badge="高风险：需要审批令牌" risk="high">
+        <KmSection title="Canary 发布向导" description="精确 Bot、限时生效、G2 审批；无需修改 PM2 环境变量或重启服务，到期自动回落 Shadow。" badge="LIVE · 精确作用域" risk="high">
+          <ol className="km-canary-steps" aria-label="Canary 发布步骤">
+            {['选择 Bot 与窗口', '确认影响与回滚', 'G2 确认发布', '观察与回落'].map((label, index) => <li key={label} className={canaryStep >= index + 1 ? 'is-active' : ''}><b>{index + 1}</b><span>{label}</span></li>)}
+          </ol>
+          <div className="km-canary-console">
+            <div className="km-form-grid">
+              <label>精确 Bot App ID<input value={canaryForm.botAppId} onChange={e => setCanaryForm({ ...canaryForm, botAppId: e.target.value })} placeholder="cli_xxx" /></label>
+              <label>观察窗口（小时）<input type="number" min="1" max="744" value={canaryForm.durationHours} onChange={e => setCanaryForm({ ...canaryForm, durationHours: Number(e.target.value) })} /></label>
+              <label>会话范围<input value={canaryForm.sessionClass} onChange={e => setCanaryForm({ ...canaryForm, sessionClass: e.target.value })} /></label>
+              <label className="km-canary-wide">回滚条件<textarea value={canaryForm.rollbackCriteria} onChange={e => setCanaryForm({ ...canaryForm, rollbackCriteria: e.target.value })} /></label>
+            </div>
+            <div className="km-canary-impact">
+              <span><small>运行边界</small><strong>仅 {canaryForm.botAppId || '未选择'}</strong></span>
+              <span><small>持续时间</small><strong>{canaryForm.durationHours} 小时</strong></span>
+              <span><small>到期策略</small><strong>自动 Shadow</strong></span>
+              <span><small>服务操作</small><strong>无需重启</strong></span>
+            </div>
+            <label className="km-canary-ack"><input type="checkbox" checked={canaryForm.riskAcknowledged} onChange={e => { setCanaryForm({ ...canaryForm, riskAcknowledged: e.target.checked }); setCanaryStep(e.target.checked ? 2 : 1); }} /> 我已核对精确 Bot、观察窗口、隐私边界和回滚条件</label>
+            <div className="km-canary-actions">
+              <button disabled={!canaryForm.riskAcknowledged || !canaryForm.botAppId.trim()} onClick={() => void createCanaryPlan()}>生成影响预览</button>
+              <button className="danger" disabled={!canaryForm.planId || !canaryForm.confirmationToken} onClick={() => void activateCanary()}>G2 确认并发布</button>
+              <button disabled={!canaryRuntime?.runtime.active} onClick={() => void rollbackCanary()}>立即回落 Shadow</button>
+            </div>
+          </div>
+          <div className={`km-canary-status ${canaryRuntime?.runtime.active ? 'is-live' : ''}`}>
+            <span className="km-canary-pulse" aria-hidden="true" />
+            <div><small>当前运行态</small><strong>{canaryRuntime?.runtime.active ? 'LIVE CANARY' : 'SHADOW / 未激活'}</strong></div>
+            <div><small>Bot</small><strong>{canaryRuntime?.runtime.botAppId ?? canaryForm.botAppId}</strong></div>
+            <div><small>窗口结束</small><strong>{canaryRuntime?.runtime.window?.end ? new Date(canaryRuntime.runtime.window.end).toLocaleString() : '—'}</strong></div>
+            <div><small>原因</small><strong>{canaryRuntime?.runtime.reason ?? 'not_loaded'}</strong></div>
+          </div>
+          <KmInlineHelp>发布会写入 SQLite 的 action-scoped runtime intent；每次请求实时校验 exact Bot、G2 状态、Kill Switch 与时间窗口。窗口结束后即使进程不重启，也会 fail-closed 回到 Shadow。</KmInlineHelp>
+        </KmSection>
+
+        <KmSection title="Production Gates（高级）" description="通用生产闸门：计划、审批、Intent 与审计。Canary 日常发布优先使用上方向导。" badge="高风险：需要审批令牌" risk="high">
           <details className="km-advanced-panel">
             <summary>展开生产闸门表单</summary>
             <div className="km-form-grid">
@@ -863,7 +960,7 @@ function KmPage(): React.JSX.Element {
                 <option value="prompt-canary">prompt-canary</option>
                 <option value="retention-purge">retention-purge</option>
               </select>
-              <input type="number" min="60" max="86400" value={productionGateForm.ttlSeconds} onChange={e => setProductionGateForm({ ...productionGateForm, ttlSeconds: Number(e.target.value) })} title="TTL seconds" />
+              <input type="number" min="60" max="2678400" value={productionGateForm.ttlSeconds} onChange={e => setProductionGateForm({ ...productionGateForm, ttlSeconds: Number(e.target.value) })} title="TTL seconds" />
               <select value={productionGateForm.approvalGrade} onChange={e => setProductionGateForm({ ...productionGateForm, approvalGrade: e.target.value })}>
                 <option value="G0">G0</option><option value="G1">G1</option><option value="G2">G2</option><option value="G3">G3</option><option value="G4">G4</option>
               </select>

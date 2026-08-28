@@ -21,6 +21,7 @@ import { federatedMemoryRetrieveWithTelemetry } from './memory-backend-coordinat
 import type { MemoryBackendProvider } from './memory-backend-spi.js';
 import { resolveRetrievalScopeSubjects, visibleScopes } from './retrieval-quality.js';
 import type { MemoryScope, RetrievalQualityCounters } from './observation-store.js';
+import { resolveKmCanaryRuntimeAuthorization } from './canary-release.js';
 
 function envOn(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
   return ['1', 'true', 'yes'].includes(env[name]?.trim().toLowerCase() ?? '');
@@ -242,16 +243,22 @@ export async function composePromptMemoryForTurn(input: {
     } else if (input.providers?.length) {
       warnings.push('federated_retrieval_gate_disabled');
     }
-    const canaryApprovalPresent = store.listProductionGatePlans({ limit: 200, actionKind: 'prompt-canary' }).some(plan => {
-      if (plan.state !== 'approved' && plan.state !== 'executing') return false;
+    const canaryAuthorization = resolveKmCanaryRuntimeAuthorization(store, input.botAppId);
+    // Compatibility path for canaries activated before the Dashboard runtime
+    // executor existed. It still requires all legacy env gates plus an exact,
+    // approved, in-window plan; the wizard path needs no process reload.
+    const legacyApprovalPresent = store.listProductionGatePlans({ limit: 200, actionKind: 'prompt-canary' }).some(plan => {
+      if (plan.state !== 'approved') return false;
       const target = plan.target as { botAppId?: unknown; window?: { start?: unknown; end?: unknown } };
-      if (target.botAppId !== input.botAppId) return false;
-      if (typeof target.window?.start !== 'string' || typeof target.window?.end !== 'string') return false;
       const now = Date.now();
-      return Date.parse(plan.expiresAt) > now
-        && Date.parse(target.window.start) <= now
-        && Date.parse(target.window.end) > now;
+      return target.botAppId === input.botAppId
+        && typeof target.window?.start === 'string' && typeof target.window?.end === 'string'
+        && Date.parse(plan.expiresAt) > now && Date.parse(target.window.start) <= now && Date.parse(target.window.end) > now;
     });
+    const legacyLiveAuthorized = legacyApprovalPresent
+      && isKmEffectiveModeAuthorized(env)
+      && isKmLiveInjectionEnabled(env)
+      && parseBotAllowlist(env.BOTMUX_KM_CANARY_BOT_APP_IDS).includes(input.botAppId);
     const composed = composeLivePromptMemory(input.promptContent, candidates, {
       botAppId: input.botAppId,
       userId: input.userId,
@@ -261,9 +268,9 @@ export async function composePromptMemoryForTurn(input: {
       teamId: input.teamId,
       workspaceId: input.workspaceId,
       requestedMode,
-      effectiveModeAuthorized: isKmEffectiveModeAuthorized(env) && canaryApprovalPresent,
-      liveInjectionEnabled: isKmLiveInjectionEnabled(env),
-      canaryBotIds: parseBotAllowlist(env.BOTMUX_KM_CANARY_BOT_APP_IDS),
+      effectiveModeAuthorized: canaryAuthorization.active || legacyLiveAuthorized,
+      liveInjectionEnabled: canaryAuthorization.active || legacyLiveAuthorized,
+      canaryBotIds: canaryAuthorization.active || legacyLiveAuthorized ? [input.botAppId] : [],
       promptTokenBudget: profile?.budgets.promptTokens ?? 1_800,
     });
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
