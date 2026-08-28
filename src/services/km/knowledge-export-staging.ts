@@ -1,15 +1,18 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
-import { dirname, join, posix, resolve, sep } from 'node:path';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, dirname, join, posix, relative, resolve, sep } from 'node:path';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import type { KnowledgeItem, KnowledgeLayer } from './observation-store.js';
 
 export const KM_EXPORT_STAGING_SCHEMA_VERSION = 1;
 export const KM_EXPORT_STAGING_DIR = 'km-export-staging';
 export const KM_EXPORTER_VERSION = 'km-approved-exporter-v1';
+export const KM_FORMAL_EXPORT_EXECUTOR_VERSION = 'km-formal-export-executor-v1';
 
-export type KmKnowledgeExportJobState = 'review_pending' | 'rejected' | 'staged';
-export type KmExportActionKind = 'create' | 'approve' | 'reject';
+export type KmKnowledgeExportJobState = 'review_pending' | 'rejected' | 'staged' | 'executing' | 'applied' | 'conflict' | 'failed' | 'rolled_back';
+export type KmExportActionKind = 'create' | 'approve' | 'reject' | 'execute' | 'rollback' | 'resume';
+export type KmDestinationAdapterKind = 'plain-markdown' | 'command-plan';
 
 export interface KmExportDestination {
   layer: KnowledgeLayer;
@@ -17,6 +20,9 @@ export interface KmExportDestination {
   relativePath: string;
   formalPath: string;
   writeMode: 'staging-only' | 'reviewed-only';
+  adapterId: string;
+  adapterKind: KmDestinationAdapterKind;
+  commandPlan: string[];
 }
 
 export interface KmExportPlannedFile {
@@ -81,12 +87,78 @@ export interface KmKnowledgeExportManifest {
   updatedAt: string;
 }
 
+export interface KmFormalExportPrecondition {
+  destinationRoot: string;
+  targetRelativePath: string;
+  expectedTargetHash: string | null;
+  currentTargetHash: string | null;
+  stagedContentHash: string;
+  destinationVersion: string;
+}
+
+export interface KmFormalExportPatch {
+  deterministicPatchHash: string;
+  status: 'new' | 'unchanged' | 'changed' | 'blocked';
+  lines: string[];
+}
+
+export interface KmFormalExportExecutionPreview {
+  schemaVersion: 1;
+  executorVersion: string;
+  jobId: string;
+  state: KmKnowledgeExportJobState;
+  adapter: { adapterId: string; kind: KmDestinationAdapterKind; commandPlan: string[] };
+  destination: { root: string; relativePath: string; absolutePath: string };
+  allowed: boolean;
+  reasonCodes: string[];
+  precondition: KmFormalExportPrecondition;
+  patch: KmFormalExportPatch;
+  requiredApprovalGrade: 'G2';
+  confirmationToken: string;
+  risk: { mutatesWorkspace: boolean; network: false; gitPush: false; fixtureOnly: boolean };
+}
+
+export interface KmFormalExportExecutionManifest {
+  schemaVersion: 1;
+  executorVersion: string;
+  jobId: string;
+  executionId: string;
+  state: 'applied' | 'rolled_back' | 'conflict' | 'failed';
+  adapterId: string;
+  destination: { root: string; relativePath: string; absolutePath: string };
+  precondition: KmFormalExportPrecondition;
+  patchHash: string;
+  contentHash: string;
+  beforeHash: string | null;
+  afterHash: string | null;
+  backupFile?: string;
+  committedAt?: string;
+  rolledBackAt?: string;
+  rolledBackExecutionId?: string;
+  rollbackPlan: string[];
+}
+
+export interface KmFormalExportAttempt {
+  executionId: string;
+  action: 'execute' | 'rollback';
+  state: 'prepared' | 'applied' | 'rolled_back' | 'conflict' | 'failed';
+  idempotencyKey: string;
+  actorId: string;
+  approvalGrade: 'G2' | 'G3' | 'G4';
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+  manifestPath?: string;
+}
+
 export interface KmKnowledgeExportJob {
   schemaVersion: 1;
   jobId: string;
   state: KmKnowledgeExportJobState;
   plan: KmKnowledgeExportPlan;
   manifest?: KmKnowledgeExportManifest;
+  execution?: KmFormalExportExecutionManifest;
+  attempts?: KmFormalExportAttempt[];
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -110,12 +182,86 @@ export interface ReviewKmKnowledgeExportJobInput {
   now?: string;
 }
 
+export interface KmFormalExportEnv {
+  BOTMUX_KM_FORMAL_EXPORT_ENABLED?: string;
+  BOTMUX_KM_FORMAL_EXPORT_ALLOWED_ROOTS?: string;
+}
+
+export interface PreviewKmFormalExportInput {
+  dataDir: string;
+  jobId: string;
+  workspaceRoot?: string;
+  env?: KmFormalExportEnv;
+}
+
+export interface ExecuteKmFormalExportInput extends PreviewKmFormalExportInput {
+  actorId: string;
+  idempotencyKey: string;
+  approvalGrade: 'G2' | 'G3' | 'G4';
+  confirmationToken: string;
+  expectedTargetHash: string | null;
+  destinationVersion: string;
+  maxAttempts?: number;
+  now?: string;
+  simulateCrashAfterPrepare?: boolean;
+}
+
+export interface RollbackKmFormalExportInput extends PreviewKmFormalExportInput {
+  actorId: string;
+  idempotencyKey: string;
+  approvalGrade: 'G2' | 'G3' | 'G4';
+  confirmationToken: string;
+  expectedTargetHash?: string | null;
+  destinationVersion?: string;
+  now?: string;
+}
+
 const LAYER_ROOTS: Readonly<Record<KnowledgeLayer, string>> = {
   L1: 'l1-wiki',
   L2: 'l2-staging',
   L3: 'l3-skills',
   L4: 'l4-references',
   'reviewed-only': 'reviewed-only',
+};
+
+const LAYER_ADAPTERS: Readonly<Record<KnowledgeLayer, { adapterId: string; adapterKind: KmDestinationAdapterKind; commandPlan: string[] }>> = {
+  L1: {
+    adapterId: 'l1-wiki-command-plan-v1',
+    adapterKind: 'command-plan',
+    commandPlan: [
+      'Prepare reviewed Markdown payload for the future Lark/wiki writer.',
+      'Do not invoke Lark APIs, network, git push, or external tools from this executor.',
+    ],
+  },
+  L2: {
+    adapterId: 'l2-staging-plain-markdown-v1',
+    adapterKind: 'plain-markdown',
+    commandPlan: [
+      'Atomically replace the allowlisted local Markdown destination.',
+      'Do not run git commands, network calls, or background schedulers.',
+    ],
+  },
+  L3: {
+    adapterId: 'l3-skill-command-plan-v1',
+    adapterKind: 'command-plan',
+    commandPlan: [
+      'Prepare reviewed Markdown payload and patch metadata for a future skill/reference tool.',
+      'Do not install skills, edit package registries, invoke network, or push git refs.',
+    ],
+  },
+  L4: {
+    adapterId: 'l4-reference-command-plan-v1',
+    adapterKind: 'command-plan',
+    commandPlan: [
+      'Prepare reviewed Markdown payload and patch metadata for a future reference writer.',
+      'Do not invoke network, external CLIs, or git push.',
+    ],
+  },
+  'reviewed-only': {
+    adapterId: 'reviewed-only-disabled-v1',
+    adapterKind: 'command-plan',
+    commandPlan: ['Reviewed-only knowledge is intentionally not exportable.'],
+  },
 };
 
 const CONTENT_HEADER = '<!-- botmux:km-export schema=1; generated for review staging only -->';
@@ -161,6 +307,12 @@ function assertUnder(parent: string, child: string): void {
   if (target !== root && !target.startsWith(`${root}${sep}`)) throw new Error('km_export_path_escape');
 }
 
+function appendAudit(dataDir: string, event: Record<string, unknown>): void {
+  const path = join(kmExportRoot(dataDir), 'audit.jsonl');
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+}
+
 export function kmExportRoot(dataDir: string): string {
   return join(dataDir, KM_EXPORT_STAGING_DIR);
 }
@@ -173,8 +325,16 @@ function stagedRoot(dataDir: string): string {
   return join(kmExportRoot(dataDir), 'staged');
 }
 
+function executionRoot(dataDir: string): string {
+  return join(kmExportRoot(dataDir), 'executions');
+}
+
 function jobPath(dataDir: string, jobId: string): string {
   return join(jobsRoot(dataDir), `${jobId}.json`);
+}
+
+function executionDir(dataDir: string, executionId: string): string {
+  return join(executionRoot(dataDir), executionId);
 }
 
 function idempotencyPath(dataDir: string, key: string): string {
@@ -210,6 +370,7 @@ function renderKnowledgeContent(item: KnowledgeItem): string {
 
 function destinationFor(item: KnowledgeItem): KmExportDestination {
   const root = LAYER_ROOTS[item.targetLayer];
+  const adapter = LAYER_ADAPTERS[item.targetLayer];
   const base = `${slugPart(item.claimKey)}-${sha256Hex(item.knowledgeId).slice(0, 10)}.md`;
   const relative = normalizeRelativePath(`${root}/${base}`);
   if (!relative || !relative.startsWith(`${root}/`)) throw new Error('km_export_invalid_target_path');
@@ -219,6 +380,9 @@ function destinationFor(item: KnowledgeItem): KmExportDestination {
     relativePath: relative,
     formalPath: posix.join('knowledge', relative),
     writeMode: item.targetLayer === 'reviewed-only' ? 'reviewed-only' : 'staging-only',
+    adapterId: adapter.adapterId,
+    adapterKind: adapter.adapterKind,
+    commandPlan: [...adapter.commandPlan],
   };
 }
 
@@ -259,6 +423,123 @@ function existingStagedContent(dataDir: string, targetPath: string): string | un
   const path = join(stagedRoot(dataDir), targetPath);
   try { return readFileSync(path, 'utf8'); }
   catch { return undefined; }
+}
+
+function existingDestinationContent(root: string, targetPath: string): string | undefined {
+  const path = join(root, targetPath);
+  try { return readFileSync(path, 'utf8'); }
+  catch { return undefined; }
+}
+
+function hashContentOrNull(content: string | undefined): string | null {
+  return content === undefined ? null : sha256(content);
+}
+
+function fileHashOrNull(path: string): string | null {
+  try { return sha256(readFileSync(path, 'utf8')); }
+  catch { return null; }
+}
+
+function canonicalExistingRoot(root: string): string {
+  const resolved = resolve(root);
+  const stat = lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('km_export_destination_root_invalid');
+  return realpathSync(resolved);
+}
+
+function assertNoSymlinkAncestors(root: string, relativePath: string): string {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) throw new Error('km_export_path_escape');
+  const rootReal = canonicalExistingRoot(root);
+  let cursor = rootReal;
+  const parts = normalized.split('/');
+  for (let i = 0; i < parts.length; i += 1) {
+    cursor = join(cursor, parts[i]);
+    if (!existsSync(cursor)) continue;
+    const stat = lstatSync(cursor);
+    if (stat.isSymbolicLink()) throw new Error('km_export_symlink_rejected');
+    if (i < parts.length - 1 && !stat.isDirectory()) throw new Error('km_export_destination_parent_not_directory');
+    if (i === parts.length - 1 && !stat.isFile()) throw new Error('km_export_destination_not_plain_file');
+    const real = realpathSync(cursor);
+    assertUnder(rootReal, real);
+  }
+  return join(rootReal, normalized);
+}
+
+function destinationVersion(root: string): string {
+  const real = canonicalExistingRoot(root);
+  const marker = join(real, '.botmux-km-destination.json');
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf8')) as { version?: unknown };
+    return typeof parsed.version === 'string' && parsed.version.trim() ? parsed.version : sha256(real);
+  } catch {
+    return sha256(real);
+  }
+}
+
+function parseAllowedRoots(env: KmFormalExportEnv): string[] {
+  const raw = env.BOTMUX_KM_FORMAL_EXPORT_ALLOWED_ROOTS?.trim();
+  if (!raw) return [];
+  return raw.split(delimiter).map(value => value.trim()).filter(Boolean).map(value => canonicalExistingRoot(value));
+}
+
+function exactRootAllowed(root: string, env: KmFormalExportEnv): boolean {
+  if (env.BOTMUX_KM_FORMAL_EXPORT_ENABLED !== 'true') return false;
+  const canonical = canonicalExistingRoot(root);
+  return parseAllowedRoots(env).some(allowed => allowed === canonical);
+}
+
+function isFixtureRoot(root: string): boolean {
+  const canonical = canonicalExistingRoot(root);
+  const rel = relative(canonicalExistingRoot(tmpdir()), canonical);
+  return !!rel && !rel.startsWith('..') && !posix.isAbsolute(rel.replaceAll('\\', '/')) && canonical.includes('botmux-km-export-');
+}
+
+function defaultWorkspaceRoot(dataDir: string): string {
+  return join(tmpdir(), `botmux-km-export-${sha256Hex(resolve(dataDir)).slice(0, 12)}`);
+}
+
+function executionIdFor(jobId: string, idempotencyKey: string): string {
+  return `kmxe_${sha256Hex(`${jobId}:${idempotencyKey}`).slice(0, 32)}`;
+}
+
+function confirmationTokenFor(job: KmKnowledgeExportJob, root: string): string {
+  return `kmx-confirm:${sha256Hex(stableJson({
+    jobId: job.jobId,
+    root: canonicalExistingRoot(root),
+    targetPath: job.plan.destination.relativePath,
+    contentHash: job.plan.file.contentHash,
+    adapterId: job.plan.destination.adapterId,
+  })).slice(0, 32)}`;
+}
+
+function appendAttempt(job: KmKnowledgeExportJob, attempt: KmFormalExportAttempt): KmKnowledgeExportJob {
+  const attempts = job.attempts ?? [];
+  const index = attempts.findIndex(item => item.executionId === attempt.executionId);
+  const nextAttempts = index >= 0
+    ? attempts.map(item => item.executionId === attempt.executionId ? attempt : item)
+    : [...attempts, attempt];
+  return { ...job, attempts: nextAttempts, updatedAt: attempt.updatedAt };
+}
+
+function manifestPathForExecution(dataDir: string, executionId: string): string {
+  return join(executionDir(dataDir, executionId), 'manifest.json');
+}
+
+function backupPathForExecution(dataDir: string, executionId: string): string {
+  return join(executionDir(dataDir, executionId), 'before.md');
+}
+
+function commitManifest(dataDir: string, executionId: string, manifest: KmFormalExportExecutionManifest): string {
+  const path = manifestPathForExecution(dataDir, executionId);
+  assertUnder(executionRoot(dataDir), path);
+  mkdirSync(dirname(path), { recursive: true });
+  atomicWriteFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, durable: true, followTargetSymlink: false });
+  return path;
+}
+
+function relativeToKmRoot(dataDir: string, path: string): string {
+  return relative(kmExportRoot(dataDir), path).replaceAll('\\', '/');
 }
 
 function jobIdFor(plan: KmKnowledgeExportPlan): string {
@@ -348,6 +629,7 @@ export function createKnowledgeExportJob(input: CreateKmKnowledgeExportJobInput)
   mkdirSync(jobsRoot(input.dataDir), { recursive: true });
   writeJson(jobPath(input.dataDir, job.jobId), job);
   writeJson(keyFile, { jobId: job.jobId, action: 'create', createdAt: now });
+  appendAudit(input.dataDir, { action: 'create', state: job.state, jobId: job.jobId, actorId: input.actorId, at: now });
   return job;
 }
 
@@ -417,5 +699,275 @@ export function reviewKnowledgeExportJob(input: ReviewKmKnowledgeExportJobInput)
   }
   writeJson(jobPath(input.dataDir, job.jobId), next);
   writeJson(keyFile, { jobId: job.jobId, action: approval.action, createdAt: now });
+  appendAudit(input.dataDir, { action: approval.action, state: next.state, jobId: job.jobId, actorId: input.actorId, at: now });
+  return next;
+}
+
+function resolveWorkspaceRoot(input: PreviewKmFormalExportInput): string {
+  const root = input.workspaceRoot?.trim() || defaultWorkspaceRoot(input.dataDir);
+  if (!input.workspaceRoot) mkdirSync(root, { recursive: true });
+  return canonicalExistingRoot(root);
+}
+
+function stagedContentForJob(dataDir: string, job: KmKnowledgeExportJob): string {
+  if (!job.manifest?.stagedFile) throw new Error('km_export_staged_manifest_required');
+  const stagedFile = join(stagedRoot(dataDir), job.manifest.stagedFile);
+  assertUnder(stagedRoot(dataDir), stagedFile);
+  const content = readFileSync(stagedFile, 'utf8');
+  if (sha256(content) !== job.plan.file.contentHash) throw new Error('km_export_staged_content_mismatch');
+  return content;
+}
+
+function previewContentForJob(dataDir: string, job: KmKnowledgeExportJob): string {
+  if (!job.manifest?.stagedFile) return job.plan.file.content;
+  return stagedContentForJob(dataDir, job);
+}
+
+function formalPatch(existing: string | undefined, next: string): KmFormalExportPatch {
+  const preview = diffLines(existing, next);
+  return {
+    deterministicPatchHash: sha256(stableJson({ before: existing ?? null, after: next })),
+    status: preview.status,
+    lines: preview.lines,
+  };
+}
+
+function writePreparedAttempt(dataDir: string, job: KmKnowledgeExportJob, attempt: KmFormalExportAttempt): KmKnowledgeExportJob {
+  const next = appendAttempt(job, attempt);
+  writeJson(jobPath(dataDir, job.jobId), next);
+  return next;
+}
+
+function writeExecutionResult(
+  dataDir: string,
+  job: KmKnowledgeExportJob,
+  attempt: KmFormalExportAttempt,
+  manifest: KmFormalExportExecutionManifest,
+  jobExecution: KmFormalExportExecutionManifest = manifest,
+): KmKnowledgeExportJob {
+  const manifestPath = commitManifest(dataDir, attempt.executionId, manifest);
+  const finalAttempt: KmFormalExportAttempt = {
+    ...attempt,
+    state: manifest.state,
+    updatedAt: manifest.committedAt ?? manifest.rolledBackAt ?? attempt.updatedAt,
+    manifestPath: relativeToKmRoot(dataDir, manifestPath),
+  };
+  const next = appendAttempt({ ...job, state: manifest.state, execution: jobExecution }, finalAttempt);
+  writeJson(jobPath(dataDir, job.jobId), next);
+  return next;
+}
+
+export function previewKmFormalExport(input: PreviewKmFormalExportInput): KmFormalExportExecutionPreview {
+  const job = getKnowledgeExportJob(input.dataDir, input.jobId);
+  if (!job) throw new Error('km_export_job_not_found');
+  const root = resolveWorkspaceRoot(input);
+  const content = previewContentForJob(input.dataDir, job);
+  const targetPath = assertNoSymlinkAncestors(root, job.plan.destination.relativePath);
+  const current = existingDestinationContent(root, job.plan.destination.relativePath);
+  const currentTargetHash = hashContentOrNull(current);
+  const destVersion = destinationVersion(root);
+  const env = input.env ?? process.env;
+  const fixtureOnly = isFixtureRoot(root);
+  const formalAllowed = exactRootAllowed(root, env);
+  const reasonCodes: string[] = [];
+  if (!['staged', 'executing', 'conflict', 'failed'].includes(job.state)) reasonCodes.push(`job_not_staged:${job.state}`);
+  if (!fixtureOnly && !formalAllowed) reasonCodes.push('formal_export_not_allowlisted');
+  if (job.plan.destination.adapterKind === 'command-plan') reasonCodes.push('command_plan_adapter_no_direct_write');
+  const patch = formalPatch(current, content);
+  return {
+    schemaVersion: 1,
+    executorVersion: KM_FORMAL_EXPORT_EXECUTOR_VERSION,
+    jobId: job.jobId,
+    state: job.state,
+    adapter: {
+      adapterId: job.plan.destination.adapterId,
+      kind: job.plan.destination.adapterKind,
+      commandPlan: [...job.plan.destination.commandPlan],
+    },
+    destination: { root, relativePath: job.plan.destination.relativePath, absolutePath: targetPath },
+    allowed: reasonCodes.length === 0,
+    reasonCodes,
+    precondition: {
+      destinationRoot: root,
+      targetRelativePath: job.plan.destination.relativePath,
+      expectedTargetHash: currentTargetHash,
+      currentTargetHash,
+      stagedContentHash: sha256(content),
+      destinationVersion: destVersion,
+    },
+    patch,
+    requiredApprovalGrade: 'G2',
+    confirmationToken: confirmationTokenFor(job, root),
+    risk: { mutatesWorkspace: job.plan.destination.adapterKind === 'plain-markdown', network: false, gitPush: false, fixtureOnly },
+  };
+}
+
+export function executeKmFormalExport(input: ExecuteKmFormalExportInput): KmKnowledgeExportJob {
+  const keyFile = idempotencyPath(input.dataDir, `execute:${input.jobId}:${input.idempotencyKey}`);
+  const replay = readJson<{ jobId: string }>(keyFile);
+  if (replay) {
+    const existing = getKnowledgeExportJob(input.dataDir, replay.jobId);
+    if (existing) return existing;
+  }
+  let job = getKnowledgeExportJob(input.dataDir, input.jobId);
+  if (!job) throw new Error('km_export_job_not_found');
+  if (input.approvalGrade !== 'G2') throw new Error('km_export_approval_grade_required');
+  const maxAttempts = input.maxAttempts ?? 3;
+  const executionAttempts = (job.attempts ?? []).filter(attempt => attempt.action === 'execute' && attempt.idempotencyKey !== input.idempotencyKey);
+  const existingAttempt = (job.attempts ?? []).find(attempt => attempt.action === 'execute' && attempt.idempotencyKey === input.idempotencyKey);
+  if (!existingAttempt && executionAttempts.length >= maxAttempts) throw new Error('km_export_retry_exhausted');
+
+  const preview = previewKmFormalExport(input);
+  if (input.confirmationToken !== preview.confirmationToken) throw new Error('km_export_confirmation_token_invalid');
+  if (!preview.allowed) throw new Error(`km_export_execution_blocked:${preview.reasonCodes.join(',')}`);
+  if (input.expectedTargetHash !== preview.precondition.currentTargetHash || input.destinationVersion !== preview.precondition.destinationVersion) {
+    const now = input.now ?? new Date().toISOString();
+    const executionId = executionIdFor(job.jobId, input.idempotencyKey);
+    const attempt: KmFormalExportAttempt = {
+      executionId,
+      action: 'execute',
+      state: 'conflict',
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId,
+      approvalGrade: input.approvalGrade,
+      createdAt: existingAttempt?.createdAt ?? now,
+      updatedAt: now,
+      error: 'km_export_precondition_stale',
+    };
+    const manifest: KmFormalExportExecutionManifest = {
+      schemaVersion: 1,
+      executorVersion: KM_FORMAL_EXPORT_EXECUTOR_VERSION,
+      jobId: job.jobId,
+      executionId,
+      state: 'conflict',
+      adapterId: job.plan.destination.adapterId,
+      destination: preview.destination,
+      precondition: { ...preview.precondition, expectedTargetHash: input.expectedTargetHash, destinationVersion: input.destinationVersion },
+      patchHash: preview.patch.deterministicPatchHash,
+      contentHash: job.plan.file.contentHash,
+      beforeHash: preview.precondition.currentTargetHash,
+      afterHash: preview.precondition.currentTargetHash,
+      rollbackPlan: ['No destination mutation was performed because the precondition was stale. Refresh preview and retry with a new token.'],
+    };
+    const next = writeExecutionResult(input.dataDir, job, attempt, manifest);
+    writeJson(keyFile, { jobId: job.jobId, action: 'execute', executionId, createdAt: now });
+    appendAudit(input.dataDir, { action: 'execute', state: 'conflict', jobId: job.jobId, executionId, actorId: input.actorId, at: now });
+    return next;
+  }
+
+  const now = input.now ?? new Date().toISOString();
+  const executionId = executionIdFor(job.jobId, input.idempotencyKey);
+  const attempt: KmFormalExportAttempt = {
+    executionId,
+    action: 'execute',
+    state: 'prepared',
+    idempotencyKey: input.idempotencyKey,
+    actorId: input.actorId,
+    approvalGrade: input.approvalGrade,
+    createdAt: existingAttempt?.createdAt ?? now,
+    updatedAt: now,
+  };
+  job = writePreparedAttempt(input.dataDir, { ...job, state: 'executing' }, attempt);
+  const content = stagedContentForJob(input.dataDir, job);
+  const preparedContent = join(executionDir(input.dataDir, executionId), 'content.md');
+  mkdirSync(dirname(preparedContent), { recursive: true });
+  atomicWriteFileSync(preparedContent, content, { mode: 0o600, durable: true, followTargetSymlink: false });
+  const targetPath = assertNoSymlinkAncestors(preview.destination.root, job.plan.destination.relativePath);
+  const beforeContent = existingDestinationContent(preview.destination.root, job.plan.destination.relativePath);
+  const beforeHash = hashContentOrNull(beforeContent);
+  let backupFile: string | undefined;
+  if (beforeContent !== undefined) {
+    const backup = backupPathForExecution(input.dataDir, executionId);
+    mkdirSync(dirname(backup), { recursive: true });
+    atomicWriteFileSync(backup, beforeContent, { mode: 0o600, durable: true, followTargetSymlink: false });
+    backupFile = relativeToKmRoot(input.dataDir, backup);
+  }
+  appendAudit(input.dataDir, { action: 'execute', state: 'prepared', jobId: job.jobId, executionId, actorId: input.actorId, at: now });
+  if (input.simulateCrashAfterPrepare) throw new Error('km_export_simulated_crash_after_prepare');
+
+  mkdirSync(dirname(targetPath), { recursive: true });
+  const commitTargetPath = assertNoSymlinkAncestors(preview.destination.root, job.plan.destination.relativePath);
+  atomicWriteFileSync(commitTargetPath, content, { mode: 0o600, durable: true, followTargetSymlink: false });
+  const afterHash = fileHashOrNull(commitTargetPath);
+  const manifest: KmFormalExportExecutionManifest = {
+    schemaVersion: 1,
+    executorVersion: KM_FORMAL_EXPORT_EXECUTOR_VERSION,
+    jobId: job.jobId,
+    executionId,
+    state: 'applied',
+    adapterId: job.plan.destination.adapterId,
+    destination: preview.destination,
+    precondition: preview.precondition,
+    patchHash: preview.patch.deterministicPatchHash,
+    contentHash: job.plan.file.contentHash,
+    beforeHash,
+    afterHash,
+    ...(backupFile ? { backupFile } : {}),
+    committedAt: now,
+    rollbackPlan: beforeHash
+      ? ['Restore the captured backup file through rollbackKmFormalExport after verifying the current target hash.']
+      : ['Remove the newly created destination file through rollbackKmFormalExport after verifying the current target hash.'],
+  };
+  const next = writeExecutionResult(input.dataDir, job, attempt, manifest);
+  writeJson(keyFile, { jobId: job.jobId, action: 'execute', executionId, createdAt: now });
+  appendAudit(input.dataDir, { action: 'execute', state: 'applied', jobId: job.jobId, executionId, actorId: input.actorId, at: now });
+  return next;
+}
+
+export function rollbackKmFormalExport(input: RollbackKmFormalExportInput): KmKnowledgeExportJob {
+  const keyFile = idempotencyPath(input.dataDir, `rollback:${input.jobId}:${input.idempotencyKey}`);
+  const replay = readJson<{ jobId: string }>(keyFile);
+  if (replay) {
+    const existing = getKnowledgeExportJob(input.dataDir, replay.jobId);
+    if (existing) return existing;
+  }
+  const job = getKnowledgeExportJob(input.dataDir, input.jobId);
+  if (!job?.execution || job.execution.state !== 'applied') throw new Error('km_export_applied_execution_required');
+  if (input.approvalGrade !== 'G2') throw new Error('km_export_approval_grade_required');
+  const root = resolveWorkspaceRoot(input);
+  const expectedToken = confirmationTokenFor(job, root);
+  if (input.confirmationToken !== expectedToken) throw new Error('km_export_confirmation_token_invalid');
+  if (!isFixtureRoot(root) && !exactRootAllowed(root, input.env ?? process.env)) throw new Error('km_export_destination_not_allowlisted');
+  const targetPath = assertNoSymlinkAncestors(root, job.plan.destination.relativePath);
+  const currentHash = fileHashOrNull(targetPath);
+  const expectedHash = input.expectedTargetHash ?? job.execution.afterHash;
+  if (currentHash !== expectedHash) throw new Error('km_export_rollback_precondition_stale');
+  if (input.destinationVersion && input.destinationVersion !== destinationVersion(root)) throw new Error('km_export_destination_version_stale');
+
+  const now = input.now ?? new Date().toISOString();
+  const executionId = executionIdFor(job.jobId, input.idempotencyKey);
+  const attempt: KmFormalExportAttempt = {
+    executionId,
+    action: 'rollback',
+    state: 'prepared',
+    idempotencyKey: input.idempotencyKey,
+    actorId: input.actorId,
+    approvalGrade: input.approvalGrade,
+    createdAt: now,
+    updatedAt: now,
+  };
+  writePreparedAttempt(input.dataDir, job, attempt);
+  if (job.execution.beforeHash && !job.execution.backupFile) throw new Error('km_export_rollback_backup_missing');
+  if (job.execution.beforeHash && job.execution.backupFile) {
+    const backup = join(kmExportRoot(input.dataDir), job.execution.backupFile);
+    assertUnder(kmExportRoot(input.dataDir), backup);
+    atomicWriteFileSync(targetPath, readFileSync(backup, 'utf8'), { mode: 0o600, durable: true, followTargetSymlink: false });
+  } else if (existsSync(targetPath)) {
+    unlinkSync(targetPath);
+  }
+  const afterHash = fileHashOrNull(targetPath);
+  const manifest: KmFormalExportExecutionManifest = {
+    ...job.execution,
+    executionId,
+    state: 'rolled_back',
+    beforeHash: currentHash,
+    afterHash,
+    rolledBackAt: now,
+    rolledBackExecutionId: job.execution.executionId,
+    rollbackPlan: ['Rollback already applied; reruns with the same idempotency key are no-ops.'],
+  };
+  const next = writeExecutionResult(input.dataDir, job, attempt, manifest, { ...job.execution, state: 'rolled_back', rolledBackAt: now, rolledBackExecutionId: executionId });
+  writeJson(keyFile, { jobId: job.jobId, action: 'rollback', executionId, createdAt: now });
+  appendAudit(input.dataDir, { action: 'rollback', state: 'rolled_back', jobId: job.jobId, executionId, actorId: input.actorId, at: now });
   return next;
 }

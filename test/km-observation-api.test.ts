@@ -213,6 +213,73 @@ describe('KM observation dashboard API', () => {
     expect(status.bodies[0]).toMatchObject({ jobId: created.jobId, state: 'staged' });
   });
 
+  it('serves KM formal export preview, execute, rollback and status in fixture mode', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-km-export-api-'));
+    const getKnowledge = vi.fn(() => knowledge({ targetLayer: 'L2' }));
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const deps = {
+      enabled: true,
+      actorId: 'reviewer-1',
+      dataDir,
+      openStore: async () => ({
+        schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+        getKnowledge, executeKmMutation,
+      }),
+    };
+    const create = response();
+    await handleKmObservationApi(Object.assign(Readable.from([Buffer.from(JSON.stringify({ knowledgeId: 'kn-api' }))]), {
+      method: 'POST',
+      headers: { 'idempotency-key': 'formal-create-1' },
+    }) as any, create.res, new URL('http://localhost/api/km/exports'), deps);
+    const created = create.bodies[0] as any;
+    const review = response();
+    await handleKmObservationApi(Object.assign(Readable.from([Buffer.from(JSON.stringify({ decision: 'approved', reasonCode: 'reviewed' }))]), {
+      method: 'POST',
+      headers: { 'idempotency-key': 'formal-review-1' },
+    }) as any, review.res, new URL(`http://localhost/api/km/exports/${created.jobId}/review`), deps);
+
+    const preview = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, preview.res,
+      new URL(`http://localhost/api/km/exports/${created.jobId}/preview`), deps);
+    const previewBody = preview.bodies[0] as any;
+    expect(previewBody).toMatchObject({
+      allowed: true,
+      adapter: { kind: 'plain-markdown' },
+      risk: { fixtureOnly: true, network: false, gitPush: false },
+    });
+
+    const execute = response();
+    await handleKmObservationApi(Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      confirmationToken: previewBody.confirmationToken,
+      approvalGrade: 'G2',
+      expectedTargetHash: previewBody.precondition.currentTargetHash,
+      destinationVersion: previewBody.precondition.destinationVersion,
+    }))]), {
+      method: 'POST',
+      headers: { 'idempotency-key': 'formal-execute-1' },
+    }) as any, execute.res, new URL(`http://localhost/api/km/exports/${created.jobId}/execute`), deps);
+    expect(execute.bodies[0]).toMatchObject({ jobId: created.jobId, state: 'applied' });
+    const target = previewBody.destination.absolutePath;
+    expect(readFileSync(target, 'utf8')).toContain('Route explicit export requests through the KM exporter.');
+
+    const rollbackPreview = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, rollbackPreview.res,
+      new URL(`http://localhost/api/km/exports/${created.jobId}/preview`), deps);
+    const rollbackPreviewBody = rollbackPreview.bodies[0] as any;
+    const rollback = response();
+    await handleKmObservationApi(Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      confirmationToken: rollbackPreviewBody.confirmationToken,
+      approvalGrade: 'G2',
+      expectedTargetHash: (execute.bodies[0] as any).execution.afterHash,
+      destinationVersion: rollbackPreviewBody.precondition.destinationVersion,
+    }))]), {
+      method: 'POST',
+      headers: { 'idempotency-key': 'formal-rollback-1' },
+    }) as any, rollback.res, new URL(`http://localhost/api/km/exports/${created.jobId}/rollback`), deps);
+    expect(rollback.bodies[0]).toMatchObject({ jobId: created.jobId, state: 'rolled_back' });
+    expect(() => statSync(target)).toThrow();
+  });
+
   it('serves trace/evolution reads and enforces approval grade through the store', async () => {
     const listTrace = vi.fn(() => [{ edgeId: 'edge-1' }]);
     const listEvolution = vi.fn(() => [{ proposalId: 'evo-1' }]);
