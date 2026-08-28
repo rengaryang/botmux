@@ -818,9 +818,22 @@ export async function handleKmObservationApi(
       if (!store.listProductionGatePlans || !store.getProductionGateKillState) throw new Error('km_canary_release_unavailable');
       const botAppId = String(url.searchParams.get('botAppId') ?? '').trim();
       if (!botAppId) throw new KmApiError(400, 'km_canary_release_bot_required');
+      const runtime = resolveKmCanaryRuntimeAuthorization(store as any, botAppId);
+      const legacyEnvironmentActive = !runtime.active
+        && ['1', 'true', 'yes'].includes(process.env.BOTMUX_KM_LIVE_INJECTION_ENABLED?.trim().toLowerCase() ?? '')
+        && ['1', 'true', 'yes'].includes(process.env.BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED?.trim().toLowerCase() ?? '')
+        && (process.env.BOTMUX_KM_CANARY_BOT_APP_IDS ?? '').split(/[,\s]+/u).includes(botAppId)
+        && store.listProductionGatePlans({ limit: 200, actionKind: 'prompt-canary' }).some(plan => {
+          const target = plan.target as { botAppId?: unknown; window?: { start?: unknown; end?: unknown } };
+          const now = Date.now();
+          return plan.state === 'approved' && target.botAppId === botAppId
+            && typeof target.window?.start === 'string' && typeof target.window?.end === 'string'
+            && Date.parse(plan.expiresAt) > now && Date.parse(target.window.start) <= now && Date.parse(target.window.end) > now;
+        });
       jsonRes(res, 200, {
-        runtime: resolveKmCanaryRuntimeAuthorization(store as any, botAppId),
-        restartRequired: false,
+        runtime,
+        legacyEnvironmentActive,
+        restartRequired: legacyEnvironmentActive,
         autoFallback: 'shadow',
       });
       return true;
