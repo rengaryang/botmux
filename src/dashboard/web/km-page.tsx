@@ -1,6 +1,19 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { controlCsrfHeaders } from './control-csrf.js';
+import {
+  KmEmptyState,
+  KmInlineHelp,
+  KmOverview,
+  KmPageFrame,
+  KmSection,
+  type KmOpsTab,
+} from './km-dashboard-components.js';
+import {
+  buildKmDashboardModel,
+  KM_DASHBOARD_EXPECTED_CONTRACT,
+  type KmOpsTabId,
+} from './km-dashboard-model.js';
 
 type Health = {
   enabled: boolean;
@@ -167,6 +180,22 @@ type ObservationEvent = {
 };
 
 const FUNNEL_STAGES = ['skill.manifest.resolved', 'skill.invoked', 'skill.completed', 'skill.failed'] as const;
+const KM_TAB_STORAGE_KEY = 'botmux.km.activeTab';
+
+function readKmTab(): KmOpsTabId {
+  try {
+    const value = window.localStorage.getItem(KM_TAB_STORAGE_KEY);
+    return value === 'knowledge' || value === 'memory' || value === 'quality' || value === 'configuration' || value === 'production' || value === 'audit'
+      ? value
+      : 'overview';
+  } catch {
+    return 'overview';
+  }
+}
+
+function persistKmTab(tab: KmOpsTabId): void {
+  try { window.localStorage.setItem(KM_TAB_STORAGE_KEY, tab); } catch { /* silent */ }
+}
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(path);
@@ -195,6 +224,8 @@ function KmPage(): React.JSX.Element {
   const [events, setEvents] = useState<ObservationEvent[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<KmOpsTabId>(() => readKmTab());
   const [typeFilter, setTypeFilter] = useState<string>('');
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
   const [exportJobs, setExportJobs] = useState<KnowledgeExportJob[]>([]);
@@ -246,6 +277,7 @@ function KmPage(): React.JSX.Element {
 
   const load = async (type?: string) => {
     try {
+      setLoading(true);
       setError('');
       const [h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<Health>('/api/km/health'),
@@ -296,6 +328,8 @@ function KmPage(): React.JSX.Element {
       setGoldenCases(goldenList.items); setShadowComparisons(comparisonList.items); setShadowReadiness(readiness);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -562,247 +596,172 @@ function KmPage(): React.JSX.Element {
 
   const funnel = funnelCounts(events);
   const maxFunnel = Math.max(1, ...Object.values(funnel));
+  const dashboardModel = useMemo(() => buildKmDashboardModel({
+    health,
+    knowledge,
+    memory,
+    importJobs,
+    retrievalQuality,
+    retention,
+    productionGates,
+    events,
+    retrievals,
+    backendRuntime,
+    centralSink,
+    shadowReadiness,
+  }), [health, knowledge, memory, importJobs, retrievalQuality, retention, productionGates, events, retrievals, backendRuntime, centralSink, shadowReadiness]);
+  const selectTab = (tab: KmOpsTabId) => {
+    setActiveTab(tab);
+    persistKmTab(tab);
+  };
+  const TabOnly = ({ tab, children }: { tab: KmOpsTab['id']; children: React.ReactNode }) => (
+    activeTab === tab ? <>{children}</> : null
+  );
 
   return (
-    <div className="page km-page">
-      <header className="sect-header">
-        <div>
-          <h1>Skill Intelligence（KM）</h1>
-          <p>本地观测数据 · 默认关闭 · BOTMUX_KM_OBSERVATION_ENABLED=true 时采集</p>
-        </div>
-      </header>
-      {error && <p className="error-banner">{error}</p>}
-      {notice && <p style={{ color: 'var(--success, #248a3d)' }}>{notice}</p>}
+    <KmPageFrame activeTab={activeTab} onTabChange={selectTab} model={dashboardModel} loading={loading} error={error} notice={notice}>
+      <TabOnly tab="overview">
+        <KmOverview model={dashboardModel} />
+      </TabOnly>
 
-      <section className="feedback-kpis">
-        <article><span>观测事件</span><strong>{health?.counts.observations ?? '—'}</strong></article>
-        <article><span>隔离冲突</span><strong>{health?.counts.quarantined ?? '—'}</strong></article>
-        <article><span>知识候选</span><strong>{health?.counts.knowledge ?? '—'}</strong></article>
-        <article><span>记忆条目</span><strong>{health?.counts.memory ?? '—'}</strong></article>
-        <article><span>导入任务</span><strong>{importJobs.length}</strong></article>
-        <article><span>Schema 版本</span><strong>{health?.schemaVersion ?? '—'}</strong></article>
-        <article><span>WAL 模式</span><strong>{health?.pragmas.journalMode ?? '—'}</strong></article>
-        <article><span>采集状态</span><strong>{health?.enabled ? '已开启' : '未开启'}</strong></article>
-        <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
-        <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
-        <article><span>Backend Worker</span><strong>{backendRuntime?.enabled ? '已开启' : '未开启'}</strong></article>
-        <article><span>Central Sink</span><strong>{centralSink?.enabled ? '已开启' : '未开启'}</strong></article>
-        <article><span>Backend Outbox</span><strong>{backendRuntime?.outbox.pending ?? '—'}/{backendRuntime?.outbox.total ?? '—'}</strong></article>
-        <article><span>Backend 隔离</span><strong>{backendRuntime?.outbox.quarantined ?? '—'}</strong></article>
-        <article><span>Eval 运行</span><strong>{health?.evalEvolution.evalRuns ?? '—'}</strong></article>
-        <article><span>失败 Eval</span><strong>{health?.evalEvolution.failingEvalRuns ?? '—'}</strong></article>
-        <article><span>待审提案</span><strong>{health?.evalEvolution.reviewPendingProposals ?? '—'}</strong></article>
-        <article><span>Retrieval 零命中</span><strong>{retrievalQuality ? `${retrievalQuality.zeroHits}/${retrievalQuality.runs}` : '—'}</strong></article>
-        <article><span>Retrieval 直接命中</span><strong>{retrievalQuality?.directHits ?? '—'}</strong></article>
-        <article><span>Retrieval 归一命中</span><strong>{retrievalQuality?.normalizedHits ?? '—'}</strong></article>
-        <article><span>Retrieval 未匹配</span><strong>{retrievalQuality?.noHits ?? '—'}</strong></article>
-        <article><span>Retrieval Scope 过滤</span><strong>{retrievalQuality?.filteredScope ?? '—'}</strong></article>
-        <article><span>Retrieval 隐私过滤</span><strong>{retrievalQuality?.filteredPrivacy ?? '—'}</strong></article>
-        <article><span>Retrieval 状态过滤</span><strong>{retrievalQuality?.filteredState ?? '—'}</strong></article>
-        <article><span>Retrieval 均延迟</span><strong>{retrievalQuality ? `${retrievalQuality.avgLatencyMs}ms` : '—'}</strong></article>
-        <article><span>Retention Shadow</span><strong>{retention?.enabled ? '已开启' : '未开启'}</strong></article>
-        <article><span>可归档预览</span><strong>{retention ? retention.latestPlan.domains.reduce((sum, item) => sum + item.eligibleCount, 0) : '—'}</strong></article>
-        <article><span>KM DB+WAL</span><strong>{retention ? `${Math.round(retention.latestPlan.db.totalBytes / 1024)} KiB` : '—'}</strong></article>
-        <article><span>SLO 状态</span><strong>{retention ? retention.latestPlan.slo.find(item => item.state === 'critical')?.state ?? retention.latestPlan.slo.find(item => item.state === 'warn')?.state ?? 'ok' : '—'}</strong></article>
-      </section>
-
-      <section className="panel">
-        <h2>Retention / GC Preview（只读）</h2>
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          策略只生成 eligibility preview 和 shadow report；没有 purge/apply 按钮，BOTMUX_KM_AUTO_GC_ENABLED 不会触发删除。
-        </p>
-        <div className="feedback-deliveries">
-          {retention?.latestPlan.domains.map(domain => <div key={domain.domain}>
-            <code>{domain.tier}</code>
-            <span>{domain.domain} · {domain.table}</span>
-            <span>total {domain.totalCount} · protected {domain.protectedCount} · eligible {domain.eligibleCount}</span>
-            <b>{domain.retentionDays}d · oldest {domain.oldestRecordAgeDays}d</b>
-          </div>)}
-          {retention?.latestPlan.slo.map(metric => <div key={metric.key}>
-            <code>SLO</code>
-            <span>{metric.key}</span>
-            <span>{metric.value} {metric.unit} · warn {metric.warnAt} · critical {metric.criticalAt}</span>
-            <b>{metric.state}</b>
-          </div>)}
-          {retention?.reports.slice(0, 5).map(report => <div key={report.reportId}>
-            <code>report</code>
-            <span>{report.completedAt}</span>
-            <span>{report.reportHash}</span>
-            <b>{report.totalEligible} · {report.worstSloState}</b>
-          </div>)}
-          {!retention && <p style={{ color: 'var(--text-dim)' }}>Retention 状态暂不可用。</p>}
-        </div>
-        <article><span>Golden Cases</span><strong>{goldenCases.length}</strong></article>
-        <article><span>Shadow 对比</span><strong>{shadowComparisons.length}</strong></article>
-        <article><span>Readiness</span><strong>{shadowReadiness?.ready ? 'ready' : 'blocked'}</strong></article>
-      </section>
-
-      <section className="panel">
-        <h2>Production Gates（Intent Only）</h2>
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          这里只生成不可执行计划、审批记录和 inert intent；effective=false，sideEffectsExecuted=false，不触发网络、导出、注入、删除或调度器。
-        </p>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginBottom: 10 }}>
-          <select value={productionGateForm.actionKind} onChange={e => updateProductionGateTemplate(e.target.value as ProductionGatePlan['actionKind'])}>
-            <option value="real-memory-transport">real-memory-transport</option>
-            <option value="real-central-sink">real-central-sink</option>
-            <option value="formal-knowledge-export">formal-knowledge-export</option>
-            <option value="prompt-canary">prompt-canary</option>
-            <option value="retention-purge">retention-purge</option>
-          </select>
-          <input type="number" min="60" max="86400" value={productionGateForm.ttlSeconds} onChange={e => setProductionGateForm({ ...productionGateForm, ttlSeconds: Number(e.target.value) })} title="TTL seconds" />
-          <select value={productionGateForm.approvalGrade} onChange={e => setProductionGateForm({ ...productionGateForm, approvalGrade: e.target.value })}>
-            <option value="G0">G0</option><option value="G1">G1</option><option value="G2">G2</option><option value="G3">G3</option><option value="G4">G4</option>
-          </select>
-          <input value={productionGateForm.confirmationToken} onChange={e => setProductionGateForm({ ...productionGateForm, confirmationToken: e.target.value })} placeholder="Confirmation token from created plan" />
-          <button onClick={() => void createProductionGate()}>Create Plan</button>
-          <button onClick={() => void toggleProductionGateKill()}>{productionGateKill?.enabled ? 'Disable Kill' : 'Enable Kill'}</button>
-          <textarea value={productionGateForm.targetJson} onChange={e => setProductionGateForm({ ...productionGateForm, targetJson: e.target.value })} placeholder="Exact target JSON" />
-          <textarea value={productionGateForm.scopeJson} onChange={e => setProductionGateForm({ ...productionGateForm, scopeJson: e.target.value })} placeholder="Exact non-wildcard scope JSON" />
-          <textarea value={productionGateForm.riskAckJson} onChange={e => setProductionGateForm({ ...productionGateForm, riskAckJson: e.target.value })} placeholder="Risk acknowledgement JSON" />
-        </div>
-        {productionGateKill && <p style={{ color: productionGateKill.enabled ? 'var(--danger, #b42318)' : 'var(--text-dim)', fontSize: 12 }}>
-          kill switch: {productionGateKill.enabled ? 'enabled' : 'disabled'} · {productionGateKill.reason} · {productionGateKill.updatedAt}
-        </p>}
-        <div className="feedback-deliveries">
-          {productionGates.map(plan => <div key={plan.planId}>
-            <code>{plan.actionKind}</code>
-            <span>{plan.planId} · {plan.previewHash}</span>
-            <span>{plan.requiredApprovalGrade} · expires {plan.expiresAt} · token {plan.confirmationTokenUsedAt ? 'used' : 'unused'}</span>
-            <b>{plan.state}{' '}
-              {plan.state === 'ready' && <button onClick={() => void approveProductionGate(plan)}>Approve</button>}{' '}
-              {plan.state === 'approved' && <button onClick={() => void createProductionGateIntent(plan)}>Intent</button>}{' '}
-              <button onClick={() => void loadProductionGateAudit(plan)}>Audit</button>
-            </b>
-          </div>)}
-          {productionGates.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 production gate plan。</p>}
-          {productionGateAudit.map(item => <div key={item.auditId}>
-            <code>audit</code>
-            <span>{item.action} · {item.fromState ?? 'none'} → {item.toState}</span>
-            <span>{item.actorId}</span>
-            <b>{item.createdAt}</b>
-          </div>)}
-        </div>
-        {productionGateHandoff && <pre style={{ whiteSpace: 'pre-wrap', fontSize: 11, overflowX: 'auto' }}>{JSON.stringify(productionGateHandoff, null, 2)}</pre>}
-      </section>
-
-      <section className="panel">
-        <h2>Skill 使用漏斗（最近 100 条）</h2>
-        {Object.entries(funnel).map(([stage, count]) => (
-          <div className="feedback-bar" key={stage}>
-            <span>{stage}</span>
-            <i style={{ width: `${count / maxFunnel * 100}%` }} />
-            <b>{count}</b>
+      <TabOnly tab="knowledge">
+        <KmSection title="知识审核" description="处理候选知识、导出 staging 和知识到记忆导入。" badge="中风险：写入 staging 或本地 memory 前需确认" risk="medium">
+          <div className="feedback-deliveries">
+            {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}{' '}
+              {item.state === 'approved' && item.targetLayer !== 'reviewed-only' && item.freshness === 'fresh' && <button onClick={() => void createExportJob(item)}>Stage Export</button>}
+            </b></div>)}
+            {knowledge.length === 0 && <KmEmptyState title="暂无知识候选" message="开启观测和蒸馏后，这里会显示待审核知识。" />}
           </div>
-        ))}
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          manifest.resolved = 会话分发的 Skill；invoked = 模型实际执行 botmux skill show/read 拉取内容；completed/failed = 命令退出状态。
-        </p>
-      </section>
+        </KmSection>
 
-      <section className="panel">
-        <h2>Knowledge / Memory Review</h2>
-        <div className="feedback-deliveries">
-          {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}{' '}
-            {item.state === 'approved' && item.targetLayer !== 'reviewed-only' && item.freshness === 'fresh' && <button onClick={() => void createExportJob(item)}>Stage Export</button>}
-          </b></div>)}
-          {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}{' '}
-            {(item.state === 'proposed' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'expired') && <button onClick={() => void changeMemoryState(item, 'active', 'review_approved')}>Approve</button>}{' '}
-            {item.state === 'proposed' && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_rejected')}>Reject</button>}{' '}
-            {(item.state === 'active' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'shadowed') && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_revoked')}>Revoke</button>}{' '}
-            {item.state === 'active' && <button onClick={() => void changeMemoryState(item, 'conflicted', 'review_conflict')}>Conflict</button>}
-          </b></div>)}
-          {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
-          {knowledge.length + memory.length + policyDecisions.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无待审核知识或记忆。</p>}
-        </div>
-      </section>
+        <KmSection title="Knowledge → Memory Import" description="扫描只读来源并生成预览，执行动作保留显式确认。" badge="渐进披露" risk="medium">
+          <details className="km-advanced-panel">
+            <summary>展开导入配置</summary>
+            <div className="km-form-grid">
+              <select value={importForm.source} onChange={e => setImportForm({ ...importForm, source: e.target.value })}>
+                <option value="knowledge-items">approved knowledge_items</option>
+                <option value="markdown-files">selected Markdown files</option>
+                <option value="mixed">mixed</option>
+              </select>
+              <input value={importForm.defaultScope} onChange={e => setImportForm({ ...importForm, defaultScope: e.target.value })} placeholder="workspace/project/skill/environment/team" />
+              <input value={importForm.defaultSubject} onChange={e => setImportForm({ ...importForm, defaultSubject: e.target.value })} placeholder="Subject" />
+              <textarea value={importForm.allowlistedRoots} onChange={e => setImportForm({ ...importForm, allowlistedRoots: e.target.value })} placeholder="Allowlisted roots, one per line" />
+              <textarea value={importForm.markdownFiles} onChange={e => setImportForm({ ...importForm, markdownFiles: e.target.value })} placeholder="Explicit Markdown files, one per line" />
+              <button disabled={!importForm.allowlistedRoots.trim() || !importForm.defaultSubject.trim()} onClick={() => void scanImport()}>Scan Preview</button>
+            </div>
+          </details>
+          <KmInlineHelp>扫描只读取 approved/fresh/observed/non-sensitive knowledge_items 和显式列出的 allowlist 内 Markdown；执行需确认，不启用外部 transport。</KmInlineHelp>
+          <div className="feedback-deliveries">
+            {importJobs.map(job => <div key={job.jobId}>
+              <code>{job.state}</code>
+              <span>{job.jobId}</span>
+              <span>source {job.sourceCount} · eligible {job.eligibleCount} · imported {job.importedCount} · deduped {job.dedupedCount} · conflict {job.conflictCount} · skipped {job.skippedCount}</span>
+              <b>{job.outboxEnqueuedCount} outbox {job.state === 'preview' || job.state === 'review_pending' || job.state === 'partial' ? <button onClick={() => void executeImport(job)}>Execute</button> : null}</b>
+            </div>)}
+            {importJobs.length === 0 && <KmEmptyState title="暂无导入任务" message="填写导入配置后可先生成扫描预览。" />}
+          </div>
+        </KmSection>
 
-      <section className="panel">
-        <h2>Knowledge → Memory Import</h2>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginBottom: 10 }}>
-          <select value={importForm.source} onChange={e => setImportForm({ ...importForm, source: e.target.value })}>
-            <option value="knowledge-items">approved knowledge_items</option>
-            <option value="markdown-files">selected Markdown files</option>
-            <option value="mixed">mixed</option>
-          </select>
-          <input value={importForm.defaultScope} onChange={e => setImportForm({ ...importForm, defaultScope: e.target.value })} placeholder="workspace/project/skill/environment/team" />
-          <input value={importForm.defaultSubject} onChange={e => setImportForm({ ...importForm, defaultSubject: e.target.value })} placeholder="Subject" />
-          <textarea value={importForm.allowlistedRoots} onChange={e => setImportForm({ ...importForm, allowlistedRoots: e.target.value })} placeholder="Allowlisted roots, one per line" />
-          <textarea value={importForm.markdownFiles} onChange={e => setImportForm({ ...importForm, markdownFiles: e.target.value })} placeholder="Explicit Markdown files, one per line" />
-          <button disabled={!importForm.allowlistedRoots.trim() || !importForm.defaultSubject.trim()} onClick={() => void scanImport()}>Scan Preview</button>
-        </div>
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>扫描只读取 approved/fresh/observed/non-sensitive knowledge_items 和显式列出的 allowlist 内 Markdown；执行需确认，不启用外部 transport。</p>
-        <div className="feedback-deliveries">
-          {importJobs.map(job => <div key={job.jobId}>
-            <code>{job.state}</code>
-            <span>{job.jobId}</span>
-            <span>source {job.sourceCount} · eligible {job.eligibleCount} · imported {job.importedCount} · deduped {job.dedupedCount} · conflict {job.conflictCount} · skipped {job.skippedCount}</span>
-            <b>{job.outboxEnqueuedCount} outbox {job.state === 'preview' || job.state === 'review_pending' || job.state === 'partial' ? <button onClick={() => void executeImport(job)}>Execute</button> : null}</b>
-          </div>)}
-          {importJobs.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无导入任务。</p>}
-        </div>
-      </section>
+        <KmSection title="Knowledge Export Staging" description="导出审核单先进入 staging，再通过显式预览和确认执行。">
+          <div className="feedback-deliveries">
+            {exportJobs.map(job => {
+              const preview = exportPreviews[job.jobId];
+              return <div key={job.jobId}>
+                <code>{job.plan.targetLayer}</code>
+                <span>{job.plan.destination.relativePath}</span>
+                <span>{preview ? `${preview.patch.status} · ${preview.allowed ? 'ready' : preview.reasonCodes.join(', ')}` : `${job.plan.diff.status} · ${job.plan.reasonCodes.join(', ') || 'ready'}`}</span>
+                <b>{job.state}{' '}
+                  {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'approved')}>Approve</button>}{' '}
+                  {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'rejected')}>Reject</button>}{' '}
+                  {(job.state === 'staged' || job.state === 'executing') && <button onClick={() => void previewFormalExport(job)}>Preview</button>}{' '}
+                  {preview?.allowed && (job.state === 'staged' || job.state === 'executing') && <button onClick={() => void executeFormalExport(job)}>Execute</button>}{' '}
+                  {job.state === 'applied' && <button onClick={() => void rollbackFormalExport(job)}>Rollback</button>}
+                </b>
+              </div>;
+            })}
+            {exportJobs.length === 0 && <KmEmptyState title="暂无导出审核单" message="通过知识审核列表创建 staging export。" />}
+          </div>
+        </KmSection>
+      </TabOnly>
 
-      <section className="panel">
-        <h2>Golden Set / Pi Shadow Quality</h2>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
-          <input value={goldenForm.title} onChange={e => setGoldenForm({ ...goldenForm, title: e.target.value })} placeholder="Golden case title" />
-          <input value={goldenForm.queryRedacted} onChange={e => setGoldenForm({ ...goldenForm, queryRedacted: e.target.value })} placeholder="Redacted query" />
-          <input value={goldenForm.claimKey} onChange={e => setGoldenForm({ ...goldenForm, claimKey: e.target.value })} placeholder="Expected claim key" />
-          <input value={goldenForm.claimTextHash} onChange={e => setGoldenForm({ ...goldenForm, claimTextHash: e.target.value })} placeholder="sha256:..." />
-          <button disabled={!goldenForm.title.trim() || !goldenForm.queryRedacted.trim() || !goldenForm.claimKey.trim()} onClick={() => void createGoldenCase()}>保存 Golden</button>
-          <button onClick={() => void refreshReadiness()}>生成 Readiness</button>
-        </div>
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>Golden set 只接受显式 review/redacted 输入；Shadow quality 只读取本地已存摘要，默认关闭且不调用 Pi/LLM/网络。</p>
-        <div className="feedback-deliveries">
-          {goldenCases.map(item => <div key={`${item.caseId}@${item.revision}`}><code>{item.state}</code><span>{item.title}</span><span>{item.caseId}@{item.revision} · {item.expectedClaims.length} claims</span><b><button onClick={() => void compareGoldenCase(item)}>Compare</button></b></div>)}
-          {shadowComparisons.map(item => <div key={item.comparisonId}><code>compare</code><span>{item.caseId}@{item.revision}</span><span>overlap {item.metrics.claimOverlap} · rules {item.metrics.rulesUnique} · pi {item.metrics.piUnique} · evidence {Math.round(item.metrics.evidenceCoverage * 100)}%</span><b>FP {item.metrics.falsePositiveLabels} / FN {item.metrics.falseNegativeLabels} <button onClick={() => void labelComparison(item, 'false_positive')}>FP</button> <button onClick={() => void labelComparison(item, 'false_negative')}>FN</button></b></div>)}
-          {shadowReadiness && <div><code>readiness</code><span>{shadowReadiness.reasonCodes.join(', ') || 'thresholds_passed'}</span><span>{JSON.stringify(shadowReadiness.metrics ?? {})}</span><b>{shadowReadiness.ready ? 'ready' : 'not ready'}</b></div>}
-          {goldenCases.length + shadowComparisons.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Golden case 或 Shadow comparison。</p>}
-        </div>
-      </section>
+      <TabOnly tab="memory">
+        <KmSection title="Memory Review" description="按状态处理记忆条目，策略决策用于解释为什么被接纳或拦截。" badge="中风险：状态切换需确认" risk="medium">
+          <div className="feedback-deliveries">
+            {memory.map(item => <div key={item.memoryId}><code>{item.scope}</code><span>{item.subject} · {item.claimKey}</span><span>{item.confidence}</span><b>{item.state}{' '}
+              {(item.state === 'proposed' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'expired') && <button onClick={() => void changeMemoryState(item, 'active', 'review_approved')}>Approve</button>}{' '}
+              {item.state === 'proposed' && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_rejected')}>Reject</button>}{' '}
+              {(item.state === 'active' || item.state === 'conflicted' || item.state === 'stale' || item.state === 'shadowed') && <button onClick={() => void changeMemoryState(item, 'revoked', 'review_revoked')}>Revoke</button>}{' '}
+              {item.state === 'active' && <button onClick={() => void changeMemoryState(item, 'conflicted', 'review_conflict')}>Conflict</button>}
+            </b></div>)}
+            {policyDecisions.map(item => <div key={item.decisionId}><code>policy</code><span>{item.evidence.claimKey ?? item.sourceEventId} · {item.evidence.subject ?? '—'}</span><span>{item.reasonCodes.join(', ')}</span><b>{item.disposition}</b></div>)}
+            {memory.length + policyDecisions.length === 0 && <KmEmptyState title="暂无待审核记忆" message="新的记忆候选或策略决策会显示在这里。" />}
+          </div>
+        </KmSection>
 
-      <section className="panel">
-        <h2>Knowledge Export Staging</h2>
-        <div className="feedback-deliveries">
-          {exportJobs.map(job => {
-            const preview = exportPreviews[job.jobId];
-            return <div key={job.jobId}>
-              <code>{job.plan.targetLayer}</code>
-              <span>{job.plan.destination.relativePath}</span>
-              <span>{preview ? `${preview.patch.status} · ${preview.allowed ? 'ready' : preview.reasonCodes.join(', ')}` : `${job.plan.diff.status} · ${job.plan.reasonCodes.join(', ') || 'ready'}`}</span>
-              <b>{job.state}{' '}
-                {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'approved')}>Approve</button>}{' '}
-                {job.state === 'review_pending' && <button onClick={() => void reviewExportJob(job, 'rejected')}>Reject</button>}{' '}
-                {(job.state === 'staged' || job.state === 'executing') && <button onClick={() => void previewFormalExport(job)}>Preview</button>}{' '}
-                {preview?.allowed && (job.state === 'staged' || job.state === 'executing') && <button onClick={() => void executeFormalExport(job)}>Execute</button>}{' '}
-                {job.state === 'applied' && <button onClick={() => void rollbackFormalExport(job)}>Rollback</button>}
-              </b>
-            </div>;
-          })}
-          {exportJobs.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无导出审核单。</p>}
-        </div>
-      </section>
+        <KmSection title="Backend Runtime / Migration" description="外部记忆后端 outbox、隔离和迁移状态。">
+          <div className="feedback-deliveries">
+            {backendOutbox.map(item => <div key={item.outboxId}><code>{item.providerId}</code><span>{item.operation} · {item.memoryId}</span><span>attempt {item.attempts}{item.lastError ? ` · ${item.lastError}` : ''}</span><b>{item.status}</b></div>)}
+            {backendMigrations.map(item => <div key={item.migrationId}><code>migration</code><span>{item.botAppId} · {item.migrationId}</span><span>checkpoint {item.checkpoint ?? '—'} · {JSON.stringify(item.stats)}</span><b>{item.state}</b></div>)}
+            {backendOutbox.length + backendMigrations.length === 0 && <KmEmptyState title="暂无运行任务" message="Backend outbox 或迁移任务出现后会列在这里。" />}
+          </div>
+        </KmSection>
+      </TabOnly>
 
-      <section className="panel">
-        <h2>Trace / Eval / Evolution</h2>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-          <input value={traceType} onChange={e => setTraceType(e.target.value)} placeholder="类型，如 turn" />
-          <input value={traceId} onChange={e => setTraceId(e.target.value)} placeholder="ID" />
-          <button onClick={() => void loadTrace()}>查询 Trace</button>
-        </div>
-        <div className="feedback-deliveries">
-          {traceEdges.map(edge => <div key={edge.edgeId}><code>{edge.edgeType}</code><span>{edge.fromType}:{edge.fromId}</span><span>{edge.toType}:{edge.toId}</span><b>edge</b></div>)}
-          {evalRuns.map(run => <div key={run.evalRunId}><code>{run.evaluatorName}</code><span>{run.targetType}:{run.targetId}</span><span>pass {run.passCount} · warn {run.warnCount}</span><b>fail {run.failCount}</b></div>)}
-          {proposals.map(proposal => <div key={proposal.proposalId}><code>{proposal.proposalType}</code><span>{proposal.summary}</span><span>{proposal.targetRef}</span><b>{proposal.approvalGrade} · {proposal.state}</b></div>)}
-          {traceEdges.length + evalRuns.length + proposals.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 Trace、Eval 或 Evolution 数据。</p>}
-        </div>
-      </section>
+      <TabOnly tab="quality">
+        <KmSection title="Skill 使用漏斗" description="最近 100 条观测事件的 Skill 分发、调用和完成情况。">
+          {Object.entries(funnel).map(([stage, count]) => (
+            <div className="feedback-bar" key={stage}>
+              <span>{stage}</span>
+              <i style={{ width: `${count / maxFunnel * 100}%` }} />
+              <b>{count}</b>
+            </div>
+          ))}
+          <KmInlineHelp>manifest.resolved = 会话分发的 Skill；invoked = 模型实际执行 botmux skill show/read 拉取内容；completed/failed = 命令退出状态。</KmInlineHelp>
+        </KmSection>
 
-      <section className="panel">
-        <h2>Memory Settings（真实 Transport 默认禁用）</h2>
+        <KmSection title="Golden Set / Pi Shadow Quality" description="Golden set 只接受脱敏输入，Shadow quality 默认不调用外部模型或网络。">
+          <details className="km-advanced-panel">
+            <summary>展开 Golden case 输入</summary>
+            <div className="km-form-grid">
+              <input value={goldenForm.title} onChange={e => setGoldenForm({ ...goldenForm, title: e.target.value })} placeholder="Golden case title" />
+              <input value={goldenForm.queryRedacted} onChange={e => setGoldenForm({ ...goldenForm, queryRedacted: e.target.value })} placeholder="Redacted query" />
+              <input value={goldenForm.claimKey} onChange={e => setGoldenForm({ ...goldenForm, claimKey: e.target.value })} placeholder="Expected claim key" />
+              <input value={goldenForm.claimTextHash} onChange={e => setGoldenForm({ ...goldenForm, claimTextHash: e.target.value })} placeholder="sha256:..." />
+              <button disabled={!goldenForm.title.trim() || !goldenForm.queryRedacted.trim() || !goldenForm.claimKey.trim()} onClick={() => void createGoldenCase()}>保存 Golden</button>
+              <button onClick={() => void refreshReadiness()}>生成 Readiness</button>
+            </div>
+          </details>
+          <div className="feedback-deliveries">
+            {goldenCases.map(item => <div key={`${item.caseId}@${item.revision}`}><code>{item.state}</code><span>{item.title}</span><span>{item.caseId}@{item.revision} · {item.expectedClaims.length} claims</span><b><button onClick={() => void compareGoldenCase(item)}>Compare</button></b></div>)}
+            {shadowComparisons.map(item => <div key={item.comparisonId}><code>compare</code><span>{item.caseId}@{item.revision}</span><span>overlap {item.metrics.claimOverlap} · rules {item.metrics.rulesUnique} · pi {item.metrics.piUnique} · evidence {Math.round(item.metrics.evidenceCoverage * 100)}%</span><b>FP {item.metrics.falsePositiveLabels} / FN {item.metrics.falseNegativeLabels} <button onClick={() => void labelComparison(item, 'false_positive')}>FP</button> <button onClick={() => void labelComparison(item, 'false_negative')}>FN</button></b></div>)}
+            {shadowReadiness && <div><code>readiness</code><span>{shadowReadiness.reasonCodes.join(', ') || 'thresholds_passed'}</span><span>{JSON.stringify(shadowReadiness.metrics ?? {})}</span><b>{shadowReadiness.ready ? 'ready' : 'not ready'}</b></div>}
+            {goldenCases.length + shadowComparisons.length === 0 && <KmEmptyState title="暂无质量样本" message="保存 Golden case 后可生成 shadow comparison 和 readiness。" />}
+          </div>
+        </KmSection>
+
+        <KmSection title="Trace / Eval / Evolution" description="查看 trace 边、评估运行和演进提案。">
+          <div className="km-form-grid km-form-grid--compact">
+            <input value={traceType} onChange={e => setTraceType(e.target.value)} placeholder="类型，如 turn" />
+            <input value={traceId} onChange={e => setTraceId(e.target.value)} placeholder="ID" />
+            <button onClick={() => void loadTrace()}>查询 Trace</button>
+          </div>
+          <div className="feedback-deliveries">
+            {traceEdges.map(edge => <div key={edge.edgeId}><code>{edge.edgeType}</code><span>{edge.fromType}:{edge.fromId}</span><span>{edge.toType}:{edge.toId}</span><b>edge</b></div>)}
+            {evalRuns.map(run => <div key={run.evalRunId}><code>{run.evaluatorName}</code><span>{run.targetType}:{run.targetId}</span><span>pass {run.passCount} · warn {run.warnCount}</span><b>fail {run.failCount}</b></div>)}
+            {proposals.map(proposal => <div key={proposal.proposalId}><code>{proposal.proposalType}</code><span>{proposal.summary}</span><span>{proposal.targetRef}</span><b>{proposal.approvalGrade} · {proposal.state}</b></div>)}
+            {traceEdges.length + evalRuns.length + proposals.length === 0 && <KmEmptyState title="暂无质量追踪" message="Trace、Eval 或 Evolution 数据出现后会聚合到这里。" />}
+          </div>
+        </KmSection>
+      </TabOnly>
+
+      <TabOnly tab="configuration">
+        <KmSection title="Metrics Contract" description="并行开发的 metrics API 可直接实现该前端期望契约。">
+          <pre className="km-contract-block">{JSON.stringify(KM_DASHBOARD_EXPECTED_CONTRACT, null, 2)}</pre>
+        </KmSection>
+
+        <KmSection title="Memory Settings" description="真实 Transport 默认禁用，配置项集中在此处而非总览。">
         <h3>Bot Pipeline Profile</h3>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+        <div className="km-form-grid">
           <input value={profileForm.botAppId} onChange={e => setProfileForm({ ...profileForm, botAppId: e.target.value })} placeholder="Bot App ID" />
           <input value={profileForm.profileId} onChange={e => setProfileForm({ ...profileForm, profileId: e.target.value })} placeholder="Profile ID（可选）" />
           <input type="number" min="1" value={profileForm.revision} onChange={e => setProfileForm({ ...profileForm, revision: Number(e.target.value) })} title="Revision" />
@@ -822,7 +781,7 @@ function KmPage(): React.JSX.Element {
           </div>)}
         </div>
         <h3>External Provider Connection</h3>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+        <div className="km-form-grid">
           <select value={providerForm.providerId} onChange={e => setProviderForm({ ...providerForm, providerId: e.target.value as ProviderConfig['providerId'] })}>
             <option value="mem0">Mem0</option><option value="hindsight">Hindsight</option><option value="openviking">OpenViking</option>
           </select>
@@ -832,7 +791,7 @@ function KmPage(): React.JSX.Element {
           <label><input type="checkbox" checked={providerForm.enabled} onChange={e => setProviderForm({ ...providerForm, enabled: e.target.checked })} /> Enabled</label>
           <button disabled={!providerForm.endpoint.trim()} onClick={() => void saveProvider()}>保存连接配置</button>
         </div>
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>只保存 endpoint 与 credential reference；不保存密钥，不发网络请求，realTransportEnabled 固定为 false。</p>
+        <KmInlineHelp>只保存 endpoint 与 credential reference；不保存密钥，不发网络请求，realTransportEnabled 固定为 false。</KmInlineHelp>
         <div className="feedback-deliveries">
           {providerConfigs.map(config => <div key={config.providerId}><code>{config.providerId}</code><span>{config.endpoint}</span><span>{config.credentialRef} · {config.timeoutMs}ms</span><b>{config.enabled ? 'configured' : 'disabled'} / transport off <button onClick={() => void checkProvider(config.providerId)}>检查</button></b></div>)}
           {backendRuntime?.providers.map(provider => {
@@ -843,31 +802,20 @@ function KmPage(): React.JSX.Element {
           })}
           {configAudit.map(item => <div key={item.auditId}><code>audit</code><span>{item.action} · {item.targetRef}</span><span>{item.actorId}</span><b>{item.createdAt}</b></div>)}
         </div>
-      </section>
+      </KmSection>
 
-      <section className="panel">
-        <h2>Backend Runtime / Migration</h2>
-        <div className="feedback-deliveries">
-          {backendOutbox.map(item => <div key={item.outboxId}><code>{item.providerId}</code><span>{item.operation} · {item.memoryId}</span><span>attempt {item.attempts}{item.lastError ? ` · ${item.lastError}` : ''}</span><b>{item.status}</b></div>)}
-          {backendMigrations.map(item => <div key={item.migrationId}><code>migration</code><span>{item.botAppId} · {item.migrationId}</span><span>checkpoint {item.checkpoint ?? '—'} · {JSON.stringify(item.stats)}</span><b>{item.state}</b></div>)}
-          {backendOutbox.length + backendMigrations.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 backend outbox 或迁移任务。</p>}
-        </div>
-      </section>
-
-      <section className="panel">
-        <h2>Providers / Distillation / Retrieval Shadow</h2>
+        <KmSection title="Providers / Distillation / Retrieval Shadow" description="Provider 描述、蒸馏任务、召回和注入快照。">
         <div className="feedback-deliveries">
           {providers.map(provider => <div key={`${provider.providerId}@${provider.version}`}><code>{provider.kind}</code><span>{provider.providerId}</span><span>{provider.descriptor?.execution ?? '—'} · {(provider.descriptor?.capabilities ?? []).slice(0, 3).join(', ')}</span><b>v{provider.version} · {provider.status}</b></div>)}
           {jobs.map(job => <div key={job.jobId}><code>distill</code><span>{job.profileId} · {job.botAppId}</span><span>attempt {job.attempts}</span><b>{job.state}</b></div>)}
           {retrievals.map(run => <div key={run.retrievalRunId}><code>retrieve</code><span>{run.botAppId} · {run.mode}</span><span>{run.candidateCount} → {run.eligibleCount}</span><b>{run.latencyMs}ms</b></div>)}
           {injections.map(item => <div key={item.snapshotId}><code>inject</code><span>{item.botAppId} · {item.mode}</span><span>{item.itemIds.length} items · {item.promptBytes} bytes</span><b>{item.disposition}</b></div>)}
-          {providers.length + jobs.length + retrievals.length + injections.length === 0 && <p style={{ color: 'var(--text-dim)' }}>自动蒸馏和检索影子尚未启用。</p>}
+          {providers.length + jobs.length + retrievals.length + injections.length === 0 && <KmEmptyState title="暂无影子运行数据" message="自动蒸馏和检索影子尚未启用。" />}
         </div>
-      </section>
+      </KmSection>
 
-      <section className="panel">
-        <h2>Central Sink / Sync（默认禁用）</h2>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+        <KmSection title="Central Sink / Sync" description="中心同步默认禁用，HTTP/HTTPS 只能保存为关闭配置。" badge="外部同步风险" risk="medium">
+        <div className="km-form-grid">
           <input value={sinkForm.sinkId} onChange={e => setSinkForm({ ...sinkForm, sinkId: e.target.value })} placeholder="Sink ID" />
           <input value={sinkForm.endpointRef} onChange={e => setSinkForm({ ...sinkForm, endpointRef: e.target.value })} placeholder="mock://central 或 inmemory://central" />
           <input value={sinkForm.credentialRef} onChange={e => setSinkForm({ ...sinkForm, credentialRef: e.target.value })} placeholder="env:SECRET_NAME" />
@@ -878,12 +826,10 @@ function KmPage(): React.JSX.Element {
           <label><input type="checkbox" checked={sinkForm.enabled} onChange={e => setSinkForm({ ...sinkForm, enabled: e.target.checked })} /> Enabled</label>
           <button disabled={!sinkForm.sinkId.trim() || !sinkForm.endpointRef.trim()} onClick={() => void saveSink()}>保存 Sink</button>
         </div>
-        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          Runtime 需要 BOTMUX_KM_CENTRAL_SINK_ENABLED=true；只执行 mock:// 与 inmemory://。HTTPS/HTTP 仅可保存为关闭配置，不能启用真实传输。
-        </p>
-        {centralSink && <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+        <KmInlineHelp>Runtime 需要 BOTMUX_KM_CENTRAL_SINK_ENABLED=true；只执行 mock:// 与 inmemory://。HTTPS/HTTP 仅可保存为关闭配置，不能启用真实传输。</KmInlineHelp>
+        {centralSink && <KmInlineHelp>
           protocol v{centralSink.protocol.envelopeVersion} · {centralSink.protocol.signing} · {centralSink.protocol.credentialMode} · rollback: local-disable-only
-        </p>}
+        </KmInlineHelp>}
         <div className="feedback-deliveries">
           {syncStatus.map(sink => <div key={sink.sinkId}><code>{sink.sinkId}</code><span>{sink.endpointRef}</span><span>pending {sink.pending} · quarantine {sink.quarantined} · seq {sink.lastLocalSeq}</span><b>{sink.enabled ? sink.status : 'disabled'}{' '}
             <button onClick={() => void runSinkDrill(sink.sinkId, 'status')}>Status</button>{' '}
@@ -891,13 +837,89 @@ function KmPage(): React.JSX.Element {
             <button onClick={() => void runSinkDrill(sink.sinkId, 'partial-ack')}>Partial Ack</button>{' '}
             <button onClick={() => void runSinkDrill(sink.sinkId, 'conflict')}>Conflict</button>
           </b></div>)}
-          {syncStatus.length === 0 && <p style={{ color: 'var(--text-dim)' }}>未配置 Sink；本地能力不受影响。</p>}
+          {syncStatus.length === 0 && <KmEmptyState title="未配置 Sink" message="本地能力不受影响。" />}
         </div>
-      </section>
+      </KmSection>
+      </TabOnly>
 
-      <section className="panel">
-        <h2>事件列表</h2>
-        <div style={{ marginBottom: 8 }}>
+      <TabOnly tab="production">
+        <KmSection title="Production Gates（Intent Only）" description="这里只生成不可执行计划、审批记录和 inert intent；高风险动作不出现在总览。" badge="高风险：需要审批令牌" risk="high">
+          <details className="km-advanced-panel">
+            <summary>展开生产闸门表单</summary>
+            <div className="km-form-grid">
+              <select value={productionGateForm.actionKind} onChange={e => updateProductionGateTemplate(e.target.value as ProductionGatePlan['actionKind'])}>
+                <option value="real-memory-transport">real-memory-transport</option>
+                <option value="real-central-sink">real-central-sink</option>
+                <option value="formal-knowledge-export">formal-knowledge-export</option>
+                <option value="prompt-canary">prompt-canary</option>
+                <option value="retention-purge">retention-purge</option>
+              </select>
+              <input type="number" min="60" max="86400" value={productionGateForm.ttlSeconds} onChange={e => setProductionGateForm({ ...productionGateForm, ttlSeconds: Number(e.target.value) })} title="TTL seconds" />
+              <select value={productionGateForm.approvalGrade} onChange={e => setProductionGateForm({ ...productionGateForm, approvalGrade: e.target.value })}>
+                <option value="G0">G0</option><option value="G1">G1</option><option value="G2">G2</option><option value="G3">G3</option><option value="G4">G4</option>
+              </select>
+              <input value={productionGateForm.confirmationToken} onChange={e => setProductionGateForm({ ...productionGateForm, confirmationToken: e.target.value })} placeholder="Confirmation token from created plan" />
+              <button onClick={() => void createProductionGate()}>Create Plan</button>
+              <button className="danger" onClick={() => void toggleProductionGateKill()}>{productionGateKill?.enabled ? 'Disable Kill' : 'Enable Kill'}</button>
+              <textarea value={productionGateForm.targetJson} onChange={e => setProductionGateForm({ ...productionGateForm, targetJson: e.target.value })} placeholder="Exact target JSON" />
+              <textarea value={productionGateForm.scopeJson} onChange={e => setProductionGateForm({ ...productionGateForm, scopeJson: e.target.value })} placeholder="Exact non-wildcard scope JSON" />
+              <textarea value={productionGateForm.riskAckJson} onChange={e => setProductionGateForm({ ...productionGateForm, riskAckJson: e.target.value })} placeholder="Risk acknowledgement JSON" />
+            </div>
+          </details>
+          <KmInlineHelp>effective=false，sideEffectsExecuted=false，不触发网络、导出、注入、删除或调度器。</KmInlineHelp>
+          {productionGateKill && <p className={`km-kill-state ${productionGateKill.enabled ? 'enabled' : ''}`}>
+            kill switch: {productionGateKill.enabled ? 'enabled' : 'disabled'} · {productionGateKill.reason} · {productionGateKill.updatedAt}
+          </p>}
+          <div className="feedback-deliveries">
+            {productionGates.map(plan => <div key={plan.planId}>
+              <code>{plan.actionKind}</code>
+              <span>{plan.planId} · {plan.previewHash}</span>
+              <span>{plan.requiredApprovalGrade} · expires {plan.expiresAt} · token {plan.confirmationTokenUsedAt ? 'used' : 'unused'}</span>
+              <b>{plan.state}{' '}
+                {plan.state === 'ready' && <button onClick={() => void approveProductionGate(plan)}>Approve</button>}{' '}
+                {plan.state === 'approved' && <button onClick={() => void createProductionGateIntent(plan)}>Intent</button>}{' '}
+                <button onClick={() => void loadProductionGateAudit(plan)}>Audit</button>
+              </b>
+            </div>)}
+            {productionGates.length === 0 && <KmEmptyState title="暂无 production gate plan" message="需要执行高风险上线前，先在这里创建可审计计划。" />}
+            {productionGateAudit.map(item => <div key={item.auditId}>
+              <code>audit</code>
+              <span>{item.action} · {item.fromState ?? 'none'} → {item.toState}</span>
+              <span>{item.actorId}</span>
+              <b>{item.createdAt}</b>
+            </div>)}
+          </div>
+          {productionGateHandoff && <pre className="km-contract-block">{JSON.stringify(productionGateHandoff, null, 2)}</pre>}
+        </KmSection>
+      </TabOnly>
+
+      <TabOnly tab="audit">
+        <KmSection title="Retention / GC Preview（只读）" description="策略只生成 eligibility preview 和 shadow report，没有 purge/apply 按钮。" badge="只读" risk="low">
+          <div className="feedback-deliveries">
+            {retention?.latestPlan.domains.map(domain => <div key={domain.domain}>
+              <code>{domain.tier}</code>
+              <span>{domain.domain} · {domain.table}</span>
+              <span>total {domain.totalCount} · protected {domain.protectedCount} · eligible {domain.eligibleCount}</span>
+              <b>{domain.retentionDays}d · oldest {domain.oldestRecordAgeDays}d</b>
+            </div>)}
+            {retention?.latestPlan.slo.map(metric => <div key={metric.key}>
+              <code>SLO</code>
+              <span>{metric.key}</span>
+              <span>{metric.value} {metric.unit} · warn {metric.warnAt} · critical {metric.criticalAt}</span>
+              <b>{metric.state}</b>
+            </div>)}
+            {retention?.reports.slice(0, 5).map(report => <div key={report.reportId}>
+              <code>report</code>
+              <span>{report.completedAt}</span>
+              <span>{report.reportHash}</span>
+              <b>{report.totalEligible} · {report.worstSloState}</b>
+            </div>)}
+            {!retention && <KmEmptyState title="Retention 状态暂不可用" message="GC preview API 返回后会显示保留策略和 SLO。" />}
+          </div>
+        </KmSection>
+
+        <KmSection title="事件列表" description="按事件类型筛选最近观测，便于审计输入来源。">
+        <div className="km-form-grid km-form-grid--compact">
           <select value={typeFilter} onChange={e => { setTypeFilter(e.target.value); void load(e.target.value || undefined); }}>
             <option value="">全部类型</option>
             {FUNNEL_STAGES.map(stage => <option key={stage} value={stage}>{stage}</option>)}
@@ -917,10 +939,11 @@ function KmPage(): React.JSX.Element {
               <b>{event.source.confidence === 'observed' ? '✓ observed' : '~ inferred'}</b>
             </div>
           ))}
-          {events.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无事件。开启 BOTMUX_KM_OBSERVATION_ENABLED=true 并使用一段时间后刷新。</p>}
+          {events.length === 0 && <KmEmptyState title="暂无事件" message="开启 BOTMUX_KM_OBSERVATION_ENABLED=true 并使用一段时间后刷新。" />}
         </div>
-      </section>
-    </div>
+      </KmSection>
+      </TabOnly>
+    </KmPageFrame>
   );
 }
 
