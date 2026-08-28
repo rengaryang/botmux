@@ -1095,6 +1095,116 @@ export interface KnowledgeExportDryRun {
   risk: { mutatesWorkspace: true; automaticExecution: false };
 }
 
+export interface KmOpsBucket {
+  key: string;
+  count: number;
+}
+
+export interface KmOpsItemRank {
+  itemId: string;
+  itemKind: 'knowledge' | 'memory' | 'unknown';
+  title: string;
+  count: number;
+  lastSeenAt: string;
+  state?: string;
+  targetLayer?: KnowledgeLayer;
+  category?: string;
+  scope?: MemoryScope;
+}
+
+export interface KmOpsAttentionItem {
+  itemId: string;
+  itemKind: 'knowledge' | 'memory';
+  title: string;
+  state: string;
+  updatedAt: string;
+  ageDays: number;
+  targetLayer?: KnowledgeLayer;
+  category?: string;
+  scope?: MemoryScope;
+}
+
+export interface KmOpsTrendPoint {
+  date: string;
+  knowledgeCreated: number;
+  memoryCreated: number;
+  retrievalRuns: number;
+  wouldInject: number;
+  actualInject: number;
+}
+
+export interface KmOpsEmptyState {
+  key: string;
+  empty: boolean;
+  title: string;
+  detail: string;
+}
+
+export interface KmOpsMetricsRaw {
+  schemaVersion: 1;
+  source: 'sqlite';
+  generatedAt: string;
+  windows: {
+    last7dSince: string;
+    last30dSince: string;
+  };
+  kpis: {
+    totalKnowledge: number;
+    activeMemory: number;
+    healthPercent: number;
+    retrievalRuns: number;
+    auditEvents: number;
+  };
+  totals: {
+    knowledgeTotal: number;
+    knowledgeUsable: number;
+    memoryTotal: number;
+    memoryActive: number;
+    memoryUsable: number;
+    retrievalTotal: number;
+    retrievalLast7d: number;
+    retrievalLast30d: number;
+    wouldInjectTotal: number;
+    wouldInjectLast7d: number;
+    wouldInjectLast30d: number;
+    actualInjectTotal: number;
+    actualInjectLast7d: number;
+    actualInjectLast30d: number;
+    auditEventsTotal: number;
+    pendingReviewTotal: number;
+    conflictTotal: number;
+    staleKnowledge: number;
+    staleMemory: number;
+    overallHealthRate: number;
+    knowledgeUsableRate: number;
+    memoryActiveRate: number;
+    freshnessRate: number;
+  };
+  distributions: {
+    knowledgeByLayer: KmOpsBucket[];
+    knowledgeByState: KmOpsBucket[];
+    memoryByState: KmOpsBucket[];
+    memoryByScope: KmOpsBucket[];
+    knowledgeByFreshness: KmOpsBucket[];
+    knowledgeByCategory: KmOpsBucket[];
+    observationBySource: Array<KmOpsBucket & { adapter: string }>;
+    observationByType: KmOpsBucket[];
+    operationalHealth: KmOpsBucket[];
+  };
+  trends: {
+    last7d: KmOpsTrendPoint[];
+    last30d: KmOpsTrendPoint[];
+  };
+  rankings: {
+    recallHot: KmOpsItemRank[];
+    readHot: KmOpsItemRank[];
+    pendingReview: KmOpsAttentionItem[];
+    conflicts: KmOpsAttentionItem[];
+    stale: KmOpsAttentionItem[];
+  };
+  emptyStates: KmOpsEmptyState[];
+}
+
 interface ExistingIdentityRow {
   event_id: string;
   payload_hash: string;
@@ -1154,6 +1264,26 @@ function syncEndpointPolicy(endpointRef: string): { ok: boolean; mode: 'offline'
   } catch {
     return { ok: false, mode: 'invalid', reason: 'invalid_url' };
   }
+}
+
+function ratioPercent(part: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.round((part / total) * 1000) / 10;
+}
+
+function startOfUtcDay(ms: number): number {
+  const date = new Date(ms);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
+
+function isoDay(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function ageDaysFrom(updatedAt: string, nowMs: number): number {
+  const parsed = Date.parse(updatedAt);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.floor((nowMs - parsed) / 86_400_000));
 }
 
 interface RetentionDomainSpec {
@@ -3600,6 +3730,236 @@ export class ObservationStore {
       eligible: Number(row.eligible ?? 0), directHits: Number(row.direct_hits ?? 0), normalizedHits: Number(row.normalized_hits ?? 0), noHits: Number(row.no_hits ?? 0),
       filteredScope: Number(row.filtered_scope ?? 0), filteredPrivacy: Number(row.filtered_privacy ?? 0),
       filteredState: Number(row.filtered_state ?? 0), avgLatencyMs: Math.round(Number(row.avg_latency_ms ?? 0)) };
+  }
+
+  dashboardMetrics(input: { now?: number; rankingLimit?: number } = {}): KmOpsMetricsRaw {
+    const nowMs = input.now ?? Date.now();
+    const generatedAt = new Date(nowMs).toISOString();
+    const dayMs = 86_400_000;
+    const todayStart = startOfUtcDay(nowMs);
+    const last7Start = todayStart - (6 * dayMs);
+    const last30Start = todayStart - (29 * dayMs);
+    const last7dSince = new Date(last7Start).toISOString();
+    const last30dSince = new Date(last30Start).toISOString();
+    const rankLimit = Math.max(1, Math.min(input.rankingLimit ?? 10, 50));
+    const count = (sql: string, ...args: Array<string | number>): number =>
+      Number((this.db.prepare(sql).get(...args) as any)?.count ?? 0);
+    const buckets = (sql: string, ...args: Array<string | number>): KmOpsBucket[] =>
+      (this.db.prepare(sql).all(...args) as any[])
+        .map(row => ({ key: String(row.key ?? 'unknown'), count: Number(row.count ?? 0) }))
+        .filter(row => row.count > 0);
+    const attentionFromRows = (rows: any[]): KmOpsAttentionItem[] => rows.map(row => ({
+      itemId: String(row.item_id),
+      itemKind: row.item_kind,
+      title: String(row.title),
+      state: String(row.state),
+      updatedAt: String(row.updated_at),
+      ageDays: ageDaysFrom(String(row.updated_at), nowMs),
+      ...(row.target_layer ? { targetLayer: row.target_layer as KnowledgeLayer } : {}),
+      ...(row.category ? { category: String(row.category) } : {}),
+      ...(row.scope ? { scope: row.scope as MemoryScope } : {}),
+    }));
+    const rankFromRows = (rows: any[]): KmOpsItemRank[] => rows.map(row => ({
+      itemId: String(row.item_id),
+      itemKind: row.item_kind === 'knowledge' || row.item_kind === 'memory' ? row.item_kind : 'unknown',
+      title: String(row.title ?? row.item_id),
+      count: Number(row.count ?? 0),
+      lastSeenAt: String(row.last_seen_at ?? generatedAt),
+      ...(row.state ? { state: String(row.state) } : {}),
+      ...(row.target_layer ? { targetLayer: row.target_layer as KnowledgeLayer } : {}),
+      ...(row.category ? { category: String(row.category) } : {}),
+      ...(row.scope ? { scope: row.scope as MemoryScope } : {}),
+    }));
+    const trend = (days: number, startMs: number): KmOpsTrendPoint[] => {
+      const points = new Map<string, KmOpsTrendPoint>();
+      for (let index = 0; index < days; index += 1) {
+        const date = isoDay(startMs + (index * dayMs));
+        points.set(date, { date, knowledgeCreated: 0, memoryCreated: 0, retrievalRuns: 0, wouldInject: 0, actualInject: 0 });
+      }
+      const fill = (sql: string, field: keyof Omit<KmOpsTrendPoint, 'date'>): void => {
+        const rows = this.db.prepare(sql).all(new Date(startMs).toISOString()) as any[];
+        for (const row of rows) {
+          const point = points.get(String(row.date));
+          if (point) point[field] = Number(row.count ?? 0);
+        }
+      };
+      fill(`SELECT substr(created_at,1,10) date,COUNT(*) count FROM knowledge_items WHERE created_at>=? GROUP BY substr(created_at,1,10)`, 'knowledgeCreated');
+      fill(`SELECT substr(created_at,1,10) date,COUNT(*) count FROM memory_items WHERE created_at>=? GROUP BY substr(created_at,1,10)`, 'memoryCreated');
+      fill(`SELECT substr(created_at,1,10) date,COUNT(*) count FROM retrieval_runs WHERE created_at>=? GROUP BY substr(created_at,1,10)`, 'retrievalRuns');
+      fill(`SELECT substr(created_at,1,10) date,COUNT(*) count FROM prompt_injection_snapshots WHERE created_at>=? AND disposition='would_inject' GROUP BY substr(created_at,1,10)`, 'wouldInject');
+      fill(`SELECT substr(created_at,1,10) date,COUNT(*) count FROM prompt_injection_snapshots WHERE created_at>=? AND disposition='injected' GROUP BY substr(created_at,1,10)`, 'actualInject');
+      return [...points.values()];
+    };
+
+    const knowledgeTotal = count(`SELECT COUNT(*) count FROM knowledge_items`);
+    const memoryTotal = count(`SELECT COUNT(*) count FROM memory_items`);
+    const knowledgeUsable = count(`SELECT COUNT(*) count FROM knowledge_items
+      WHERE state IN ('approved','exported') AND freshness NOT IN ('stale','purged') AND privacy_class NOT IN ('sensitive','secret-reference-only')`);
+    const memoryActive = count(`SELECT COUNT(*) count FROM memory_items
+      WHERE state='active' AND (ttl_expires_at IS NULL OR ttl_expires_at>?)`, generatedAt);
+    const memoryUsable = count(`SELECT COUNT(*) count FROM memory_items
+      WHERE state='active' AND privacy_class NOT IN ('sensitive','secret-reference-only') AND (ttl_expires_at IS NULL OR ttl_expires_at>?)`, generatedAt);
+    const staleKnowledge = count(`SELECT COUNT(*) count FROM knowledge_items
+      WHERE state IN ('stale','deprecated') OR freshness IN ('stale','purged') OR (review_after IS NOT NULL AND review_after<=?)`, generatedAt);
+    const staleMemory = count(`SELECT COUNT(*) count FROM memory_items
+      WHERE state IN ('stale','expired','revoked') OR (ttl_expires_at IS NOT NULL AND ttl_expires_at<=?) OR (review_after IS NOT NULL AND review_after<=?)`, generatedAt, generatedAt);
+    const retrievalTotal = count(`SELECT COUNT(*) count FROM retrieval_runs`);
+    const retrievalLast7d = count(`SELECT COUNT(*) count FROM retrieval_runs WHERE created_at>=?`, last7dSince);
+    const retrievalLast30d = count(`SELECT COUNT(*) count FROM retrieval_runs WHERE created_at>=?`, last30dSince);
+    const wouldInjectTotal = count(`SELECT COUNT(*) count FROM prompt_injection_snapshots WHERE disposition='would_inject'`);
+    const wouldInjectLast7d = count(`SELECT COUNT(*) count FROM prompt_injection_snapshots WHERE disposition='would_inject' AND created_at>=?`, last7dSince);
+    const wouldInjectLast30d = count(`SELECT COUNT(*) count FROM prompt_injection_snapshots WHERE disposition='would_inject' AND created_at>=?`, last30dSince);
+    const actualInjectTotal = count(`SELECT COUNT(*) count FROM prompt_injection_snapshots WHERE disposition='injected'`);
+    const actualInjectLast7d = count(`SELECT COUNT(*) count FROM prompt_injection_snapshots WHERE disposition='injected' AND created_at>=?`, last7dSince);
+    const actualInjectLast30d = count(`SELECT COUNT(*) count FROM prompt_injection_snapshots WHERE disposition='injected' AND created_at>=?`, last30dSince);
+    const pendingReviewTotal = count(`SELECT COUNT(*) count FROM knowledge_items WHERE state IN ('candidate','review_pending')`)
+      + count(`SELECT COUNT(*) count FROM memory_items WHERE state='proposed'`);
+    const conflictTotal = count(`SELECT COUNT(*) count FROM knowledge_items WHERE state='conflict'`)
+      + count(`SELECT COUNT(*) count FROM memory_items WHERE state='conflicted'`)
+      + count(`SELECT COUNT(*) count FROM quarantine_events`);
+    const auditEventsTotal = count(`SELECT COUNT(*) count FROM observation_events`)
+      + count(`SELECT COUNT(*) count FROM km_config_audit`)
+      + count(`SELECT COUNT(*) count FROM km_import_audit`)
+      + count(`SELECT COUNT(*) count FROM km_production_gate_audit`);
+
+    const recallRows = this.db.prepare(`
+      SELECT r.item_id,r.item_kind,COUNT(*) count,MAX(q.created_at) last_seen_at,
+        COALESCE(k.title,m.claim_key,r.item_id) title,
+        COALESCE(k.state,m.state) state,k.target_layer,k.category,m.scope
+      FROM retrieval_results r
+      JOIN retrieval_runs q ON q.retrieval_run_id=r.retrieval_run_id
+      LEFT JOIN knowledge_items k ON r.item_kind='knowledge' AND r.item_id=k.knowledge_id
+      LEFT JOIN memory_items m ON r.item_kind='memory' AND r.item_id=m.memory_id
+      WHERE r.eligible=1
+      GROUP BY r.item_id,r.item_kind
+      ORDER BY count DESC,last_seen_at DESC,r.item_id
+      LIMIT ?`).all(rankLimit) as any[];
+    const readRows = this.db.prepare(`
+      WITH used AS (
+        SELECT CAST(value AS TEXT) item_id,COUNT(*) count,MAX(s.created_at) last_seen_at
+        FROM prompt_injection_snapshots s,json_each(s.item_ids_json)
+        WHERE s.disposition IN ('would_inject','injected')
+        GROUP BY CAST(value AS TEXT)
+      )
+      SELECT u.item_id,
+        CASE WHEN k.knowledge_id IS NOT NULL THEN 'knowledge' WHEN m.memory_id IS NOT NULL THEN 'memory' ELSE 'unknown' END item_kind,
+        u.count,u.last_seen_at,COALESCE(k.title,m.claim_key,u.item_id) title,
+        COALESCE(k.state,m.state) state,k.target_layer,k.category,m.scope
+      FROM used u
+      LEFT JOIN knowledge_items k ON u.item_id=k.knowledge_id
+      LEFT JOIN memory_items m ON u.item_id=m.memory_id
+      ORDER BY u.count DESC,u.last_seen_at DESC,u.item_id
+      LIMIT ?`).all(rankLimit) as any[];
+
+    const pendingRows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT knowledge_id item_id,'knowledge' item_kind,title,state,updated_at,target_layer,category,NULL scope
+        FROM knowledge_items WHERE state IN ('candidate','review_pending')
+        UNION ALL
+        SELECT memory_id item_id,'memory' item_kind,claim_key title,state,updated_at,NULL target_layer,NULL category,scope
+        FROM memory_items WHERE state='proposed'
+      )
+      ORDER BY updated_at DESC,item_id DESC
+      LIMIT ?`).all(rankLimit) as any[];
+    const conflictRows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT knowledge_id item_id,'knowledge' item_kind,title,state,updated_at,target_layer,category,NULL scope
+        FROM knowledge_items WHERE state='conflict'
+        UNION ALL
+        SELECT memory_id item_id,'memory' item_kind,claim_key title,state,updated_at,NULL target_layer,NULL category,scope
+        FROM memory_items WHERE state='conflicted'
+      )
+      ORDER BY updated_at DESC,item_id DESC
+      LIMIT ?`).all(rankLimit) as any[];
+    const staleRows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT knowledge_id item_id,'knowledge' item_kind,title,state,updated_at,target_layer,category,NULL scope
+        FROM knowledge_items WHERE state IN ('stale','deprecated') OR freshness IN ('stale','purged') OR (review_after IS NOT NULL AND review_after<=?)
+        UNION ALL
+        SELECT memory_id item_id,'memory' item_kind,claim_key title,state,updated_at,NULL target_layer,NULL category,scope
+        FROM memory_items WHERE state IN ('stale','expired','revoked') OR (ttl_expires_at IS NOT NULL AND ttl_expires_at<=?) OR (review_after IS NOT NULL AND review_after<=?)
+      )
+      ORDER BY updated_at DESC,item_id DESC
+      LIMIT ?`).all(generatedAt, generatedAt, generatedAt, rankLimit) as any[];
+
+    return {
+      schemaVersion: 1,
+      source: 'sqlite',
+      generatedAt,
+      windows: { last7dSince, last30dSince },
+      kpis: {
+        totalKnowledge: knowledgeTotal,
+        activeMemory: memoryActive,
+        healthPercent: ratioPercent(knowledgeUsable + memoryUsable, knowledgeTotal + memoryTotal),
+        retrievalRuns: retrievalLast30d,
+        auditEvents: auditEventsTotal,
+      },
+      totals: {
+        knowledgeTotal,
+        knowledgeUsable,
+        memoryTotal,
+        memoryActive,
+        memoryUsable,
+        retrievalTotal,
+        retrievalLast7d,
+        retrievalLast30d,
+        wouldInjectTotal,
+        wouldInjectLast7d,
+        wouldInjectLast30d,
+        actualInjectTotal,
+        actualInjectLast7d,
+        actualInjectLast30d,
+        auditEventsTotal,
+        pendingReviewTotal,
+        conflictTotal,
+        staleKnowledge,
+        staleMemory,
+        overallHealthRate: ratioPercent(knowledgeUsable + memoryUsable, knowledgeTotal + memoryTotal),
+        knowledgeUsableRate: ratioPercent(knowledgeUsable, knowledgeTotal),
+        memoryActiveRate: ratioPercent(memoryActive, memoryTotal),
+        freshnessRate: ratioPercent(Math.max(0, knowledgeTotal - staleKnowledge), knowledgeTotal),
+      },
+      distributions: {
+        knowledgeByLayer: buckets(`SELECT target_layer key,COUNT(*) count FROM knowledge_items GROUP BY target_layer ORDER BY count DESC,key`),
+        knowledgeByState: buckets(`SELECT state key,COUNT(*) count FROM knowledge_items GROUP BY state ORDER BY count DESC,key`),
+        memoryByState: buckets(`SELECT state key,COUNT(*) count FROM memory_items GROUP BY state ORDER BY count DESC,key`),
+        memoryByScope: buckets(`SELECT scope key,COUNT(*) count FROM memory_items GROUP BY scope ORDER BY count DESC,key`),
+        knowledgeByFreshness: buckets(`SELECT freshness key,COUNT(*) count FROM knowledge_items GROUP BY freshness ORDER BY count DESC,key`),
+        knowledgeByCategory: buckets(`SELECT category key,COUNT(*) count FROM knowledge_items GROUP BY category ORDER BY count DESC,key LIMIT 20`),
+        observationBySource: (this.db.prepare(`
+          SELECT json_extract(event_json,'$.source.producer') key,json_extract(event_json,'$.source.adapter') adapter,COUNT(*) count
+          FROM observation_events GROUP BY key,adapter ORDER BY count DESC,key,adapter LIMIT 20`).all() as any[])
+          .map(row => ({ key: String(row.key ?? 'unknown'), adapter: String(row.adapter ?? 'unknown'), count: Number(row.count ?? 0) }))
+          .filter(row => row.count > 0),
+        observationByType: buckets(`SELECT event_type key,COUNT(*) count FROM observation_events GROUP BY event_type ORDER BY count DESC,key LIMIT 20`),
+        operationalHealth: [
+          { key: 'usable_items', count: knowledgeUsable + memoryUsable },
+          { key: 'pending_review', count: pendingReviewTotal },
+          { key: 'conflicts', count: conflictTotal },
+          { key: 'stale', count: staleKnowledge + staleMemory },
+          { key: 'would_inject', count: wouldInjectTotal },
+          { key: 'actual_inject', count: actualInjectTotal },
+        ].filter(row => row.count > 0),
+      },
+      trends: {
+        last7d: trend(7, last7Start),
+        last30d: trend(30, last30Start),
+      },
+      rankings: {
+        recallHot: rankFromRows(recallRows),
+        readHot: rankFromRows(readRows),
+        pendingReview: attentionFromRows(pendingRows),
+        conflicts: attentionFromRows(conflictRows),
+        stale: attentionFromRows(staleRows),
+      },
+      emptyStates: [
+        { key: 'knowledge', empty: knowledgeTotal === 0, title: 'No knowledge items', detail: 'Create or import reviewed knowledge before the dashboard can show layer and freshness health.' },
+        { key: 'memory', empty: memoryTotal === 0, title: 'No memory items', detail: 'Activate reviewed memories before the dashboard can show scope and state health.' },
+        { key: 'retrieval', empty: retrievalTotal === 0, title: 'No retrieval runs', detail: 'Run KM retrieval in shadow or active mode before rankings and retrieval trends appear.' },
+        { key: 'injection', empty: wouldInjectTotal + actualInjectTotal === 0, title: 'No prompt injection snapshots', detail: 'Prompt memory snapshots are required before read rankings can be populated.' },
+        { key: 'observations', empty: auditEventsTotal === 0, title: 'No observation events', detail: 'The observation journal is empty or disabled for this data directory.' },
+      ],
+    };
   }
 
   evalMetricWindows(input: { metricKeys: string[]; minCount: number; sinceEvalRunId?: string }): KmEvalMetricWindow[] {
