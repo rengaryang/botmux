@@ -21509,6 +21509,25 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   white-space: nowrap;
 }
 
+.v3r-profile-section { min-width: 0; }
+.v3r-profile-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+.v3r-profile-form :where(input, select) { min-width: 0; }
+.v3r-recommend-bar { display: grid; grid-template-columns: minmax(240px, 1fr) auto minmax(120px, auto); gap: 8px; margin-top: 10px; align-items: center; }
+.v3r-profile-table-wrap { margin-top: 10px; overflow: auto; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); }
+.v3r-profile-table { width: 100%; border-collapse: collapse; font-size: 12px; background: var(--surface); }
+.v3r-profile-table th, .v3r-profile-table td { padding: 9px 10px; border-bottom: 1px solid var(--border-soft); text-align: left; vertical-align: top; }
+.v3r-profile-table th { color: var(--muted); background: var(--surface-muted); white-space: nowrap; }
+.v3r-profile-table td small { display: block; margin-top: 3px; color: var(--muted); }
+@media (max-width: 820px) { .v3r-profile-form, .v3r-recommend-bar { grid-template-columns: 1fr; } }
+
 .v3r-run-list {
   display: grid;
   grid-auto-rows: max-content;

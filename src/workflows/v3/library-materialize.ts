@@ -25,7 +25,7 @@ import {
   validateWorkflowParamSchema,
   type RawParamInput,
 } from '../shared/params.js';
-import { isGoalNode, isLoopNode, validateDag, type V3Dag, type V3Node } from './dag.js';
+import { executionSelector, isGoalNode, isLoopNode, validateDag, type V3Dag, type V3Node } from './dag.js';
 import {
   freezeDagBotSnapshots,
   parseFrozenBotSnapshots,
@@ -124,7 +124,7 @@ function canonicalizeNodeBots(
 ): V3Node[] {
   return nodes.map((node) => {
     if (!isGoalNode(node) && !isLoopNode(node)) return { ...node };
-    const selector = node.bot ?? inheritedSelector ?? '';
+    const selector = executionSelector(node, inheritedSelector) ?? '';
     const snapshot = snapshots.get(selector);
     if (!snapshot) {
       throw new Error(
@@ -132,7 +132,9 @@ function canonicalizeNodeBots(
         `${JSON.stringify(selector || '<default>')} (node ${node.id})`,
       );
     }
-    const next: V3Node = { ...node, bot: snapshot.larkAppId };
+    const next: V3Node = snapshot.directCli
+      ? { ...node, bot: undefined, executionProfile: snapshot.executionProfileId }
+      : { ...node, executionProfile: undefined, bot: snapshot.larkAppId };
     if (isLoopNode(next)) {
       next.body = {
         nodes: canonicalizeNodeBots(next.body.nodes, snapshots, selector),

@@ -5356,9 +5356,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // v3 workflow runs. Reads project directly from disk; cancel resolves the
-    // immutable run owner and proxies to that daemon (the dashboard never
-    // writes the v3 journal itself).
+    // v3 workflow runs and execution-profile control plane. Profile mutations
+    // are management writes and require the same CSRF boundary as other
+    // Dashboard control APIs; runtime journals remain daemon-owned.
+    if (url.pathname.startsWith('/api/v3/execution-profiles') && !['GET', 'HEAD'].includes(req.method ?? 'GET')) {
+      if (!requestIdentity) return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+    }
     if (await handleV3RunsApi(req, res, url, {
       runsDir: v3RunsDir(),
       proxyToDaemon,

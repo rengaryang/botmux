@@ -1430,7 +1430,7 @@ botmux workflow architect <runId>
 系统自动把 spec 编译成 dag.json 并**由 host 校验**。成功 → 命令打印 \`dagPath\`/\`notesPath\`，进下一步。失败（退回 spec_approved + 打印 problems）→ 多半是 spec 还有问题：\`botmux workflow revise-spec <runId>\` 退回 grilling，按 problems 改 spec.md，再 spec-finalize → approve-spec → architect。（若判断只是 architect 偶发失败、spec 没问题，可直接重跑 architect。）
 
 ### 7. Gate-2：确认流程
-读 architect 产出的 dag.json + architect-notes.md（用第 6 步打印的路径），给用户讲清楚流程：有哪些节点、依赖顺序、哪些节点执行期会停下等人批。问：
+读 architect 产出的 dag.json + architect-notes.md（用第 6 步打印的路径），必须给用户展示清晰节点表：\`节点 / 任务 / Execution Profile / CLI / 模型 / 预计成本等级与 Token 区间 / 超时 / 工作目录 / 风险级别 / Gate\`，并说明依赖、并发组、输入输出契约和确定性推荐理由（历史成功率、样本量；样本不足标 cold_start）。用户可要求逐节点修改 Profile、模型、超时或 Gate，修改后重新预览再确认。Review 和最终报告节点仅在用户显式要求时加入，不默认增加模型调用。问：
 
 > 编排好的流程是这样，对吗？确认就开跑。
 

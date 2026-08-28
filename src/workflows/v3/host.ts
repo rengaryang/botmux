@@ -55,6 +55,7 @@ import {
   type V3AdHocRunEnvelope,
 } from './run-envelope.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
+import { WorkflowExecutionProfileStore } from './execution-profile-store.js';
 
 // ─── Core operations (dep-injected, pure of CLI / process concerns) ─────────
 
@@ -498,10 +499,10 @@ export function authorizeAdHocRun(
       throw new Error(`spec runId=${spec.runId} 与 grill runId=${cur.runId} 不一致`);
     }
     const snapshots = freezeDagBotSnapshots(dag, bots, {
-      // A node that omits `bot` inherits the bot where this grill was born,
-      // never the first unrelated entry in bots.json. Standalone/dev runs have
-      // no binding and retain the legacy first-supported fallback.
+      // A node that omits a selector inherits the entry bot. Explicit
+      // executionProfile selectors resolve from the independent catalog.
       defaultSelector: cur.chatBinding?.larkAppId,
+      executionProfiles: new WorkflowExecutionProfileStore().list(),
     });
 
     const dagPath = join(runDir, 'dag.json');

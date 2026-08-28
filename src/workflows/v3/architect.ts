@@ -12,6 +12,9 @@ import { join } from 'node:path';
 
 import { createEphemeralPool, type EphemeralPoolDeps } from './ephemeral-pool.js';
 import { readAndValidateManifest, ManifestValidationError } from './manifest.js';
+import { WorkflowExecutionProfileStore } from './execution-profile-store.js';
+import { collectWorkflowProfileHistory, recommendWorkflowProfiles } from './model-recommender.js';
+import { defaultRunsDir } from './ops-projection.js';
 import {
   GOAL_ENV,
   SPEC_SCHEMA_VERSION,
@@ -52,7 +55,7 @@ export interface RunArchitectResult {
   sessionInfo?: WorkerSessionInfo;
 }
 
-export function buildArchitectGoal(specPath: string, specJsonPath: string): string {
+export function buildArchitectGoal(specPath: string, specJsonPath: string, executionPlanningPath?: string): string {
   const sketchFields = [
     'sketchId',
     'goal',
@@ -68,6 +71,7 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     'Inputs:',
     `- Canonical machine-readable spec: ${specJsonPath}`,
     `- Human narrative spec: ${specPath}`,
+    ...(executionPlanningPath ? [`- Deterministic execution-profile recommendations: ${executionPlanningPath}`] : []),
     '',
     'Task:',
     `- Read the canonical spec first; it must use schemaVersion ${SPEC_SCHEMA_VERSION}. Use the narrative spec only for context.`,
@@ -125,7 +129,9 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     '- `triggerRule` controls a join over multiple incoming edges: default "all_success" (every edge active); "one_success" (any one active — racing alternatives); { "quorum": N } (at least N active — voting). One_success/quorum nodes receive only the products of ACTIVE upstream edges; the omitted rest is listed for the agent, so write their goal text to tolerate partial inputs.',
     '- Conditional edges are not allowed inside a loop body (first cut).',
     '',
-    'Per-node capability override (optional):',
+    'Per-node capability override and execution selection:',
+    '- Prefer `executionProfile:"<profileId>"` on every goal node, selecting from the deterministic recommendation file. Do not set both `bot` and `executionProfile`.',
+    '- The entry Bot is the control/input/output identity only. Goal workers launch the selected CLI profile directly; trusted host nodes alone use chat identity.',
     '- A goal node (incl. loop body nodes) may set `override: { model?, systemPromptAppend? }`.',
     '- `model`: pick a cheaper/faster model for light nodes (research, summarize, verify) and reserve the strong default for code/synthesis nodes — state the cost reasoning in architect-notes.md.',
     '- Permission is NOT configurable per node: every workflow worker requires CLI bypass permissions; never emit `permissionMode`.',
@@ -135,6 +141,7 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     '- Summarize the DAG structure and the reasoning for dependencies/gates.',
     '- For each loop: why a loop, the exit condition, and the worst-case cost estimate (maxIterations × body nodes).',
     '- For each conditional branch: the decision field + its enum, which path each value takes, and confirmation that every value reaches some sink (no allSinksSkipped hole).',
+    '- Include an execution table listing node, task, execution profile, CLI, model, estimated cost tier/token range, timeout, working directory, risk level, gate, and deterministic recommendation reasons/history sample size.',
     '- Include an artifact contract table listing producer node, output key, path, kind, and every consumer.',
     '- List any assumptions or unresolved risks for human review.',
   ].join('\n');
@@ -154,11 +161,21 @@ export async function runArchitect(input: RunArchitectInput): Promise<RunArchite
   rmSync(attemptDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
-  const goal = buildArchitectGoal(input.specPath, input.specJsonPath);
+  const profiles = new WorkflowExecutionProfileStore().list().filter(profile => profile.enabled);
+  const specText = readFileSync(input.specJsonPath, 'utf8');
+  const executionPlanningPath = join(attemptDir, 'execution-planning.json');
+  const recommendations = recommendWorkflowProfiles({
+    goal: specText,
+    profiles,
+    history: collectWorkflowProfileHistory(defaultRunsDir()),
+  });
+  await writeJsonFile(executionPlanningPath, JSON.stringify({ schemaVersion: 1, profiles, recommendations }, null, 2));
+  const goal = buildArchitectGoal(input.specPath, input.specJsonPath, executionPlanningPath);
   const inputs = {
     inputs: [
       { from: 'grill', name: 'spec.json', path: input.specJsonPath, kind: 'json' },
       { from: 'grill', name: 'spec.md', path: input.specPath, kind: 'markdown' },
+      { from: 'host', name: 'execution-planning.json', path: executionPlanningPath, kind: 'json' },
     ],
   };
 

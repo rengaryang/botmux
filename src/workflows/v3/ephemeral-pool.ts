@@ -106,7 +106,7 @@ async function runNodeImpl(
   }
   let secret: string | undefined;
   try {
-    secret = await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
+    secret = req.botSnapshot.directCli ? '' : await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
   } catch (err) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     throw err;
@@ -115,7 +115,7 @@ async function runNodeImpl(
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
     return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
   }
-  if (!secret) {
+  if (!req.botSnapshot.directCli && !secret) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'secret_missing');
     return { status: 'fail', manifestPath };
   }
@@ -248,8 +248,9 @@ async function runNodeImpl(
     backendType: 'pty' as const,
     prompt: '',
     resume: false,
-    larkAppId: req.botSnapshot.larkAppId,
-    larkAppSecret: secret,
+    larkAppId: req.botSnapshot.directCli ? `local_${req.botSnapshot.executionProfileId ?? 'workflow'}` : req.botSnapshot.larkAppId,
+    larkAppSecret: secret ?? '',
+    apiOnly: req.botSnapshot.directCli === true,
     botName: req.node.bot,
     locale: 'zh' as const,
   };

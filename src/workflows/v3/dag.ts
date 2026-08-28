@@ -241,6 +241,9 @@ export interface V3Node {
   /** Which bot/CLI runs this node.  MVP dogfoods a single CLI, but the field
    *  is per-node so a mixed-backend DAG is a non-breaking extension. */
   bot?: string;
+  /** Execution Profile selector. New workflows prefer this over bot; bot is
+   * retained as a backwards-compatible alias during migration. */
+  executionProfile?: string;
   /** Normalized incoming edges.  Authored as `string | {from, when?}`;
    *  validateDag normalizes to `V3DependRef[]` (edge-activation design §1.1).
    *  Unconditional edges gate on source `done`; `when` edges additionally
@@ -310,6 +313,12 @@ export interface V3GoalNode extends V3Node {
 /** Narrowing guard: a validated goal node always has a non-empty `goal`. */
 export function isGoalNode(node: V3Node): node is V3GoalNode {
   return node.type === 'goal' && typeof node.goal === 'string' && node.goal.length > 0;
+}
+
+/** Stable execution selector. New DAGs use executionProfile; historical DAGs
+ * keep bot. Runtime/freeze paths must use this helper so both remain resumable. */
+export function executionSelector(node: Pick<V3Node, 'executionProfile' | 'bot'>, inherited?: string): string | undefined {
+  return node.executionProfile ?? node.bot ?? inherited;
 }
 
 export interface V3HostNode extends V3Node {
@@ -457,6 +466,7 @@ export function validateDag(raw: unknown): V3Dag {
           type,
           goal: typeof n.goal === 'string' ? n.goal : undefined,
           bot: typeof n.bot === 'string' ? n.bot : undefined,
+          executionProfile: typeof n.executionProfile === 'string' ? n.executionProfile : undefined,
           depends,
           triggerRule,
           inputs,
@@ -471,6 +481,7 @@ export function validateDag(raw: unknown): V3Dag {
       if (n.outputs !== undefined) problems.push(`host node "${id}".outputs is not supported`);
       if (n.goal !== undefined) problems.push(`host node "${id}".goal is not supported`);
       if (n.bot !== undefined) problems.push(`host node "${id}".bot is not supported — host nodes do not spawn a CLI`);
+      if (n.executionProfile !== undefined) problems.push(`host node "${id}".executionProfile is not supported — host nodes do not spawn a CLI`);
       if (n.override !== undefined) problems.push(`host node "${id}".override is not supported`);
       if (n.revisitTo !== undefined) problems.push(`host node "${id}".revisitTo is not supported`);
       if (n.resultSchema !== undefined) {
@@ -555,6 +566,14 @@ export function validateDag(raw: unknown): V3Dag {
       problems.push(`goal node "${id}".goal must be a non-empty string`);
     }
 
+    const executionProfile = typeof n.executionProfile === 'string' ? n.executionProfile.trim() : undefined;
+    if (n.executionProfile !== undefined && (!executionProfile || !SEGMENT_RE.test(executionProfile))) {
+      problems.push(`goal node "${id}".executionProfile must be a path-safe profile id`);
+    }
+    if (n.bot !== undefined && executionProfile) {
+      problems.push(`goal node "${id}" cannot set both bot and executionProfile`);
+    }
+
     const timeoutSec = normTimeoutSec(n.timeoutSec, `node "${id}"`, problems);
 
     const resultSchema = normResultSchema(n.resultSchema, id, problems);
@@ -576,6 +595,7 @@ export function validateDag(raw: unknown): V3Dag {
       type,
       goal: typeof n.goal === 'string' ? n.goal : undefined,
       bot: typeof n.bot === 'string' ? n.bot : undefined,
+      executionProfile,
       depends,
       triggerRule,
       override,
@@ -1216,6 +1236,11 @@ function normLoopFields(
     if (bFromList.includes(bid)) problems.push(`${where}.body node "${bid}" depends on itself`);
     if (new Set(bFromList).size !== bFromList.length) problems.push(`${where}.body node "${bid}".depends has duplicates`);
     const binputs = normInputs(b.inputs, `${id}.body.${bid}`, problems, schemaVersion);
+    const bexecutionProfile = typeof b.executionProfile === 'string' ? b.executionProfile.trim() : undefined;
+    if (b.executionProfile !== undefined && (!bexecutionProfile || !SEGMENT_RE.test(bexecutionProfile))) {
+      problems.push(`${where}.body node "${bid}".executionProfile must be a path-safe profile id`);
+    }
+    if (b.bot !== undefined && bexecutionProfile) problems.push(`${where}.body node "${bid}" cannot set both bot and executionProfile`);
     const btimeout = normTimeoutSec(b.timeoutSec, `${where}.body node "${bid}"`, problems);
     const bschema = normResultSchema(b.resultSchema, `${id}.body.${bid}`, problems);
     const boverride = normOverride(b.override, `${where}.body node "${bid}"`, problems);
@@ -1230,6 +1255,7 @@ function normLoopFields(
       type: 'goal',
       goal: typeof b.goal === 'string' ? b.goal : undefined,
       bot: typeof b.bot === 'string' ? b.bot : undefined,
+      executionProfile: bexecutionProfile,
       depends: bdepends,
       override: boverride,
       inputs: binputs,

@@ -12,7 +12,8 @@
  */
 
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
-import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
+import { executionSelector, isGoalNode, isLoopNode, type V3Dag } from './dag.js';
+import type { WorkflowExecutionProfile } from './execution-profile-store.js';
 import {
   V3_SUPPORTED_CLIS,
   isV3SupportedCli,
@@ -82,6 +83,59 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
   };
 }
 
+/** Direct CLI profile → legacy-shaped execution snapshot. The synthetic
+ * profile identity is intentionally not a Lark app id; EphemeralPool runs it
+ * apiOnly and never resolves or injects a Feishu secret. */
+export function executionProfileToSnapshot(profile: WorkflowExecutionProfile): BotSnapshot {
+  if (!profile.enabled) throw new Error(`v3 workflow execution profile "${profile.profileId}" is disabled`);
+  if (!isV3SupportedCli(profile.cli)) throw new Error(`v3 workflow execution profile "${profile.profileId}" uses unsupported CLI "${profile.cli}"`);
+  return {
+    larkAppId: `profile:${profile.profileId}`,
+    executionProfileId: profile.profileId,
+    directCli: true,
+    cliId: profile.cli,
+    ...(profile.model ? { model: profile.model } : {}),
+    workingDir: profile.workingDir,
+    sandbox: profile.sandbox.enabled,
+    sandboxNetwork: profile.sandbox.network,
+    sandboxPaths: {
+      ...(profile.sandbox.readWrite.length ? { readWrite: [...profile.sandbox.readWrite] } : {}),
+      ...(profile.sandbox.readOnly.length ? { readOnly: [...profile.sandbox.readOnly] } : {}),
+      ...(profile.sandbox.deny.length ? { deny: [...profile.sandbox.deny] } : {}),
+    },
+    timeoutDefaultSec: profile.timeoutPolicy.defaultSec,
+    costTier: profile.costTier,
+    timeoutMaxSec: profile.timeoutPolicy.maxSec,
+    envAllowlist: [...profile.envPolicy.allow],
+    envDenylist: [...profile.envPolicy.deny],
+  };
+}
+
+/** Freeze all execution selectors. New executionProfile selectors resolve from
+ * the independent catalog; legacy bot selectors keep their historical path. */
+export function freezeDagExecutionSnapshots(
+  dag: V3Dag,
+  bots: BotConfig[],
+  profiles: readonly WorkflowExecutionProfile[],
+  opts: { defaultSelector?: string; workingDirOverride?: string } = {},
+): Map<string, BotSnapshot> {
+  const profileById = new Map(profiles.map(profile => [profile.profileId, profile]));
+  const snapshots = new Map<string, BotSnapshot>();
+  const freeze = (selector: string | undefined): void => {
+    const key = selector ?? '';
+    if (snapshots.has(key)) return;
+    const profile = selector ? profileById.get(selector) : undefined;
+    snapshots.set(key, profile
+      ? executionProfileToSnapshot(profile)
+      : botToSnapshot(resolveBotConfig(selector ?? opts.defaultSelector, bots), opts.workingDirOverride));
+  };
+  for (const node of dag.nodes) {
+    if (isGoalNode(node)) freeze(executionSelector(node));
+    if (isLoopNode(node)) for (const body of node.body.nodes) freeze(executionSelector(body, executionSelector(node)));
+  }
+  return snapshots;
+}
+
 /**
  * Resolve every selector used by a DAG exactly once. Keys intentionally mirror
  * the runtime contract (`''` means the DAG's default bot); loop-body nodes use
@@ -90,17 +144,19 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
 export function freezeDagBotSnapshots(
   dag: V3Dag,
   bots: BotConfig[],
-  opts: { defaultSelector?: string; workingDirOverride?: string } = {},
+  opts: { defaultSelector?: string; workingDirOverride?: string; executionProfiles?: readonly WorkflowExecutionProfile[] } = {},
 ): Map<string, BotSnapshot> {
   const snapshots = new Map<string, BotSnapshot>();
+  const profileById = new Map((opts.executionProfiles ?? []).map(profile => [profile.profileId, profile]));
   const freeze = (selector: string | undefined): void => {
     const key = selector ?? '';
     if (snapshots.has(key)) return;
-    const bot = resolveBotConfig(selector ?? opts.defaultSelector, bots);
-    const snapshot = botToSnapshot(bot, opts.workingDirOverride);
+    const directProfile = selector ? profileById.get(selector) : undefined;
+    const bot = directProfile ? undefined : resolveBotConfig(selector ?? opts.defaultSelector, bots);
+    const snapshot = directProfile ? executionProfileToSnapshot(directProfile) : botToSnapshot(bot!, opts.workingDirOverride);
     if (!isV3SupportedCli(snapshot.cliId)) {
       throw new Error(
-        `v3 workflow bot "${bot.name ?? bot.larkAppId}" uses unsupported CLI "${snapshot.cliId}" ` +
+        `v3 workflow executor "${directProfile?.displayName ?? bot?.name ?? bot?.larkAppId}" uses unsupported CLI "${snapshot.cliId}" ` +
         `(supported: ${V3_SUPPORTED_CLIS.join(', ')})`,
       );
     }
@@ -108,9 +164,9 @@ export function freezeDagBotSnapshots(
   };
 
   for (const node of dag.nodes) {
-    if (isGoalNode(node)) freeze(node.bot);
+    if (isGoalNode(node)) freeze(executionSelector(node));
     if (isLoopNode(node)) {
-      for (const bodyNode of node.body.nodes) freeze(bodyNode.bot ?? node.bot);
+      for (const bodyNode of node.body.nodes) freeze(executionSelector(bodyNode, executionSelector(node)));
     }
   }
   return snapshots;
@@ -135,6 +191,8 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
   const allowed = new Set([
     'larkAppId',
     'cliId',
+    'executionProfileId',
+    'directCli',
     'cliPathOverride',
     'model',
     'sandbox',
@@ -143,6 +201,11 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'sandboxReadonlyPaths',
     'sandboxNetwork',
     'workingDir',
+    'timeoutDefaultSec',
+    'timeoutMaxSec',
+    'costTier',
+    'envAllowlist',
+    'envDenylist',
   ]);
   const snapshots = new Map<string, BotSnapshot>();
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -165,22 +228,27 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'model'] as const) {
+    for (const field of ['cliPathOverride', 'model', 'executionProfileId', 'costTier'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
     }
-    for (const field of ['sandbox', 'sandboxNetwork'] as const) {
+    for (const field of ['sandbox', 'sandboxNetwork', 'directCli'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'boolean') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a boolean`);
       }
     }
-    for (const field of ['sandboxHidePaths', 'sandboxReadonlyPaths'] as const) {
+    for (const field of ['sandboxHidePaths', 'sandboxReadonlyPaths', 'envAllowlist', 'envDenylist'] as const) {
       if (
         obj[field] !== undefined &&
         (!Array.isArray(obj[field]) || !(obj[field] as unknown[]).every((item) => typeof item === 'string'))
       ) {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string array`);
+      }
+    }
+    for (const field of ['timeoutDefaultSec', 'timeoutMaxSec'] as const) {
+      if (obj[field] !== undefined && (!Number.isInteger(obj[field]) || Number(obj[field]) < 1)) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a positive integer`);
       }
     }
     if (obj.sandboxPaths !== undefined) {
@@ -207,6 +275,8 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       larkAppId: obj.larkAppId,
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.executionProfileId !== undefined ? { executionProfileId: obj.executionProfileId as string } : {}),
+      ...(obj.directCli !== undefined ? { directCli: obj.directCli as boolean } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),
@@ -214,15 +284,20 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
       ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
       workingDir: obj.workingDir,
+      ...(typeof obj.timeoutDefaultSec === 'number' ? { timeoutDefaultSec: obj.timeoutDefaultSec } : {}),
+      ...(obj.costTier === 'low' || obj.costTier === 'medium' || obj.costTier === 'high' ? { costTier: obj.costTier } : {}),
+      ...(typeof obj.timeoutMaxSec === 'number' ? { timeoutMaxSec: obj.timeoutMaxSec } : {}),
+      ...(Array.isArray(obj.envAllowlist) ? { envAllowlist: [...obj.envAllowlist as string[]] } : {}),
+      ...(Array.isArray(obj.envDenylist) ? { envDenylist: [...obj.envDenylist as string[]] } : {}),
     });
   }
 
   if (dag) {
     const required = new Set<string>();
     for (const node of dag.nodes) {
-      if (isGoalNode(node)) required.add(node.bot ?? '');
+      if (isGoalNode(node)) required.add(executionSelector(node) ?? '');
       if (isLoopNode(node)) {
-        for (const bodyNode of node.body.nodes) required.add(bodyNode.bot ?? node.bot ?? '');
+        for (const bodyNode of node.body.nodes) required.add(executionSelector(bodyNode, executionSelector(node)) ?? '');
       }
     }
     for (const key of required) {

@@ -1,5 +1,8 @@
 import type { RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
 import type { V3RunStatus } from '../../workflows/v3/state.js';
+import type { WorkflowExecutionProfile } from '../../workflows/v3/execution-profile-store.js';
+import type { WorkflowProfileRecommendation } from '../../workflows/v3/model-recommender.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 export type V3Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -27,6 +30,24 @@ export type V3RunCancelResult =
     status: number;
     error: string;
   };
+
+export async function fetchWorkflowExecutionProfiles(goal = '', fetcher: V3Fetch = fetch): Promise<{ profiles: WorkflowExecutionProfile[]; recommendations: WorkflowProfileRecommendation[] }> {
+  const response = await fetcher(`/api/v3/execution-profiles?goal=${encodeURIComponent(goal)}`);
+  if (!response.ok) return { profiles: [], recommendations: [] };
+  return response.json() as Promise<{ profiles: WorkflowExecutionProfile[]; recommendations: WorkflowProfileRecommendation[] }>;
+}
+
+export async function saveWorkflowExecutionProfile(profile: Partial<WorkflowExecutionProfile>, fetcher: V3Fetch = fetch): Promise<WorkflowExecutionProfile> {
+  const response = await fetcher('/api/v3/execution-profiles', { method: 'PUT', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() }, body: JSON.stringify(profile) });
+  const body = await response.json() as { profile?: WorkflowExecutionProfile; error?: string };
+  if (!response.ok || !body.profile) throw new Error(body.error ?? `http_${response.status}`);
+  return body.profile;
+}
+
+export async function disableWorkflowExecutionProfile(profileId: string, fetcher: V3Fetch = fetch): Promise<void> {
+  const response = await fetcher(`/api/v3/execution-profiles/${encodeURIComponent(profileId)}/disable`, { method: 'POST', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() }, body: '{}' });
+  if (!response.ok) throw new Error(`http_${response.status}`);
+}
 
 export async function fetchV3Runs(fetcher: V3Fetch = fetch): Promise<RunSummary[]> {
   const response = await fetcher('/api/v3/runs');

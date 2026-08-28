@@ -154,8 +154,12 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  /** Execution identity. For legacy profiles this is a Lark app id; for direct
+   * CLI profiles it is `profile:<profileId>` and carries no transport secret. */
   larkAppId: string;
   cliId: CliId;
+  executionProfileId?: string;
+  directCli?: boolean;
   cliPathOverride?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
@@ -170,6 +174,11 @@ export interface BotSnapshot {
   sandboxNetwork?: boolean;
   /** The resolved working directory for this run. */
   workingDir: string;
+  timeoutDefaultSec?: number;
+  timeoutMaxSec?: number;
+  costTier?: 'low' | 'medium' | 'high';
+  envAllowlist?: string[];
+  envDenylist?: string[];
 }
 
 // ─── runNode (the single call across the boundary) ──────────────────────────

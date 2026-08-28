@@ -20,6 +20,7 @@ import { openV3WorkerAttempts } from './attempt-ledger.js';
 import { materialize, type V3RunStatus } from './state.js';
 import type { StoredEvent } from './event-contract.js';
 import type { V3NodeStatus } from './orchestrator.js';
+import { parseFrozenBotSnapshots } from './bot-resolve.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
  *  caller-supplied runId, so it can't escape runsDir via traversal. */
@@ -108,6 +109,17 @@ export interface RunNodeView {
   /** Read-only workflow reliability projection. No absolute paths or free-text
    *  worker output are exposed; this is safe for link-shareable run views. */
   reliability: RunNodeReliabilityView;
+  execution?: {
+    selector: string;
+    profileId?: string;
+    cli: string;
+    model?: string;
+    workingDir: string;
+    timeoutSec: number;
+    costTier: 'low' | 'medium' | 'high' | 'unknown';
+    riskLevel: 'low' | 'medium' | 'high';
+    gated: boolean;
+  };
 }
 
 export interface RunView {
@@ -154,6 +166,10 @@ interface DagNodeLite {
   id: string;
   depends: string[];
   goal?: string;
+  selector?: string;
+  timeoutSec?: number;
+  gated?: boolean;
+  type?: string;
   isLoop?: boolean;
   maxIterations?: number;
   /** Loop nodes only: body template — body-INTERNAL depends + goal per body
@@ -180,7 +196,7 @@ function readDagNodes(runDir: string): DagNodeLite[] {
     const dag = JSON.parse(readFileSync(p, 'utf-8')) as { nodes?: unknown };
     if (!dag || !Array.isArray(dag.nodes)) return [];
     return dag.nodes.map((raw): DagNodeLite => {
-      const n = raw as { id?: unknown; depends?: unknown; goal?: unknown; type?: unknown; maxIterations?: unknown; body?: unknown };
+      const n = raw as { id?: unknown; depends?: unknown; goal?: unknown; type?: unknown; bot?: unknown; executionProfile?: unknown; timeoutSec?: unknown; humanGate?: unknown; maxIterations?: unknown; body?: unknown };
       let body: DagNodeLite['body'];
       const bodyNodes = (n.body as { nodes?: unknown } | undefined)?.nodes;
       if (n.type === 'loop' && Array.isArray(bodyNodes)) {
@@ -201,6 +217,10 @@ function readDagNodes(runDir: string): DagNodeLite[] {
         id: String(n.id),
         depends: dependsToIds(n.depends),
         goal: typeof n.goal === 'string' ? n.goal : undefined,
+        selector: typeof n.executionProfile === 'string' ? n.executionProfile : typeof n.bot === 'string' ? n.bot : '',
+        timeoutSec: typeof n.timeoutSec === 'number' ? n.timeoutSec : undefined,
+        gated: Boolean(n.humanGate),
+        type: typeof n.type === 'string' ? n.type : undefined,
         isLoop: n.type === 'loop' || undefined,
         maxIterations: typeof n.maxIterations === 'number' ? n.maxIterations : undefined,
         body,
@@ -411,6 +431,8 @@ export function projectRun(runId: string, runDir: string): RunView {
   }
   const snap = materialize(events);
   const dagNodes = readDagNodes(runDir);
+  let executionSnapshots = new Map<string, import('./contract.js').BotSnapshot>();
+  try { executionSnapshots = parseFrozenBotSnapshots(JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf8'))); } catch { /* pre-envelope or partial authoring */ }
   const reliabilitySummary = summarizeReliability(events);
   const reliability = reliabilitySummary.run;
 
@@ -492,6 +514,20 @@ export function projectRun(runId: string, runDir: string): RunView {
       view.errorCode = err.errorCode;
     }
     const dagNode = dagById.get(id);
+    const execution = dagNode ? executionSnapshots.get(dagNode.selector ?? '') : undefined;
+    if (execution && dagNode?.type === 'goal') {
+      view.execution = {
+        selector: dagNode.selector ?? '',
+        ...(execution.executionProfileId ? { profileId: execution.executionProfileId } : {}),
+        cli: execution.cliId,
+        ...(execution.model ? { model: execution.model } : {}),
+        workingDir: execution.workingDir,
+        timeoutSec: Math.min(dagNode.timeoutSec ?? execution.timeoutDefaultSec ?? 1800, execution.timeoutMaxSec ?? dagNode.timeoutSec ?? 1800),
+        costTier: execution.costTier ?? 'unknown',
+        riskLevel: dagNode.gated ? 'high' : /部署|删除|写配置|deploy|delete/iu.test(dagNode.goal ?? '') ? 'medium' : 'low',
+        gated: Boolean(dagNode.gated),
+      };
+    }
     if (dagNode?.isLoop) view.isLoop = true;
     const ls = snap.loops.get(id);
     if (ls) {

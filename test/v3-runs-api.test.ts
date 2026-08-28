@@ -2,11 +2,12 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { Writable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendEvent } from '../src/workflows/v3/journal.js';
 import { handleV3RunsApi } from '../src/dashboard/v3-runs-api.js';
 import type { V3RunsApiDeps } from '../src/dashboard/v3-runs-api.js';
+import { WorkflowExecutionProfileStore } from '../src/workflows/v3/execution-profile-store.js';
 
 /** Minimal ServerResponse mock: a real Writable (so createReadStream.pipe
  *  works) with writeHead/end capture. */
@@ -113,6 +114,21 @@ describe('v3-runs-api', () => {
         expect(m.status, path).toBe(401);
         expect(m.json()).toEqual({ ok: false, error: 'auth_required' });
       }
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('manages execution profiles and returns deterministic recommendations', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-api-profile-'));
+    try {
+      const store = new WorkflowExecutionProfileStore(join(base, 'profiles.json'));
+      const deps = { ...apiDeps(join(base, 'runs')), executionProfileStore: store };
+      const payload = Buffer.from(JSON.stringify({ profileId: 'code', displayName: 'Code', cli: 'codex', model: 'm', workingDir: base, costTier: 'medium' }));
+      const put = mockRes();
+      await handleV3RunsApi(Object.assign(Readable.from([payload]), { method: 'PUT' }) as IncomingMessage, put.res, new URL('http://x/api/v3/execution-profiles'), deps, true);
+      expect(put.status).toBe(200);
+      const getResult = mockRes();
+      await handleV3RunsApi(get('/api/v3/execution-profiles?goal=实现代码').req, getResult.res, get('/api/v3/execution-profiles?goal=实现代码').url, deps, true);
+      expect(getResult.json()).toMatchObject({ profiles: [{ profileId: 'code', cli: 'codex' }], recommendations: [{ profileId: 'code', taskType: 'code', coldStart: true }] });
     } finally { rmSync(base, { recursive: true, force: true }); }
   });
 

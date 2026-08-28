@@ -51,6 +51,7 @@ import {
   parseFrozenBotSnapshots,
   serializeFrozenBotSnapshots,
 } from './bot-resolve.js';
+import { WorkflowExecutionProfileStore } from './execution-profile-store.js';
 import {
   loadAuthorizedV3Run,
   artifactRef,
@@ -518,7 +519,7 @@ function sealLegacyV3Run(
       const raw = JSON.parse(readFileSync(botPath, 'utf-8')) as unknown;
       botSnapshots = parseFrozenBotSnapshots(raw, dag);
     } else {
-      botSnapshots = freezeDagBotSnapshots(dag, bots);
+      botSnapshots = freezeDagBotSnapshots(dag, bots, { executionProfiles: new WorkflowExecutionProfileStore().list() });
       atomicWriteFileSync(
         botPath,
         `${JSON.stringify(serializeFrozenBotSnapshots(botSnapshots), null, 2)}\n`,
