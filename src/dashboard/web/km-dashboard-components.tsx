@@ -49,7 +49,7 @@ export function KmPageFrame(props: {
         <div className="km-hero-meta" aria-label="看板元信息">
           <span>UPDATED</span>
           <b>{formatDateTime(props.model.generatedAt)}</b>
-          <small>metrics fallback · contract v1</small>
+          <small>{props.model.source === 'metrics-api' ? 'metrics api' : 'metrics fallback'} · contract v1</small>
         </div>
       </header>
 
