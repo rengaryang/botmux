@@ -44,9 +44,19 @@ export interface AttemptLeaseAcquisition {
 
 export type AttemptLeaseDrainResult =
   /** Exact external ownership is proven closed; journal proof precedes finalization. */
-  | { status: 'closed'; finalizeAfterProof(): void }
+  | { status: 'closed'; diagnostic?: AttemptLeaseDrainDiagnostic; finalizeAfterProof(): void }
   /** `pending` is known live ownership; `unknown` means the host cannot prove either state. */
-  | { status: 'pending' | 'unknown' };
+  | { status: 'pending' | 'unknown'; diagnostic?: AttemptLeaseDrainDiagnostic };
+
+export interface AttemptLeaseDrainDiagnostic {
+  status: 'closed' | 'pending' | 'unknown';
+  /** Bounded host-provided classification for operations/recovery views. */
+  reason?: string;
+  /** Present only after the host signalled an exact attempt-bound process. */
+  signal?: 'SIGINT' | 'SIGKILL';
+  workerPid?: number;
+  workerProcStart?: string;
+}
 
 export interface AttemptLeaseProvider {
   /**

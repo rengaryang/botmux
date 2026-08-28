@@ -18,6 +18,7 @@ import {
 } from '../src/workflows/v3/worker-fence.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import type { BotSnapshot, Manifest, RunNode, RunNodeRequest } from '../src/workflows/v3/contract.js';
+import type { AttemptLeaseProvider } from '../src/workflows/v3/runtime-host-contract.js';
 
 const resolveBotSnapshot = (): BotSnapshot => ({
   larkAppId: 'cli_test',
@@ -868,6 +869,92 @@ describe('v3 non-cancel terminal worker quiescence', () => {
         nodeId: 'peer',
         attemptId,
         errorCode: 'ORPHAN_RECOVERY_EXHAUSTED',
+      }));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('journals bounded external-drain diagnostics without duplicate dispatch or repeated identical observations', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-orphan-drain-diagnostics-'));
+    try {
+      const dag = validateDag({
+        runId: 'orphan-drain-diagnostics',
+        nodes: [{ id: 'peer', type: 'goal', goal: 'recover' }],
+      });
+      const runDir = join(base, dag.runId);
+      const journalPath = join(runDir, 'journal.ndjson');
+      const attemptId = 'peer#001/attempts/001';
+      const attemptDir = join(runDir, attemptId);
+      mkdirSync(attemptDir, { recursive: true });
+      appendEvent(journalPath, { type: 'runStarted', runId: dag.runId });
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'peer', instanceId: 'peer#001', attemptId });
+      appendEvent(journalPath, { type: 'nodeWorkerFenceArmed', nodeId: 'peer', instanceId: 'peer#001', attemptId });
+
+      let drainCalls = 0;
+      const provider: AttemptLeaseProvider = {
+        acquire: () => ({ auditKind: 'attemptLease' }),
+        closeBeforeExecution: () => {},
+        cleanupSettled: () => {},
+        drainExternallyOwned: () => {
+          drainCalls++;
+          if (drainCalls <= 2) {
+            return {
+              status: 'pending',
+              diagnostic: {
+                status: 'pending',
+                reason: 'signal_sent',
+                signal: 'SIGINT',
+                workerPid: 123,
+                workerProcStart: 'start-1',
+              },
+            };
+          }
+          return {
+            status: 'closed',
+            diagnostic: {
+              status: 'closed',
+              reason: 'process_missing',
+              workerPid: 123,
+              workerProcStart: 'start-1',
+            },
+            finalizeAfterProof: () => {},
+          };
+        },
+      };
+      const dispatched: string[] = [];
+      const runNode: RunNode = async (req) => {
+        dispatched.push(req.attemptId);
+        return ok(req);
+      };
+
+      await expect(runWorkflow(dag, {
+        runNode,
+        validateManifest,
+        resolveBotSnapshot,
+        attemptLeaseProvider: provider,
+      }, runtimeOptions(base))).resolves.toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+
+      const events = readJournal(journalPath);
+      expect(dispatched).toEqual(['peer#001/attempts/002']);
+      expect(events.filter((event) => event.type === 'nodeDispatched').map((event) => event.attemptId))
+        .toEqual([attemptId, 'peer#001/attempts/002']);
+      expect(events.filter((event) =>
+        event.type === 'nodeAttemptDrainObserved' &&
+        event.attemptId === attemptId &&
+        event.signal === 'SIGINT')).toHaveLength(1);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'nodeAttemptDrainObserved',
+        attemptId,
+        status: 'closed',
+        leaseReason: 'process_missing',
+        workerPid: 123,
+        workerProcStart: 'start-1',
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'nodeAttemptDrained',
+        attemptId,
+        reason: 'orphanRecovery',
       }));
     } finally {
       rmSync(base, { recursive: true, force: true });

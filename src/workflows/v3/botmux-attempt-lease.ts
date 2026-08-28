@@ -58,8 +58,16 @@ export function createBotmuxAttemptLeaseProvider(): AttemptLeaseProvider {
   const closed = (
     binding: AttemptLeaseBinding,
     fence?: V3AttemptWorkerFence,
+    reason?: string,
   ): AttemptLeaseDrainResult => ({
     status: 'closed',
+    diagnostic: {
+      status: 'closed',
+      ...(reason ? { reason } : {}),
+      ...((fence?.phase === 'active' || fence?.phase === 'closed')
+        ? { workerPid: fence.workerPid, workerProcStart: fence.workerProcStart }
+        : {}),
+    },
     finalizeAfterProof: () => {
       if (fence) removeV3AttemptWorkerFence(binding.attemptDir, fence);
       clearTracking(binding.attemptId);
@@ -87,7 +95,7 @@ export function createBotmuxAttemptLeaseProvider(): AttemptLeaseProvider {
       try {
         fence = readV3AttemptWorkerFence(binding.attemptDir, binding);
       } catch {
-        return { status: 'unknown' };
+        return { status: 'unknown', diagnostic: { status: 'unknown', reason: 'fence_read_failed' } };
       }
 
       if (fence?.phase === 'armed') {
@@ -104,21 +112,24 @@ export function createBotmuxAttemptLeaseProvider(): AttemptLeaseProvider {
               });
               missingFenceNoneSince.delete(binding.attemptId);
             } catch {
-              return { status: 'unknown' };
+              return { status: 'unknown', diagnostic: { status: 'unknown', reason: 'self_owned_armed_activation_failed' } };
             }
           } else if (discovery.status === 'none') {
-            if (!emptyDiscoveryIsStable(binding.attemptId)) return { status: 'pending' };
+            if (!emptyDiscoveryIsStable(binding.attemptId)) {
+              return { status: 'pending', diagnostic: { status: 'pending', reason: 'self_owned_armed_discovery_none_stabilizing' } };
+            }
             try {
               return closed(
                 binding,
                 closeV3ArmedFenceWithoutSpawn(binding.attemptDir, fence, 'setup_failed'),
+                'self_owned_armed_no_worker',
               );
             } catch {
-              return { status: 'unknown' };
+              return { status: 'unknown', diagnostic: { status: 'unknown', reason: 'self_owned_armed_no_spawn_close_failed' } };
             }
           } else {
             missingFenceNoneSince.delete(binding.attemptId);
-            return { status: 'unknown' };
+            return { status: 'unknown', diagnostic: { status: 'unknown', reason: `self_owned_armed_discovery_${discovery.status}` } };
           }
         } else {
           const recovered = recoverV3ArmedFenceWorker({
@@ -134,11 +145,13 @@ export function createBotmuxAttemptLeaseProvider(): AttemptLeaseProvider {
           ) {
             fence = recovered.fence;
           } else if (recovered.status === 'none') {
-            if (!emptyDiscoveryIsStable(binding.attemptId)) return { status: 'pending' };
-            return closed(binding, fence);
+            if (!emptyDiscoveryIsStable(binding.attemptId)) {
+              return { status: 'pending', diagnostic: { status: 'pending', reason: 'external_armed_discovery_none_stabilizing' } };
+            }
+            return closed(binding, fence, 'external_armed_no_worker');
           } else {
             missingFenceNoneSince.delete(binding.attemptId);
-            return { status: 'unknown' };
+            return { status: 'unknown', diagnostic: { status: 'unknown', reason: `external_armed_${recovered.status}` } };
           }
         }
       }
@@ -155,20 +168,30 @@ export function createBotmuxAttemptLeaseProvider(): AttemptLeaseProvider {
             });
             missingFenceNoneSince.delete(binding.attemptId);
           } catch {
-            return { status: 'unknown' };
+            return { status: 'unknown', diagnostic: { status: 'unknown', reason: 'legacy_discovery_activation_failed' } };
           }
         } else if (discovery.status === 'none') {
-          if (!emptyDiscoveryIsStable(binding.attemptId)) return { status: 'pending' };
-          return closed(binding);
+          if (!emptyDiscoveryIsStable(binding.attemptId)) {
+            return { status: 'pending', diagnostic: { status: 'pending', reason: 'legacy_discovery_none_stabilizing' } };
+          }
+          return closed(binding, undefined, 'legacy_no_worker');
         } else {
           missingFenceNoneSince.delete(binding.attemptId);
-          return { status: 'unknown' };
+          return { status: 'unknown', diagnostic: { status: 'unknown', reason: `legacy_discovery_${discovery.status}` } };
         }
       }
 
       const probe = probeV3AttemptWorkerFence(binding.attemptDir, binding);
-      if (probe.status === 'dead') return closed(binding, probe.fence);
-      if (probe.status !== 'alive') return { status: 'unknown' };
+      if (probe.status === 'dead') return closed(binding, probe.fence, probe.reason);
+      if (probe.status !== 'alive') {
+        return {
+          status: 'unknown',
+          diagnostic: {
+            status: 'unknown',
+            reason: probe.status === 'missing' ? 'fence_missing_after_probe' : probe.reason,
+          },
+        };
+      }
 
       const now = Date.now();
       const prior = externalDrainSignals.get(binding.attemptId);
@@ -177,17 +200,44 @@ export function createBotmuxAttemptLeaseProvider(): AttemptLeaseProvider {
         : prior.sigkillAt === undefined && now - prior.sigintAt >= EXTERNAL_CANCEL_KILL_GRACE_MS
           ? 'SIGKILL'
           : undefined;
-      if (!signal) return { status: 'pending' };
+      if (!signal) {
+        return {
+          status: 'pending',
+          diagnostic: {
+            status: 'pending',
+            reason: 'signal_grace_wait',
+            workerPid: probe.fence.workerPid,
+            workerProcStart: probe.fence.workerProcStart,
+          },
+        };
+      }
       const result = signalV3AttemptWorker(
         binding.attemptDir,
         probe.fence as V3ActiveAttemptWorkerFence,
         signal,
       );
-      if (result.status === 'dead') return closed(binding, result.fence);
-      if (result.status !== 'signalled') return { status: 'unknown' };
+      if (result.status === 'dead') return closed(binding, result.fence, result.reason);
+      if (result.status !== 'signalled') {
+        return {
+          status: 'unknown',
+          diagnostic: {
+            status: 'unknown',
+            reason: result.status === 'missing' ? 'fence_missing_after_signal_probe' : result.reason,
+          },
+        };
+      }
       if (!prior) externalDrainSignals.set(binding.attemptId, { sigintAt: now });
       else externalDrainSignals.set(binding.attemptId, { ...prior, sigkillAt: now });
-      return { status: 'pending' };
+      return {
+        status: 'pending',
+        diagnostic: {
+          status: 'pending',
+          reason: 'signal_sent',
+          signal,
+          workerPid: result.fence.workerPid,
+          workerProcStart: result.fence.workerProcStart,
+        },
+      };
     },
 
     cleanupSettled(binding, acquisition) {
