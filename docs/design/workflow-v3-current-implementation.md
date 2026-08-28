@@ -193,9 +193,9 @@ botmux workflow approve-dag <runId>
 Gate-2 会完成关键的授权封装：
 
 1. 校验批准的 DAG。
-2. 解析每个节点所用 Bot。
-3. 冻结 Bot 的 CLI、模型、工作目录和 sandbox 策略。
-4. 对 `dag.json`、`spec.json`、`bots.snapshot.json` 计算摘要。
+2. 解析每个节点所用 Execution Profile；历史 `bot` selector 继续兼容。
+3. 冻结 CLI、模型、工作目录、sandbox、env policy 和 timeout policy。
+4. 对 `dag.json`、`spec.json`、`bots.snapshot.json` 计算摘要；该文件名为兼容边界，也可承载不含飞书凭据的直接 CLI Profile 快照。
 5. 原子发布不可变 `run.json`。
 
 `run.json` 是 daemon 开始执行的授权和完整性边界。重试或恢复时，Runtime 使用冻结快照，而不是让已经批准的 Workflow 随当前 `bots.json` 漂移。Bot secret 不写入 Run；启动节点时再按冻结的 `larkAppId` 从实时配置解析。
@@ -248,7 +248,7 @@ Goal 节点交给临时 Agent CLI Worker：
 - `traex`
 - `relay`
 
-节点可以通过 `override.model` 和 `override.systemPromptAppend` 覆盖本节点模型与附加指令。权限绕过策略不能由节点覆盖。
+新建 Workflow 的 Goal 节点可以通过 `executionProfile` 选择独立执行配置；历史 DAG 的 `bot` 字段继续兼容。Execution Profile 在 Dashboard 的 Workflow 页面管理，核心字段为 CLI、模型与绝对工作目录，同时冻结 sandbox、env policy、timeout policy 和成本等级。Goal Worker 以 `apiOnly` 方式直接启动对应 CLI，不解析或注入飞书密钥；入口 Bot 只承担对话、审批、进度和最终输出。节点仍可通过 `override.model` 和 `override.systemPromptAppend` 覆盖本节点模型与附加指令，权限策略不能由节点覆盖。
 
 ### 5.3 依赖、输入和并发
 
@@ -1094,7 +1094,8 @@ botmux template archive-runs
 
 ## 15. 当前限制与演进点
 
-- Workflow 只支持经过 Goal mode 验证的 CLI allowlist。
+- Workflow 只支持经过 Goal mode 验证的 CLI allowlist。Execution Profile 当前可选 Claude Code、Codex、Seed、Traex、Relay、Pi。
+- 模型推荐按任务类型与历史成功/失败/超时样本做确定性评分，样本不足明确标记 `cold_start`。可信价格表未配置时只展示成本等级，不展示金额。
 - Loop body 当前不支持嵌套 Loop 和 body 内 Human Gate。
 - Host Executor 集合是显式注册的固定集合。
 - IM `key=value` 主要面向标量；复杂 object/array 的 Agent CLI 路径使用 `--param-json`。
