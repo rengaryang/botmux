@@ -583,6 +583,44 @@ describe('v3 ephemeral pool', () => {
     expect(Buffer.byteLength(cmd, 'utf-8')).toBeLessThanOrEqual(180);
   });
 
+  it('dispatches Pi through an ordinary file-backed prompt and keeps manifest completion authoritative', async () => {
+    const worker = new ScriptedWorker({ autoReadyAfterInit: true });
+    const factory = factoryFor(worker);
+    const base = request();
+    const req: RunNodeRequest = {
+      ...base,
+      botSnapshot: { ...base.botSnapshot, cliId: 'pi' },
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      manifestPollMs: 5,
+      manifestSettleMs: 10,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    await waitFor(() => worker.readyEmitted);
+    worker.emitMessage({ type: 'prompt_ready' });
+
+    expect(worker.init?.cliId).toBe('pi');
+    expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
+    expect(worker.rawInputs[0]).not.toMatch(/^\/goal(?:\s|$)/);
+    expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.GOAL_PATH}`);
+    expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
+
+    writeFileSync(req.env[GOAL_ENV.MANIFEST_PATH]!, '{"schemaVersion":1}');
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(promise).resolves.toMatchObject({
+      status: 'ok',
+      diagnosticReason: 'manifest-written',
+      manifestPath: req.env[GOAL_ENV.MANIFEST_PATH],
+    });
+  });
+
   it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {
     const worker = new ScriptedWorker({ autoReadyAfterInit: true });
     const factory = factoryFor(worker);

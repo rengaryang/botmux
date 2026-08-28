@@ -485,7 +485,12 @@ async function runNodeImpl(
 
 export function buildGoalCommand(req: RunNodeRequest): string {
   const env = GOAL_ENV;
-  return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  const instruction = `Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  // Pi deliberately has no built-in /goal command. Sending `/goal ...` to Pi
+  // is parsed as an unknown command and never starts the agent. Its ordinary
+  // prompt path provides the same environment and filesystem tools; the pool's
+  // stable manifest watcher remains the authoritative completion boundary.
+  return req.botSnapshot.cliId === 'pi' ? instruction : `${GOAL_COMMAND} ${instruction}`;
 }
 
 function defaultWorkerPath(): string {
