@@ -28,7 +28,7 @@ describe('safe memory activation and backend migration', () => {
   });
 
   it('durably deduplicates failed mirror operations in an outbox', async () => {
-    const store = await ObservationStore.open(tempDir()); expect(store.schemaVersion()).toBe(16);
+    const store = await ObservationStore.open(tempDir()); expect(store.schemaVersion()).toBe(17);
     const memory = store.upsertMemory({ state: 'active', scope: 'user', subject: 'u1', claimKey: 'language', claimText: 'Chinese', confidence: 'observed', privacyClass: 'internal', sourceRefs: base.sourceRefs }).item;
     const first = store.enqueueMemoryBackendOperation({ memoryId: memory.memoryId, providerId: 'hindsight', operation: 'put', payload: { text: 'Chinese' }, now: 1000 });
     expect(first.created).toBe(true);

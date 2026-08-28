@@ -98,6 +98,7 @@ import { observationFromTurnCompletion } from './services/km/observation-produce
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
 import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
 import { isKmBackendWorkerEnabled, kmBackendWorkerIntervalMs, kmBackendWorkerStartupDelayMs, runKmBackendWorkerOnce } from './services/km/memory-backend-runtime.js';
+import { isKmCentralSinkEnabled, kmCentralSinkIntervalMs, kmCentralSinkStartupDelayMs, runKmCentralSinkOnce } from './services/km/central-sink-runtime.js';
 import { isKmRetentionShadowEnabled, kmRetentionShadowIntervalMs, kmRetentionShadowStartupDelayMs, runKmRetentionShadowOnce } from './services/km/retention-runtime.js';
 import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-evolution-runtime.js';
 import { isKmShadowQualityEnabled, runKmShadowQualityOnce } from './services/km/shadow-quality-runtime.js';
@@ -27737,6 +27738,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   kmShadowQualityStartupTimer.unref?.();
   const kmShadowQualityTimer = setInterval(runKmShadowQualityWorker, 60_000);
   kmShadowQualityTimer.unref?.();
+  let kmCentralSinkRunning = false;
+  const runKmCentralSinkWorker = () => {
+    if (kmCentralSinkRunning || !isKmObservationEnabled() || !isKmCentralSinkEnabled()) return;
+    kmCentralSinkRunning = true;
+    void runKmCentralSinkOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.delivered > 0 || result.retried > 0 || result.quarantined > 0) {
+          logger.info(`[km-central-sink] scanned=${result.scanned} enqueued=${result.enqueued} delivered=${result.delivered} retried=${result.retried} quarantined=${result.quarantined}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-central-sink] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmCentralSinkRunning = false; });
+  };
+  const kmCentralSinkStartupTimer = setTimeout(runKmCentralSinkWorker, kmCentralSinkStartupDelayMs(idx));
+  kmCentralSinkStartupTimer.unref?.();
+  const kmCentralSinkTimer = setInterval(runKmCentralSinkWorker, kmCentralSinkIntervalMs());
+  kmCentralSinkTimer.unref?.();
 
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
@@ -28871,6 +28889,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(kmEvalEvolutionTimer);
     if (kmShadowQualityStartupTimer) clearTimeout(kmShadowQualityStartupTimer);
     clearInterval(kmShadowQualityTimer);
+    if (kmCentralSinkStartupTimer) clearTimeout(kmCentralSinkStartupTimer);
+    clearInterval(kmCentralSinkTimer);
     clearInterval(docCommentPollTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
@@ -29118,6 +29138,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(kmEvalEvolutionTimer);
     if (kmShadowQualityStartupTimer) clearTimeout(kmShadowQualityStartupTimer);
     clearInterval(kmShadowQualityTimer);
+    if (kmCentralSinkStartupTimer) clearTimeout(kmCentralSinkStartupTimer);
+    clearInterval(kmCentralSinkTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);

@@ -26,7 +26,7 @@ import {
   type KmRetentionRuntimeStatus,
 } from './retention-policy.js';
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -422,6 +422,14 @@ const PHASE4_SCHEMA = `
     endpoint_ref TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
     redaction_policy_json TEXT NOT NULL CHECK(json_valid(redaction_policy_json)),
+    batch_limit INTEGER NOT NULL DEFAULT 25,
+    timeout_ms INTEGER NOT NULL DEFAULT 5000,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    credential_ref TEXT,
+    allowlist_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(allowlist_json)),
+    tls_policy TEXT NOT NULL DEFAULT 'https-required-for-future-real-transport',
+    payload_max_bytes INTEGER NOT NULL DEFAULT 65536,
+    rollback_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(rollback_json)),
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -841,11 +849,22 @@ export interface EvalResultInput {
 }
 export interface SyncSinkInput {
   sinkId: string; protocolVersion: number; endpointRef: string; enabled?: boolean; redactionPolicy?: Record<string, unknown>;
+  batchLimit?: number; timeoutMs?: number; maxAttempts?: number; credentialRef?: string; allowlist?: string[];
+  payloadMaxBytes?: number; rollback?: Record<string, unknown>;
 }
 export interface SyncStatus {
   sinkId: string; endpointRef: string; enabled: boolean; status: string;
   lastLocalSeq: number; lastBatchId?: string; lastAckAt?: string; centralCursor?: string;
-  pending: number; quarantined: number;
+  pending: number; inflight: number; failed: number; delivered: number; quarantined: number;
+  endpointPolicy?: { ok: boolean; mode: 'offline' | 'blocked-real' | 'invalid'; reason?: string };
+  protocolVersion?: number;
+  batchLimit?: number; timeoutMs?: number; maxAttempts?: number; payloadMaxBytes?: number;
+  credentialRef?: string; allowlist?: string[]; tlsPolicy?: string; rollback?: Record<string, unknown>;
+}
+export interface SyncOutboxRow {
+  outboxId: string; eventId: string; sinkId: string; status: 'pending' | 'inflight' | 'delivered' | 'failed' | 'quarantined';
+  attempts: number; nextAttemptAt: number; claimedAt?: number; claimToken?: string; lastError?: string; deliveredAt?: string;
+  payload: Record<string, unknown>; payloadHash: string; createdAt: string;
 }
 
 export interface EvolutionProposalInput {
@@ -1008,9 +1027,32 @@ function requireText(value: string, field: string): string {
   return result;
 }
 
+function boundedInt(value: number | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value)) throw new Error('km_invalid_integer');
+  return Math.max(min, Math.min(Math.trunc(value), max));
+}
+
 function parseJsonArray(value: string): unknown[] {
   const parsed = JSON.parse(value);
   return Array.isArray(parsed) ? parsed : [];
+}
+
+function parseJsonObject(value: string): Record<string, unknown> {
+  const parsed = JSON.parse(value);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+}
+
+function syncEndpointPolicy(endpointRef: string): { ok: boolean; mode: 'offline' | 'blocked-real' | 'invalid'; reason?: string } {
+  try {
+    const url = new URL(endpointRef);
+    if (url.protocol === 'mock:' || url.protocol === 'inmemory:') return { ok: true, mode: 'offline' };
+    if (url.protocol === 'https:') return { ok: false, mode: 'blocked-real', reason: 'offline_runtime_allows_mock_or_inmemory_only' };
+    if (url.protocol === 'http:') return { ok: false, mode: 'invalid', reason: 'tls_required_for_future_real_transport' };
+    return { ok: false, mode: 'invalid', reason: 'unsupported_protocol' };
+  } catch {
+    return { ok: false, mode: 'invalid', reason: 'invalid_url' };
+  }
 }
 
 interface RetentionDomainSpec {
@@ -1498,6 +1540,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 14) this.migrateToPhase14();
     if (this.schemaVersion() < 15) this.migrateToPhase15();
     if (this.schemaVersion() < 16) this.migrateToPhase16();
+    if (this.schemaVersion() < 17) this.migrateToPhase17();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -2889,18 +2932,37 @@ export class ObservationStore {
 
   configureSyncSink(input: SyncSinkInput): SyncStatus {
     const now = new Date().toISOString();
-    if (!input.endpointRef.startsWith('mock://') && input.enabled) throw new Error('km_sync_real_sink_requires_explicit_external_approval');
+    const endpointRef = requireText(input.endpointRef, 'sink_endpoint');
+    const endpointPolicy = syncEndpointPolicy(endpointRef);
+    if (input.enabled && !endpointPolicy.ok) throw new Error('km_sync_real_sink_blocked_offline_runtime');
+    const sinkId = requireText(input.sinkId, 'sink_id');
+    const batchLimit = boundedInt(input.batchLimit, 25, 1, 100);
+    const timeoutMs = boundedInt(input.timeoutMs, 5_000, 100, 30_000);
+    const maxAttempts = boundedInt(input.maxAttempts, 5, 1, 50);
+    const payloadMaxBytes = boundedInt(input.payloadMaxBytes, 64 * 1024, 1_024, 256 * 1024);
+    const allowlist = (input.allowlist ?? []).map(item => item.trim()).filter(Boolean);
+    const credentialRef = input.credentialRef?.trim();
+    if (credentialRef && !/^env:[A-Z_][A-Z0-9_]*$/.test(credentialRef) && !/^file:\/[^\s]+$/.test(credentialRef)) {
+      throw new Error('km_sync_credential_ref_required');
+    }
     this.db.exec('BEGIN IMMEDIATE;');
     try {
-      this.db.prepare(`INSERT INTO sync_sinks(sink_id,protocol_version,endpoint_ref,enabled,redaction_policy_json,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?) ON CONFLICT(sink_id) DO UPDATE SET protocol_version=excluded.protocol_version,
-        endpoint_ref=excluded.endpoint_ref,enabled=excluded.enabled,redaction_policy_json=excluded.redaction_policy_json,updated_at=excluded.updated_at`)
-        .run(requireText(input.sinkId, 'sink_id'), input.protocolVersion, requireText(input.endpointRef, 'sink_endpoint'), input.enabled ? 1 : 0,
-          JSON.stringify(input.redactionPolicy ?? {}), now, now);
-      this.db.prepare(`INSERT OR IGNORE INTO sync_cursors(sink_id,last_local_seq,status,updated_at) VALUES(?,0,'idle',?)`).run(input.sinkId, now);
+      this.db.prepare(`INSERT INTO sync_sinks(
+          sink_id,protocol_version,endpoint_ref,enabled,redaction_policy_json,batch_limit,timeout_ms,max_attempts,
+          credential_ref,allowlist_json,tls_policy,payload_max_bytes,rollback_json,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(sink_id) DO UPDATE SET protocol_version=excluded.protocol_version,
+          endpoint_ref=excluded.endpoint_ref,enabled=excluded.enabled,redaction_policy_json=excluded.redaction_policy_json,
+          batch_limit=excluded.batch_limit,timeout_ms=excluded.timeout_ms,max_attempts=excluded.max_attempts,
+          credential_ref=excluded.credential_ref,allowlist_json=excluded.allowlist_json,tls_policy=excluded.tls_policy,
+          payload_max_bytes=excluded.payload_max_bytes,rollback_json=excluded.rollback_json,updated_at=excluded.updated_at`)
+        .run(sinkId, input.protocolVersion, endpointRef, input.enabled ? 1 : 0,
+          JSON.stringify(input.redactionPolicy ?? {}), batchLimit, timeoutMs, maxAttempts, credentialRef ?? null,
+          JSON.stringify(allowlist), 'https-required-for-future-real-transport', payloadMaxBytes, JSON.stringify(input.rollback ?? {}), now, now);
+      this.db.prepare(`INSERT OR IGNORE INTO sync_cursors(sink_id,last_local_seq,status,updated_at) VALUES(?,0,'idle',?)`).run(sinkId, now);
       this.db.exec('COMMIT;');
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
-    return this.listSyncStatus().find(item => item.sinkId === input.sinkId)!;
+    return this.listSyncStatus().find(item => item.sinkId === sinkId)!;
   }
 
   enqueueSync(input: { sinkId: string; eventId: string; payload: Record<string, unknown>; payloadHash: string; now?: number }): { outboxId: string; created: boolean } {
@@ -2909,11 +2971,46 @@ export class ObservationStore {
     if (!sink.enabled) throw new Error('km_sync_sink_disabled');
     const outboxId = `outbox_${createHash('sha256').update(`${input.sinkId}:${input.eventId}`).digest('hex')}`;
     const now = new Date().toISOString();
+    const bytes = Buffer.byteLength(JSON.stringify(input.payload));
+    const cfg = this.db.prepare('SELECT payload_max_bytes FROM sync_sinks WHERE sink_id=?').get(input.sinkId) as { payload_max_bytes: number } | undefined;
+    if (cfg && bytes > Number(cfg.payload_max_bytes)) throw new Error('km_sync_payload_too_large');
     const result = this.db.prepare(`INSERT OR IGNORE INTO sync_outbox(outbox_id,event_id,sink_id,status,attempts,next_attempt_at,created_at)
       VALUES(?,?,?,'pending',0,?,?)`).run(outboxId, input.eventId, input.sinkId, input.now ?? Date.now(), now);
     if (Number(result.changes) === 1) this.db.prepare('UPDATE sync_outbox SET payload_json=?,payload_hash=? WHERE outbox_id=?')
       .run(JSON.stringify(input.payload), input.payloadHash, outboxId);
     return { outboxId, created: Number(result.changes) === 1 };
+  }
+
+  enqueueSyncFromCursor(input: { sinkId: string; limit: number; now?: number; redact: (event: ObservationEvent) => { ok: true; envelope: Record<string, unknown>; payloadHash: string } | { ok: false; reason: string } }):
+    { scanned: number; enqueued: number; skipped: number; quarantined: number } {
+    const status = this.listSyncStatus().find(item => item.sinkId === input.sinkId);
+    if (!status) throw new Error('km_sync_sink_not_found');
+    if (!status.enabled) return { scanned: 0, enqueued: 0, skipped: 0, quarantined: 0 };
+    const limit = Math.max(1, Math.min(input.limit, 500));
+    const rows = this.db.prepare(`SELECT local_seq,event_id,event_json FROM observation_events WHERE local_seq>?
+      ORDER BY local_seq ASC LIMIT ?`).all(status.lastLocalSeq, limit) as any[];
+    let enqueued = 0; let skipped = 0; let quarantined = 0;
+    for (const row of rows) {
+      const event = ObservationEventSchema.parse(JSON.parse(row.event_json));
+      const redacted = input.redact(event);
+      if (!redacted.ok) {
+        this.quarantineSync({ sinkId: input.sinkId, eventId: event.eventId, reason: redacted.reason, payloadHash: `sha256:${'0'.repeat(64)}` });
+        this.db.prepare(`UPDATE sync_cursors SET last_local_seq=?,status='idle',updated_at=? WHERE sink_id=? AND last_local_seq<?`)
+          .run(Number(row.local_seq), new Date(input.now ?? Date.now()).toISOString(), input.sinkId, Number(row.local_seq));
+        quarantined += 1;
+        continue;
+      }
+      try {
+        if (this.enqueueSync({ sinkId: input.sinkId, eventId: event.eventId, payload: redacted.envelope, payloadHash: redacted.payloadHash, now: input.now }).created) enqueued += 1;
+        else skipped += 1;
+      } catch {
+        this.quarantineSync({ sinkId: input.sinkId, eventId: event.eventId, reason: 'enqueue_failed', payloadHash: redacted.payloadHash });
+        this.db.prepare(`UPDATE sync_cursors SET last_local_seq=?,status='idle',updated_at=? WHERE sink_id=? AND last_local_seq<?`)
+          .run(Number(row.local_seq), new Date(input.now ?? Date.now()).toISOString(), input.sinkId, Number(row.local_seq));
+        quarantined += 1;
+      }
+    }
+    return { scanned: rows.length, enqueued, skipped, quarantined };
   }
 
   claimSyncBatch(input: { sinkId: string; limit: number; now?: number; leaseMs?: number }): { claimToken: string; items: Array<{ outboxId: string; eventId: string; payload: Record<string, unknown>; payloadHash: string }> } {
@@ -2936,13 +3033,17 @@ export class ObservationStore {
       payload: JSON.parse(row.payload_json ?? '{}'), payloadHash: String(row.payload_hash ?? '') })) };
   }
 
-  failSyncClaim(input: { claimToken: string; error: string; now?: number; baseDelayMs?: number }): void {
+  failSyncClaim(input: { claimToken: string; error: string; now?: number; baseDelayMs?: number; maxAttempts?: number }): void {
     const now = input.now ?? Date.now();
-    const rows = this.db.prepare(`SELECT outbox_id,attempts FROM sync_outbox WHERE claim_token=? AND status='inflight'`).all(input.claimToken) as any[];
-    const update = this.db.prepare(`UPDATE sync_outbox SET status='failed',claim_token=NULL,claimed_at=NULL,last_error=?,next_attempt_at=? WHERE outbox_id=?`);
+    const rows = this.db.prepare(`SELECT outbox_id,sink_id,event_id,attempts,payload_hash FROM sync_outbox WHERE claim_token=? AND status='inflight'`).all(input.claimToken) as any[];
+    const update = this.db.prepare(`UPDATE sync_outbox SET status=?,claim_token=NULL,claimed_at=NULL,last_error=?,next_attempt_at=? WHERE outbox_id=?`);
     for (const row of rows) {
+      const terminal = Number(row.attempts) >= Math.max(1, input.maxAttempts ?? 5);
       const delay = Math.min(300_000, (input.baseDelayMs ?? 1_000) * 2 ** Math.max(0, Number(row.attempts) - 1));
-      update.run(input.error.slice(0, 500), now + delay, row.outbox_id);
+      update.run(terminal ? 'quarantined' : 'failed', input.error.slice(0, 500), terminal ? now : now + delay, row.outbox_id);
+      if (terminal) {
+        this.quarantineSync({ sinkId: String(row.sink_id), eventId: String(row.event_id), reason: `max_attempts_exceeded:${input.error}`.slice(0, 500), payloadHash: String(row.payload_hash ?? 'unknown') });
+      }
     }
   }
 
@@ -2950,9 +3051,11 @@ export class ObservationStore {
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE;');
     try {
-      const delivered = this.db.prepare(`UPDATE sync_outbox SET status='delivered',delivered_at=? WHERE sink_id=? AND event_id=?`);
+      const delivered = this.db.prepare(`UPDATE sync_outbox SET status='delivered',claim_token=NULL,claimed_at=NULL,last_error=NULL,delivered_at=? WHERE sink_id=? AND event_id=?`);
       for (const eventId of input.acceptedEventIds) delivered.run(now, input.sinkId, eventId);
-      const row = this.db.prepare(`SELECT COALESCE(MAX(o.local_seq),0) max_seq FROM observation_events o JOIN sync_outbox x ON x.event_id=o.event_id WHERE x.sink_id=? AND x.status='delivered'`)
+      const row = this.db.prepare(`SELECT COALESCE(MAX(o.local_seq),0) max_seq
+        FROM observation_events o JOIN sync_outbox x ON x.event_id=o.event_id
+        WHERE x.sink_id=? AND x.status IN ('delivered','quarantined')`)
         .get(input.sinkId) as { max_seq: number };
       this.db.prepare(`UPDATE sync_cursors SET last_local_seq=?,last_batch_id=?,last_ack_at=?,central_cursor=?,status='idle',updated_at=? WHERE sink_id=?`)
         .run(Number(row.max_seq), input.batchId, now, input.centralCursor ?? null, now, input.sinkId);
@@ -2964,20 +3067,63 @@ export class ObservationStore {
     const id = `syncq_${randomUUID().replaceAll('-', '')}`;
     this.db.prepare(`INSERT INTO sync_quarantine(quarantine_id,sink_id,event_id,reason,payload_hash,created_at) VALUES(?,?,?,?,?,?)`)
       .run(id, input.sinkId, input.eventId ?? null, requireText(input.reason, 'sync_quarantine_reason'), input.payloadHash, new Date().toISOString());
-    if (input.eventId) this.db.prepare(`UPDATE sync_outbox SET status='quarantined',last_error=? WHERE sink_id=? AND event_id=?`)
-      .run(input.reason, input.sinkId, input.eventId);
+    if (input.eventId) {
+      this.db.prepare(`UPDATE sync_outbox SET status='quarantined',claim_token=NULL,claimed_at=NULL,last_error=? WHERE sink_id=? AND event_id=?`)
+        .run(input.reason, input.sinkId, input.eventId);
+      const row = this.db.prepare(`SELECT COALESCE(MAX(o.local_seq),0) max_seq
+        FROM observation_events o JOIN sync_outbox x ON x.event_id=o.event_id
+        WHERE x.sink_id=? AND x.status IN ('delivered','quarantined')`).get(input.sinkId) as { max_seq: number };
+      this.db.prepare(`UPDATE sync_cursors SET last_local_seq=?,status='idle',updated_at=? WHERE sink_id=? AND last_local_seq<?`)
+        .run(Number(row.max_seq), new Date().toISOString(), input.sinkId, Number(row.max_seq));
+    }
     return id;
   }
 
-  listSyncStatus(): SyncStatus[] {
+  listSyncStatus(input: { redactCredentials?: boolean } = {}): SyncStatus[] {
+    const redactCredentials = input.redactCredentials ?? true;
     const rows = this.db.prepare(`SELECT s.*,c.last_local_seq,c.last_batch_id,c.last_ack_at,c.central_cursor,c.status,
       (SELECT COUNT(*) FROM sync_outbox x WHERE x.sink_id=s.sink_id AND x.status IN ('pending','failed')) pending,
+      (SELECT COUNT(*) FROM sync_outbox x WHERE x.sink_id=s.sink_id AND x.status='inflight') inflight,
+      (SELECT COUNT(*) FROM sync_outbox x WHERE x.sink_id=s.sink_id AND x.status='failed') failed,
+      (SELECT COUNT(*) FROM sync_outbox x WHERE x.sink_id=s.sink_id AND x.status='delivered') delivered,
       (SELECT COUNT(*) FROM sync_quarantine q WHERE q.sink_id=s.sink_id AND q.resolved_at IS NULL) quarantined
       FROM sync_sinks s JOIN sync_cursors c ON c.sink_id=s.sink_id ORDER BY s.sink_id`).all() as any[];
     return rows.map(row => ({ sinkId: row.sink_id, endpointRef: row.endpoint_ref, enabled: Boolean(row.enabled), status: row.status,
       lastLocalSeq: Number(row.last_local_seq), ...(row.last_batch_id ? { lastBatchId: row.last_batch_id } : {}),
       ...(row.last_ack_at ? { lastAckAt: row.last_ack_at } : {}), ...(row.central_cursor ? { centralCursor: row.central_cursor } : {}),
-      pending: Number(row.pending), quarantined: Number(row.quarantined) }));
+      pending: Number(row.pending), inflight: Number(row.inflight), failed: Number(row.failed), delivered: Number(row.delivered),
+      quarantined: Number(row.quarantined), endpointPolicy: syncEndpointPolicy(String(row.endpoint_ref)),
+      protocolVersion: Number(row.protocol_version), batchLimit: Number(row.batch_limit ?? 25),
+      timeoutMs: Number(row.timeout_ms ?? 5000), maxAttempts: Number(row.max_attempts ?? 5),
+      payloadMaxBytes: Number(row.payload_max_bytes ?? 65536),
+      ...(row.credential_ref ? { credentialRef: redactCredentials
+        ? String(row.credential_ref).replace(/^(env|file):(.+)$/, (_m: string, kind: string) => `${kind}:***`)
+        : String(row.credential_ref) } : {}),
+      allowlist: parseJsonArray(row.allowlist_json ?? '[]').map(String),
+      tlsPolicy: String(row.tls_policy ?? 'https-required-for-future-real-transport'),
+      rollback: parseJsonObject(row.rollback_json ?? '{}') }));
+  }
+
+  listSyncOutbox(input: { sinkId?: string; limit: number }): SyncOutboxRow[] {
+    const limit = Math.max(1, Math.min(input.limit, 500));
+    const rows = (input.sinkId
+      ? this.db.prepare(`SELECT * FROM sync_outbox WHERE sink_id=? ORDER BY created_at DESC,outbox_id DESC LIMIT ?`).all(input.sinkId, limit)
+      : this.db.prepare(`SELECT * FROM sync_outbox ORDER BY created_at DESC,outbox_id DESC LIMIT ?`).all(limit)) as any[];
+    return rows.map(row => ({
+      outboxId: row.outbox_id,
+      eventId: row.event_id,
+      sinkId: row.sink_id,
+      status: row.status,
+      attempts: Number(row.attempts),
+      nextAttemptAt: Number(row.next_attempt_at),
+      ...(row.claimed_at ? { claimedAt: Number(row.claimed_at) } : {}),
+      ...(row.claim_token ? { claimToken: String(row.claim_token) } : {}),
+      ...(row.last_error ? { lastError: String(row.last_error) } : {}),
+      ...(row.delivered_at ? { deliveredAt: String(row.delivered_at) } : {}),
+      payload: parseJsonObject(row.payload_json ?? '{}'),
+      payloadHash: String(row.payload_hash ?? ''),
+      createdAt: row.created_at,
+    }));
   }
 
   registerKmProvider(descriptorInput: KmProviderDescriptor): void {
@@ -3008,6 +3154,36 @@ export class ObservationStore {
         input.beforeHash ?? null, input.afterHash?.(response) ?? null, input.requestHash, input.idempotencyKey, now);
       this.db.exec('COMMIT;');
       return { statusCode: input.statusCode, response, replayed: false };
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  getKmMutationReplay<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string }): { statusCode: number; response: T; replayed: true } | null {
+    const row = this.db.prepare(`SELECT route,request_hash,status_code,response_json FROM km_mutation_idempotency WHERE actor_id=? AND idempotency_key=?`)
+      .get(input.actorId, input.idempotencyKey) as any;
+    if (!row) return null;
+    if (row.route !== input.route || row.request_hash !== input.requestHash) throw new Error('km_idempotency_conflict');
+    return { statusCode: Number(row.status_code), response: JSON.parse(row.response_json) as T, replayed: true };
+  }
+
+  recordKmMutation<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string; statusCode: number;
+    action: string; targetRef: string; response: T; beforeHash?: string; afterHash?: string }): { statusCode: number; response: T; replayed: false } {
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const existing = this.db.prepare(`SELECT route,request_hash,status_code,response_json FROM km_mutation_idempotency WHERE actor_id=? AND idempotency_key=?`)
+        .get(input.actorId, input.idempotencyKey) as any;
+      if (existing) {
+        if (existing.route !== input.route || existing.request_hash !== input.requestHash) throw new Error('km_idempotency_conflict');
+        this.db.exec('COMMIT;');
+        return { statusCode: Number(existing.status_code), response: JSON.parse(existing.response_json) as T, replayed: false };
+      }
+      this.db.prepare(`INSERT INTO km_mutation_idempotency(actor_id,idempotency_key,route,request_hash,status_code,response_json,created_at)
+        VALUES(?,?,?,?,?,?,?)`).run(input.actorId, input.idempotencyKey, input.route, input.requestHash, input.statusCode, JSON.stringify(input.response), now);
+      this.db.prepare(`INSERT INTO km_config_audit(audit_id,actor_id,action,target_ref,before_hash,after_hash,request_hash,idempotency_key,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(`kma_${randomUUID().replaceAll('-', '')}`, input.actorId, input.action, input.targetRef,
+        input.beforeHash ?? null, input.afterHash ?? null, input.requestHash, input.idempotencyKey, now);
+      this.db.exec('COMMIT;');
+      return { statusCode: input.statusCode, response: input.response, replayed: false };
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
@@ -3905,6 +4081,25 @@ export class ObservationStore {
       if (this.schemaVersion() >= 16) { this.db.exec('COMMIT;'); return; }
       this.db.exec(PHASE16_SCHEMA);
       this.db.exec('PRAGMA user_version=16;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
+  private migrateToPhase17(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 17) { this.db.exec('COMMIT;'); return; }
+      const columns = new Set((this.db.prepare('PRAGMA table_info(sync_sinks)').all() as Array<{ name: string }>).map(row => row.name));
+      if (!columns.has('batch_limit')) this.db.exec('ALTER TABLE sync_sinks ADD COLUMN batch_limit INTEGER NOT NULL DEFAULT 25;');
+      if (!columns.has('timeout_ms')) this.db.exec('ALTER TABLE sync_sinks ADD COLUMN timeout_ms INTEGER NOT NULL DEFAULT 5000;');
+      if (!columns.has('max_attempts')) this.db.exec('ALTER TABLE sync_sinks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 5;');
+      if (!columns.has('credential_ref')) this.db.exec('ALTER TABLE sync_sinks ADD COLUMN credential_ref TEXT;');
+      if (!columns.has('allowlist_json')) this.db.exec(`ALTER TABLE sync_sinks ADD COLUMN allowlist_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(allowlist_json));`);
+      if (!columns.has('tls_policy')) this.db.exec(`ALTER TABLE sync_sinks ADD COLUMN tls_policy TEXT NOT NULL DEFAULT 'https-required-for-future-real-transport';`);
+      if (!columns.has('payload_max_bytes')) this.db.exec('ALTER TABLE sync_sinks ADD COLUMN payload_max_bytes INTEGER NOT NULL DEFAULT 65536;');
+      if (!columns.has('rollback_json')) this.db.exec(`ALTER TABLE sync_sinks ADD COLUMN rollback_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(rollback_json));`);
+      this.db.exec('CREATE INDEX IF NOT EXISTS sync_outbox_status_counts ON sync_outbox(sink_id,status,next_attempt_at);');
+      this.db.exec('PRAGMA user_version=17;');
       this.db.exec('COMMIT;');
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }

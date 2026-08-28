@@ -395,6 +395,78 @@ describe('KM observation dashboard API', () => {
     expect(listMemoryBackendMigrations).toHaveBeenCalledWith(100);
   });
 
+  it('serves authenticated central sink status, config and drill APIs with idempotency', async () => {
+    const configureSyncSink = vi.fn(input => ({ sinkId: input.sinkId, endpointRef: input.endpointRef, enabled: input.enabled, pending: 0, inflight: 0, failed: 0, delivered: 0, quarantined: 0, lastLocalSeq: 0, status: 'idle' }));
+    const listSyncOutbox = vi.fn(() => [{ outboxId: 'out-1', sinkId: 'central', eventId: 'evt-1', status: 'pending' }]);
+    const centralSinkRuntimeStatus = vi.fn(async () => ({
+      enabled: false,
+      leaseName: 'km-central-sink',
+      protocol: { envelopeVersion: 1, signing: 'hmac-sha256-over-canonical-batch', credentialMode: 'reference-only', realTransportEnabled: false, networkLibrariesAllowed: false },
+      defaults: { batchLimit: 25, leaseMs: 60_000, timeoutMs: 5_000, maxAttempts: 5 },
+      sinks: [],
+      rollback: { automaticRemoteRollback: false, localDisableOnly: true },
+    }));
+    const centralSinkDrill = vi.fn(async () => ({ drill: 'status', ok: true }));
+    const seen = new Map<string, any>();
+    const executeKmMutation = vi.fn((input, operation) => ({ statusCode: input.statusCode, response: operation(), replayed: false }));
+    const getKmMutationReplay = vi.fn((input) => seen.get(input.idempotencyKey) ?? null);
+    const recordKmMutation = vi.fn((input) => {
+      const value = { statusCode: input.statusCode, response: input.response, replayed: false };
+      seen.set(input.idempotencyKey, { statusCode: input.statusCode, response: input.response, replayed: true });
+      return value;
+    });
+    const deps = { enabled: true, actorId: 'reviewer', centralSinkRuntimeStatus, centralSinkDrill, openStore: async () => ({
+      schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close: vi.fn(),
+      configureSyncSink, listSyncOutbox, executeKmMutation, getKmMutationReplay, recordKmMutation,
+    }) };
+
+    const status = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, status.res, new URL('http://localhost/api/km/central-sink/status'), deps);
+    expect(centralSinkRuntimeStatus).toHaveBeenCalledOnce();
+    expect(status.bodies[0]).toEqual(expect.objectContaining({ enabled: false, leaseName: 'km-central-sink' }));
+
+    const putReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      sinkId: 'central',
+      endpointRef: 'mock://central',
+      enabled: true,
+      credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET',
+      batchLimit: 10,
+      timeoutMs: 500,
+      maxAttempts: 2,
+      payloadMaxBytes: 4096,
+    }))]), { method: 'PUT', headers: { 'idempotency-key': 'sink-put-1' } });
+    const put = response();
+    await handleKmObservationApi(putReq as any, put.res, new URL('http://localhost/api/km/central-sink/sinks'), deps);
+    expect(configureSyncSink).toHaveBeenCalledWith(expect.objectContaining({
+      sinkId: 'central',
+      endpointRef: 'mock://central',
+      enabled: true,
+      credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET',
+      batchLimit: 10,
+      timeoutMs: 500,
+      maxAttempts: 2,
+      payloadMaxBytes: 4096,
+    }));
+    expect(executeKmMutation).toHaveBeenCalledWith(expect.objectContaining({ action: 'central_sink.configured', targetRef: 'central' }), expect.any(Function));
+
+    const outbox = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, outbox.res, new URL('http://localhost/api/km/sync/outbox?sinkId=central&limit=999'), deps);
+    expect(listSyncOutbox).toHaveBeenCalledWith({ sinkId: 'central', limit: 100 });
+
+    const drillReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ sinkId: 'central', drill: 'status' }))]), { method: 'POST', headers: { 'idempotency-key': 'drill-1' } });
+    const drill = response();
+    await handleKmObservationApi(drillReq as any, drill.res, new URL('http://localhost/api/km/central-sink/drills'), deps);
+    expect(centralSinkDrill).toHaveBeenCalledOnce();
+    expect(recordKmMutation).toHaveBeenCalledWith(expect.objectContaining({ action: 'central_sink.drill.status', targetRef: 'central' }));
+    expect(drill.bodies[0]).toMatchObject({ accepted: true, drill: 'status', realTransportEnabled: false, result: { ok: true } });
+
+    const replayReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ sinkId: 'central', drill: 'status' }))]), { method: 'POST', headers: { 'idempotency-key': 'drill-1' } });
+    const replay = response();
+    await handleKmObservationApi(replayReq as any, replay.res, new URL('http://localhost/api/km/central-sink/drills'), deps);
+    expect(centralSinkDrill).toHaveBeenCalledOnce();
+    expect(replay.bodies[0]).toEqual(drill.bodies[0]);
+  });
+
   it('serves read-only retention status and bounded report history', async () => {
     const kmRetentionStatus = vi.fn(() => ({
       enabled: false,

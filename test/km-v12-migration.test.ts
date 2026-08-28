@@ -18,7 +18,7 @@ describe('KM v12 migration', () => {
     const { DatabaseSync } = await import('node:sqlite'); const db = new DatabaseSync(join(dir, 'botmux-km.sqlite'));
     db.exec(`DROP INDEX km_pipeline_profiles_one_shadow_bot; UPDATE km_pipeline_profiles SET state='shadow'; DROP TABLE km_runtime_leases; PRAGMA user_version=11;`); db.close();
     const migrated = await ObservationStore.open(dir);
-    expect(migrated.schemaVersion()).toBe(16);
+    expect(migrated.schemaVersion()).toBe(17);
     const rows = migrated.listPipelineProfiles('bot');
     expect(rows.filter(row => row.state === 'shadow')).toHaveLength(1);
     expect(rows.filter(row => row.state === 'retired')).toHaveLength(1);
@@ -48,7 +48,7 @@ describe('KM v12 migration', () => {
     db.close();
 
     const migrated = await ObservationStore.open(dir);
-    expect(migrated.schemaVersion()).toBe(16);
+    expect(migrated.schemaVersion()).toBe(17);
     expect(migrated.listInjectionSnapshots(1)).toEqual([expect.objectContaining({
       requestedMode: 'shadow',
       effectiveMode: 'shadow',
@@ -80,7 +80,7 @@ describe('KM v12 migration', () => {
     db.close();
 
     const migrated = await ObservationStore.open(dir);
-    expect(migrated.schemaVersion()).toBe(16);
+    expect(migrated.schemaVersion()).toBe(17);
     expect(migrated.listRetrievalAudits(1)).toEqual([expect.objectContaining({
       directHitCount: 0,
       normalizedHitCount: 0,

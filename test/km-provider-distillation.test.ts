@@ -36,7 +36,7 @@ describe('KM provider SPI and durable distillation', () => {
 
   it('persists provider/profile and claims a snapshot-stable job idempotently', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(16);
+    expect(store.schemaVersion()).toBe(17);
     store.registerKmProvider({ id: 'botmux-cli:pi:default', kind: 'extractor', version: '1', contractVersion: 1,
       capabilities: ['strict-json'], execution: 'botmux-cli', deterministic: false, supportsShadow: true, maxBatchSize: 1 });
     expect(store.putPipelineProfile(profile, 'active')).toMatch(/^sha256:/);
