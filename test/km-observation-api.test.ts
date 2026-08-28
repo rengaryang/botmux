@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { handleKmObservationApi } from '../src/dashboard/km-observation-api.js';
 import type { KnowledgeItem } from '../src/services/km/observation-store.js';
+import { ObservationStore } from '../src/services/km/observation-store.js';
 
 function response() {
   const bodies: unknown[] = [];
@@ -278,6 +279,88 @@ describe('KM observation dashboard API', () => {
     }) as any, rollback.res, new URL(`http://localhost/api/km/exports/${created.jobId}/rollback`), deps);
     expect(rollback.bodies[0]).toMatchObject({ jobId: created.jobId, state: 'rolled_back' });
     expect(() => statSync(target)).toThrow();
+  });
+
+  it('serves KM production gate plan, approval, inert intent, audit and kill switch APIs without side effects', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-km-production-gate-api-'));
+    const deps = {
+      enabled: true,
+      actorId: 'operator-1',
+      openStore: async () => ObservationStore.open(dataDir),
+    };
+    const target = { botAppId: 'cli_a', window: { start: '2026-08-28T00:00:00.000Z', end: '2026-08-28T01:00:00.000Z' } };
+    const scope = { botAppId: 'cli_a', sessionClass: 'manual-canary' };
+    const riskAck = { acknowledged: true, ticket: 'KM-GATE-API' };
+
+    const createdRes = response();
+    const createReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      actionKind: 'prompt-canary',
+      target,
+      scope,
+      riskAck,
+      ttlSeconds: 900,
+      confirmationToken: 'api-token',
+    }))]), { method: 'POST', headers: { 'idempotency-key': 'pg-create-api' } });
+    await handleKmObservationApi(createReq as any, createdRes.res, new URL('http://localhost/api/km/production-gates'), deps);
+    expect(createdRes.res.writeHead).toHaveBeenCalledWith(201, expect.anything());
+    const created = createdRes.bodies[0] as any;
+    expect(created).toEqual(expect.objectContaining({ effective: false, sideEffectsExecuted: false }));
+    expect(created.plan).toEqual(expect.objectContaining({
+      actionKind: 'prompt-canary',
+      state: 'ready',
+      requiredApprovalGrade: 'G2',
+      target,
+      scope,
+    }));
+    expect(created.handoff).toEqual(expect.objectContaining({ effective: false, sideEffectsExecuted: false }));
+
+    const approvedRes = response();
+    const approveReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      approvalGrade: 'G2',
+      confirmationToken: 'api-token',
+      previewHash: created.plan.previewHash,
+      riskAck,
+    }))]), { method: 'POST', headers: { 'idempotency-key': 'pg-approve-api' } });
+    await handleKmObservationApi(approveReq as any, approvedRes.res,
+      new URL(`http://localhost/api/km/production-gates/${created.plan.planId}/approve`), deps);
+    expect(approvedRes.bodies[0]).toEqual(expect.objectContaining({
+      effective: false,
+      sideEffectsExecuted: false,
+      plan: expect.objectContaining({ state: 'approved' }),
+    }));
+
+    const intentRes = response();
+    const intentReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({
+      confirmationToken: 'api-token',
+      previewHash: created.plan.previewHash,
+    }))]), { method: 'POST', headers: { 'idempotency-key': 'pg-intent-api' } });
+    await handleKmObservationApi(intentReq as any, intentRes.res,
+      new URL(`http://localhost/api/km/production-gates/${created.plan.planId}/intent`), deps);
+    expect(intentRes.bodies[0]).toEqual(expect.objectContaining({
+      intent: expect.objectContaining({
+        effective: false,
+        sideEffectsExecuted: false,
+        executorAvailable: false,
+        safety: expect.objectContaining({ noNetwork: true, noDeletion: true, noProviderCalls: true }),
+      }),
+      plan: expect.objectContaining({ state: 'executing' }),
+    }));
+
+    const auditRes = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, auditRes.res,
+      new URL(`http://localhost/api/km/production-gates/${created.plan.planId}/audit`), deps);
+    expect((auditRes.bodies[0] as any).items.map((item: any) => item.action)).toEqual(['plan.created', 'approved', 'intent.created']);
+
+    const killRes = response();
+    const killReq = Object.assign(Readable.from([Buffer.from(JSON.stringify({ enabled: true, reason: 'freeze' }))]), {
+      method: 'PUT',
+      headers: { 'idempotency-key': 'pg-kill-api' },
+    });
+    await handleKmObservationApi(killReq as any, killRes.res, new URL('http://localhost/api/km/production-gates/kill-switch'), deps);
+    expect(killRes.bodies[0]).toEqual(expect.objectContaining({
+      killSwitch: expect.objectContaining({ enabled: true, reason: 'freeze' }),
+      mutatesExistingRuntimeGates: false,
+    }));
   });
 
   it('serves trace/evolution reads and enforces approval grade through the store', async () => {

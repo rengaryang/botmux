@@ -130,6 +130,29 @@ type ShadowComparison = {
   latency: Record<string, unknown>; cost: Record<string, unknown>; createdAt: string;
 };
 type ShadowReadiness = { ready: boolean; reasonCodes: string[]; metrics?: Record<string, number>; createdAt?: string };
+type ProductionGatePlan = {
+  planId: string;
+  actionKind: 'real-memory-transport' | 'real-central-sink' | 'formal-knowledge-export' | 'prompt-canary' | 'retention-purge';
+  state: string;
+  target: Record<string, unknown>;
+  scope: Record<string, unknown>;
+  preview: Record<string, unknown>;
+  previewHash: string;
+  requiredApprovalGrade: string;
+  actorId: string;
+  riskAck: Record<string, unknown>;
+  expiresAt: string;
+  confirmationTokenHash: string;
+  confirmationTokenUsedAt?: string;
+  preflight: Array<Record<string, unknown>>;
+  rollback: Record<string, unknown>;
+  intent?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
+type ProductionGateAudit = { auditId: string; planId: string; action: string; fromState?: string; toState: string; actorId: string; details: Record<string, unknown>; createdAt: string };
+type ProductionGateKillState = { enabled: boolean; reason: string; actorId: string; updatedAt: string };
+type ProductionGateList = { items: ProductionGatePlan[]; killSwitch: ProductionGateKillState };
 
 type ObservationEvent = {
   eventId: string;
@@ -198,6 +221,10 @@ function KmPage(): React.JSX.Element {
   const [configAudit, setConfigAudit] = useState<ConfigAudit[]>([]);
   const [retrievalQuality, setRetrievalQuality] = useState<RetrievalQuality>();
   const [retention, setRetention] = useState<RetentionStatus>();
+  const [productionGates, setProductionGates] = useState<ProductionGatePlan[]>([]);
+  const [productionGateKill, setProductionGateKill] = useState<ProductionGateKillState>();
+  const [productionGateAudit, setProductionGateAudit] = useState<ProductionGateAudit[]>([]);
+  const [productionGateHandoff, setProductionGateHandoff] = useState<Record<string, unknown>>();
   const [goldenCases, setGoldenCases] = useState<GoldenCase[]>([]);
   const [shadowComparisons, setShadowComparisons] = useState<ShadowComparison[]>([]);
   const [shadowReadiness, setShadowReadiness] = useState<ShadowReadiness>();
@@ -207,17 +234,27 @@ function KmPage(): React.JSX.Element {
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
   const [sinkForm, setSinkForm] = useState({ sinkId: 'central-mock', endpointRef: 'mock://central', enabled: false, batchLimit: 25, timeoutMs: 5000, maxAttempts: 5, credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET', payloadMaxBytes: 65536 });
   const [importForm, setImportForm] = useState({ source: 'knowledge-items', allowlistedRoots: '', markdownFiles: '', defaultScope: 'workspace', defaultSubject: 'default' });
+  const [productionGateForm, setProductionGateForm] = useState({
+    actionKind: 'prompt-canary' as ProductionGatePlan['actionKind'],
+    targetJson: JSON.stringify({ botAppId: 'cli_xxx', window: { start: '2026-08-28T00:00:00.000Z', end: '2026-08-28T01:00:00.000Z' } }, null, 2),
+    scopeJson: JSON.stringify({ botAppId: 'cli_xxx', sessionClass: 'manual-canary' }, null, 2),
+    riskAckJson: JSON.stringify({ acknowledged: true, note: 'reviewed by operator' }, null, 2),
+    ttlSeconds: 900,
+    confirmationToken: '',
+    approvalGrade: 'G2',
+  });
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, exportList, memoryList, importJobList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
         getJson<{ items: KnowledgeExportJob[] }>('/api/km/exports'),
         getJson<{ items: MemoryItem[] }>('/api/km/memory?limit=20'),
         getJson<{ items: ImportJob[] }>('/api/km/imports?limit=20'),
+        getJson<ProductionGateList>('/api/km/production-gates?limit=20'),
         getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
         getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
         getJson<{ items: SyncStatus[] }>('/api/km/sync/sinks'),
@@ -245,6 +282,8 @@ function KmPage(): React.JSX.Element {
       setExportJobs(exportList.items);
       setMemory(memoryList.items);
       setImportJobs(importJobList.items);
+      setProductionGates(productionGateList.items);
+      setProductionGateKill(productionGateList.killSwitch);
       setEvalRuns(evalList.items);
       setProposals(proposalList.items);
       setSyncStatus(syncList.items);
@@ -402,6 +441,81 @@ function KmPage(): React.JSX.Element {
       await load();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
+  const updateProductionGateTemplate = (actionKind: ProductionGatePlan['actionKind']) => {
+    const now = new Date();
+    const start = now.toISOString();
+    const end = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+    const targets: Record<ProductionGatePlan['actionKind'], Record<string, unknown>> = {
+      'real-memory-transport': { provider: 'mem0', endpoint: 'https://memory.example.internal', credentialRef: 'env:MEM0_API_KEY' },
+      'real-central-sink': { provider: 'central-sink', endpoint: 'https://km-central.example.internal', credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET' },
+      'formal-knowledge-export': { destinationRoot: '/tmp/botmux-km-formal-export-fixture', manifestHash: `sha256:${'a'.repeat(64)}` },
+      'prompt-canary': { botAppId: 'cli_xxx', window: { start, end } },
+      'retention-purge': { cutoff: start, expectedCounts: { observations: 0 } },
+    };
+    setProductionGateForm(form => ({
+      ...form,
+      actionKind,
+      targetJson: JSON.stringify(targets[actionKind], null, 2),
+      approvalGrade: actionKind === 'retention-purge' ? 'G4' : actionKind === 'formal-knowledge-export' || actionKind === 'prompt-canary' ? 'G2' : 'G3',
+    }));
+  };
+  const createProductionGate = async () => {
+    try {
+      const response = await mutateJson<{ plan: ProductionGatePlan; confirmationToken: string }>('/api/km/production-gates', 'POST', {
+        actionKind: productionGateForm.actionKind,
+        target: JSON.parse(productionGateForm.targetJson),
+        scope: JSON.parse(productionGateForm.scopeJson),
+        riskAck: JSON.parse(productionGateForm.riskAckJson),
+        ttlSeconds: productionGateForm.ttlSeconds,
+      });
+      setProductionGateForm(form => ({ ...form, confirmationToken: response.confirmationToken, approvalGrade: response.plan.requiredApprovalGrade }));
+      setNotice(`Production gate plan ready: ${response.plan.planId}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const approveProductionGate = async (plan: ProductionGatePlan) => {
+    try {
+      await mutateJson(`/api/km/production-gates/${encodeURIComponent(plan.planId)}/approve`, 'POST', {
+        approvalGrade: productionGateForm.approvalGrade,
+        confirmationToken: productionGateForm.confirmationToken,
+        previewHash: plan.previewHash,
+        riskAck: plan.riskAck,
+      });
+      setNotice(`Production gate approved: ${plan.planId}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const createProductionGateIntent = async (plan: ProductionGatePlan) => {
+    try {
+      const response = await mutateJson<{ intent: Record<string, unknown> }>(`/api/km/production-gates/${encodeURIComponent(plan.planId)}/intent`, 'POST', {
+        confirmationToken: productionGateForm.confirmationToken,
+        previewHash: plan.previewHash,
+      });
+      setProductionGateHandoff(response.intent);
+      setNotice(`Inert intent created: ${String(response.intent.signedIntentHash)}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const loadProductionGateAudit = async (plan: ProductionGatePlan) => {
+    try {
+      const [audit, handoff] = await Promise.all([
+        getJson<{ items: ProductionGateAudit[] }>(`/api/km/production-gates/${encodeURIComponent(plan.planId)}/audit`),
+        getJson<Record<string, unknown>>(`/api/km/production-gates/${encodeURIComponent(plan.planId)}/handoff`),
+      ]);
+      setProductionGateAudit(audit.items);
+      setProductionGateHandoff(handoff);
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const toggleProductionGateKill = async () => {
+    try {
+      await mutateJson('/api/km/production-gates/kill-switch', 'PUT', {
+        enabled: !(productionGateKill?.enabled ?? false),
+        reason: productionGateKill?.enabled ? 'dashboard_resume_intent_creation' : 'dashboard_emergency_stop',
+      });
+      setNotice('Production gate kill switch 已更新');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
   const createGoldenCase = async () => {
     try {
       await mutateJson('/api/km/golden-cases', 'POST', {
@@ -521,6 +635,55 @@ function KmPage(): React.JSX.Element {
         <article><span>Golden Cases</span><strong>{goldenCases.length}</strong></article>
         <article><span>Shadow 对比</span><strong>{shadowComparisons.length}</strong></article>
         <article><span>Readiness</span><strong>{shadowReadiness?.ready ? 'ready' : 'blocked'}</strong></article>
+      </section>
+
+      <section className="panel">
+        <h2>Production Gates（Intent Only）</h2>
+        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          这里只生成不可执行计划、审批记录和 inert intent；effective=false，sideEffectsExecuted=false，不触发网络、导出、注入、删除或调度器。
+        </p>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginBottom: 10 }}>
+          <select value={productionGateForm.actionKind} onChange={e => updateProductionGateTemplate(e.target.value as ProductionGatePlan['actionKind'])}>
+            <option value="real-memory-transport">real-memory-transport</option>
+            <option value="real-central-sink">real-central-sink</option>
+            <option value="formal-knowledge-export">formal-knowledge-export</option>
+            <option value="prompt-canary">prompt-canary</option>
+            <option value="retention-purge">retention-purge</option>
+          </select>
+          <input type="number" min="60" max="86400" value={productionGateForm.ttlSeconds} onChange={e => setProductionGateForm({ ...productionGateForm, ttlSeconds: Number(e.target.value) })} title="TTL seconds" />
+          <select value={productionGateForm.approvalGrade} onChange={e => setProductionGateForm({ ...productionGateForm, approvalGrade: e.target.value })}>
+            <option value="G0">G0</option><option value="G1">G1</option><option value="G2">G2</option><option value="G3">G3</option><option value="G4">G4</option>
+          </select>
+          <input value={productionGateForm.confirmationToken} onChange={e => setProductionGateForm({ ...productionGateForm, confirmationToken: e.target.value })} placeholder="Confirmation token from created plan" />
+          <button onClick={() => void createProductionGate()}>Create Plan</button>
+          <button onClick={() => void toggleProductionGateKill()}>{productionGateKill?.enabled ? 'Disable Kill' : 'Enable Kill'}</button>
+          <textarea value={productionGateForm.targetJson} onChange={e => setProductionGateForm({ ...productionGateForm, targetJson: e.target.value })} placeholder="Exact target JSON" />
+          <textarea value={productionGateForm.scopeJson} onChange={e => setProductionGateForm({ ...productionGateForm, scopeJson: e.target.value })} placeholder="Exact non-wildcard scope JSON" />
+          <textarea value={productionGateForm.riskAckJson} onChange={e => setProductionGateForm({ ...productionGateForm, riskAckJson: e.target.value })} placeholder="Risk acknowledgement JSON" />
+        </div>
+        {productionGateKill && <p style={{ color: productionGateKill.enabled ? 'var(--danger, #b42318)' : 'var(--text-dim)', fontSize: 12 }}>
+          kill switch: {productionGateKill.enabled ? 'enabled' : 'disabled'} · {productionGateKill.reason} · {productionGateKill.updatedAt}
+        </p>}
+        <div className="feedback-deliveries">
+          {productionGates.map(plan => <div key={plan.planId}>
+            <code>{plan.actionKind}</code>
+            <span>{plan.planId} · {plan.previewHash}</span>
+            <span>{plan.requiredApprovalGrade} · expires {plan.expiresAt} · token {plan.confirmationTokenUsedAt ? 'used' : 'unused'}</span>
+            <b>{plan.state}{' '}
+              {plan.state === 'ready' && <button onClick={() => void approveProductionGate(plan)}>Approve</button>}{' '}
+              {plan.state === 'approved' && <button onClick={() => void createProductionGateIntent(plan)}>Intent</button>}{' '}
+              <button onClick={() => void loadProductionGateAudit(plan)}>Audit</button>
+            </b>
+          </div>)}
+          {productionGates.length === 0 && <p style={{ color: 'var(--text-dim)' }}>暂无 production gate plan。</p>}
+          {productionGateAudit.map(item => <div key={item.auditId}>
+            <code>audit</code>
+            <span>{item.action} · {item.fromState ?? 'none'} → {item.toState}</span>
+            <span>{item.actorId}</span>
+            <b>{item.createdAt}</b>
+          </div>)}
+        </div>
+        {productionGateHandoff && <pre style={{ whiteSpace: 'pre-wrap', fontSize: 11, overflowX: 'auto' }}>{JSON.stringify(productionGateHandoff, null, 2)}</pre>}
       </section>
 
       <section className="panel">

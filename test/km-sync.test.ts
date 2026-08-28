@@ -40,7 +40,7 @@ describe('KM Phase 4 sync safety', () => {
 
   it('keeps sinks disabled by default and refuses enabling real endpoints', async () => {
     const store = await ObservationStore.open(tempDir());
-    expect(store.schemaVersion()).toBe(17);
+    expect(store.schemaVersion()).toBe(18);
     expect(store.configureSyncSink({ sinkId: 'central', protocolVersion: 1, endpointRef: 'https://example.invalid' }))
       .toEqual(expect.objectContaining({ enabled: false, pending: 0, quarantined: 0 }));
     expect(() => store.configureSyncSink({ sinkId: 'real', protocolVersion: 1, endpointRef: 'https://example.invalid', enabled: true }))

@@ -25,8 +25,9 @@ import {
   type KmRetentionReportSummary,
   type KmRetentionRuntimeStatus,
 } from './retention-policy.js';
+import { assertKmProductionGateTransition } from './production-gate.js';
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -343,6 +344,51 @@ const PHASE16_SCHEMA = `
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS km_import_audit_job_created ON km_import_audit(job_id,created_at,audit_id);
+`;
+
+const PHASE18_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_production_gate_plans (
+    plan_id TEXT PRIMARY KEY,
+    action_kind TEXT NOT NULL CHECK(action_kind IN ('real-memory-transport','real-central-sink','formal-knowledge-export','prompt-canary','retention-purge')),
+    state TEXT NOT NULL CHECK(state IN ('draft','ready','approved','executing','completed','failed','rolled_back','expired')),
+    target_json TEXT NOT NULL CHECK(json_valid(target_json)),
+    scope_json TEXT NOT NULL CHECK(json_valid(scope_json)),
+    preview_json TEXT NOT NULL CHECK(json_valid(preview_json)),
+    preview_hash TEXT NOT NULL,
+    required_approval_grade TEXT NOT NULL CHECK(required_approval_grade IN ('G0','G1','G2','G3','G4')),
+    actor_id TEXT NOT NULL,
+    risk_ack_json TEXT NOT NULL CHECK(json_valid(risk_ack_json)),
+    expires_at TEXT NOT NULL,
+    confirmation_token_hash TEXT NOT NULL,
+    confirmation_token_used_at TEXT,
+    preflight_json TEXT NOT NULL CHECK(json_valid(preflight_json)),
+    rollback_json TEXT NOT NULL CHECK(json_valid(rollback_json)),
+    intent_json TEXT CHECK(intent_json IS NULL OR json_valid(intent_json)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_production_gate_plans_kind_state ON km_production_gate_plans(action_kind,state,updated_at DESC);
+  CREATE UNIQUE INDEX IF NOT EXISTS km_production_gate_plans_token_hash ON km_production_gate_plans(confirmation_token_hash);
+
+  CREATE TABLE IF NOT EXISTS km_production_gate_audit (
+    audit_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES km_production_gate_plans(plan_id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    details_json TEXT NOT NULL CHECK(json_valid(details_json)),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_production_gate_audit_plan_created ON km_production_gate_audit(plan_id,created_at,audit_id);
+
+  CREATE TABLE IF NOT EXISTS km_production_gate_kill_state (
+    scope TEXT PRIMARY KEY CHECK(scope='global'),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    reason TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `;
 
 const PHASE11_SCHEMA = `
@@ -837,6 +883,61 @@ function retrievalExpectedSubject(input: RetrievalQuery, scope: MemoryScope): st
 }
 
 export type ApprovalGrade = 'G0' | 'G1' | 'G2' | 'G3' | 'G4';
+export type KmProductionGateActionKind = 'real-memory-transport' | 'real-central-sink' | 'formal-knowledge-export' | 'prompt-canary' | 'retention-purge';
+export type KmProductionGateState = 'draft' | 'ready' | 'approved' | 'executing' | 'completed' | 'failed' | 'rolled_back' | 'expired';
+export interface KmProductionGatePlanRecord {
+  planId: string;
+  actionKind: KmProductionGateActionKind;
+  state: KmProductionGateState;
+  target: Record<string, unknown>;
+  scope: Record<string, unknown>;
+  preview: Record<string, unknown>;
+  previewHash: string;
+  requiredApprovalGrade: ApprovalGrade;
+  actorId: string;
+  riskAck: Record<string, unknown>;
+  expiresAt: string;
+  confirmationTokenHash: string;
+  confirmationTokenUsedAt?: string;
+  preflight: Array<Record<string, unknown>>;
+  rollback: Record<string, unknown>;
+  intent?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface KmProductionGateAuditRecord {
+  auditId: string;
+  planId: string;
+  action: string;
+  fromState?: KmProductionGateState;
+  toState: KmProductionGateState;
+  actorId: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+export interface KmProductionGateKillState {
+  enabled: boolean;
+  reason: string;
+  actorId: string;
+  updatedAt: string;
+}
+export interface KmProductionGatePlanInsertInput {
+  planId: string;
+  actionKind: KmProductionGateActionKind;
+  state: KmProductionGateState;
+  target: Record<string, unknown>;
+  scope: Record<string, unknown>;
+  preview: Record<string, unknown>;
+  previewHash: string;
+  requiredApprovalGrade: ApprovalGrade;
+  actorId: string;
+  riskAck: Record<string, unknown>;
+  expiresAt: string;
+  confirmationTokenHash: string;
+  preflight: Array<Record<string, unknown>>;
+  rollback: Record<string, unknown>;
+  now?: string;
+}
 export interface TraceEdgeInput {
   fromType: string; fromId: string; toType: string; toId: string;
   edgeType: 'caused' | 'used' | 'produced' | 'evaluated' | 'superseded' | 'conflicted' | 'approved' | 'synced' | 'purged';
@@ -1017,7 +1118,7 @@ function quarantineId(): string {
   return `q_${randomUUID().replaceAll('-', '')}`;
 }
 
-function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready' | 'kmi' | 'kmii' | 'kmia'): string {
+function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready' | 'kmi' | 'kmii' | 'kmia' | 'pg' | 'pga'): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
@@ -1541,6 +1642,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 15) this.migrateToPhase15();
     if (this.schemaVersion() < 16) this.migrateToPhase16();
     if (this.schemaVersion() < 17) this.migrateToPhase17();
+    if (this.schemaVersion() < 18) this.migrateToPhase18();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -3187,6 +3289,112 @@ export class ObservationStore {
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
+  createProductionGatePlan(input: KmProductionGatePlanInsertInput): KmProductionGatePlanRecord {
+    const now = input.now ?? new Date().toISOString();
+    this.db.exec('SAVEPOINT km_production_gate_create;');
+    try {
+      this.db.prepare(`INSERT INTO km_production_gate_plans(
+        plan_id,action_kind,state,target_json,scope_json,preview_json,preview_hash,required_approval_grade,
+        actor_id,risk_ack_json,expires_at,confirmation_token_hash,confirmation_token_used_at,preflight_json,rollback_json,intent_json,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        requireText(input.planId, 'production_gate_plan_id'),
+        input.actionKind,
+        input.state,
+        canonicalJsonStringify(input.target),
+        canonicalJsonStringify(input.scope),
+        canonicalJsonStringify(input.preview),
+        requireText(input.previewHash, 'production_gate_preview_hash'),
+        input.requiredApprovalGrade,
+        requireText(input.actorId, 'production_gate_actor'),
+        canonicalJsonStringify(input.riskAck),
+        requireText(input.expiresAt, 'production_gate_expires_at'),
+        requireText(input.confirmationTokenHash, 'production_gate_confirmation_token_hash'),
+        null,
+        canonicalJsonStringify(input.preflight),
+        canonicalJsonStringify(input.rollback),
+        null,
+        now,
+        now,
+      );
+      this.insertProductionGateAudit(input.planId, 'plan.created', null, input.state, input.actorId, {
+        previewHash: input.previewHash,
+        requiredApprovalGrade: input.requiredApprovalGrade,
+        effective: false,
+        sideEffectsExecuted: false,
+      }, now);
+      this.db.exec('RELEASE km_production_gate_create;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_production_gate_create; RELEASE km_production_gate_create;'); } catch {} throw error; }
+    return this.getProductionGatePlan(input.planId)!;
+  }
+
+  getProductionGatePlan(planId: string): KmProductionGatePlanRecord | null {
+    const row = this.db.prepare('SELECT * FROM km_production_gate_plans WHERE plan_id=?').get(planId) as any;
+    return row ? this.productionGatePlanFromRow(row) : null;
+  }
+
+  listProductionGatePlans(input: { limit?: number; actionKind?: KmProductionGateActionKind; state?: KmProductionGateState } = {}): KmProductionGatePlanRecord[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (input.actionKind) { where.push('action_kind=?'); args.push(input.actionKind); }
+    if (input.state) { where.push('state=?'); args.push(input.state); }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const rows = this.db.prepare(`SELECT * FROM km_production_gate_plans ${clause} ORDER BY updated_at DESC,plan_id DESC LIMIT ?`)
+      .all(...args, limit) as any[];
+    return rows.map(row => this.productionGatePlanFromRow(row));
+  }
+
+  listProductionGateAudit(planId: string, limit = 100): KmProductionGateAuditRecord[] {
+    const rows = this.db.prepare(`SELECT * FROM km_production_gate_audit WHERE plan_id=? ORDER BY created_at ASC,audit_id ASC LIMIT ?`)
+      .all(planId, Math.max(1, Math.min(limit, 500))) as any[];
+    return rows.map(row => this.productionGateAuditFromRow(row));
+  }
+
+  transitionProductionGatePlan(input: {
+    planId: string;
+    toState: KmProductionGateState;
+    actorId: string;
+    action: string;
+    details?: Record<string, unknown>;
+    expectedPreviewHash?: string;
+    intent?: Record<string, unknown>;
+    now?: string;
+  }): KmProductionGatePlanRecord {
+    const now = input.now ?? new Date().toISOString();
+    this.db.exec('SAVEPOINT km_production_gate_transition;');
+    try {
+      const row = this.db.prepare('SELECT * FROM km_production_gate_plans WHERE plan_id=?').get(input.planId) as any;
+      if (!row) throw new Error('km_production_gate_plan_not_found');
+      const fromState = row.state as KmProductionGateState;
+      if (input.expectedPreviewHash && input.expectedPreviewHash !== row.preview_hash) throw new Error('km_production_gate_preview_stale');
+      assertKmProductionGateTransition(fromState, input.toState);
+      this.db.prepare(`UPDATE km_production_gate_plans SET state=?,intent_json=COALESCE(?,intent_json),
+        confirmation_token_used_at=CASE WHEN ? IS NOT NULL THEN ? ELSE confirmation_token_used_at END,
+        updated_at=? WHERE plan_id=?`)
+        .run(input.toState, input.intent ? canonicalJsonStringify(input.intent) : null,
+          input.intent ? now : null, now, now, input.planId);
+      this.insertProductionGateAudit(input.planId, requireText(input.action, 'production_gate_action'), fromState, input.toState,
+        requireText(input.actorId, 'production_gate_actor'), input.details ?? {}, now);
+      this.db.exec('RELEASE km_production_gate_transition;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_production_gate_transition; RELEASE km_production_gate_transition;'); } catch {} throw error; }
+    return this.getProductionGatePlan(input.planId)!;
+  }
+
+  getProductionGateKillState(): KmProductionGateKillState {
+    const row = this.db.prepare(`SELECT enabled,reason,actor_id,updated_at FROM km_production_gate_kill_state WHERE scope='global'`).get() as any;
+    return row ? { enabled: Boolean(row.enabled), reason: row.reason, actorId: row.actor_id, updatedAt: row.updated_at }
+      : { enabled: false, reason: 'unset', actorId: 'system', updatedAt: '1970-01-01T00:00:00.000Z' };
+  }
+
+  setProductionGateKillState(input: { enabled: boolean; reason: string; actorId: string; now?: string }): KmProductionGateKillState {
+    const now = input.now ?? new Date().toISOString();
+    this.db.prepare(`INSERT INTO km_production_gate_kill_state(scope,enabled,reason,actor_id,updated_at)
+      VALUES('global',?,?,?,?)
+      ON CONFLICT(scope) DO UPDATE SET enabled=excluded.enabled,reason=excluded.reason,actor_id=excluded.actor_id,updated_at=excluded.updated_at`)
+      .run(input.enabled ? 1 : 0, requireText(input.reason, 'production_gate_kill_reason'), requireText(input.actorId, 'production_gate_actor'), now);
+    return this.getProductionGateKillState();
+  }
+
   listKmConfigAudit(limit: number): Array<Record<string, unknown>> {
     return (this.db.prepare(`SELECT * FROM km_config_audit ORDER BY created_at DESC,audit_id DESC LIMIT ?`).all(Math.max(1,Math.min(limit,500))) as any[])
       .map(row => ({ auditId: row.audit_id, actorId: row.actor_id, action: row.action, targetRef: row.target_ref,
@@ -3697,6 +3905,55 @@ export class ObservationStore {
     };
   }
 
+  private productionGatePlanFromRow(row: any): KmProductionGatePlanRecord {
+    return {
+      planId: row.plan_id,
+      actionKind: row.action_kind,
+      state: row.state,
+      target: parseJsonRecord(row.target_json),
+      scope: parseJsonRecord(row.scope_json),
+      preview: parseJsonRecord(row.preview_json),
+      previewHash: row.preview_hash,
+      requiredApprovalGrade: row.required_approval_grade,
+      actorId: row.actor_id,
+      riskAck: parseJsonRecord(row.risk_ack_json),
+      expiresAt: row.expires_at,
+      confirmationTokenHash: row.confirmation_token_hash,
+      ...(row.confirmation_token_used_at ? { confirmationTokenUsedAt: row.confirmation_token_used_at } : {}),
+      preflight: parseJsonArray(row.preflight_json) as Array<Record<string, unknown>>,
+      rollback: parseJsonRecord(row.rollback_json),
+      ...(row.intent_json ? { intent: parseJsonRecord(row.intent_json) } : {}),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private productionGateAuditFromRow(row: any): KmProductionGateAuditRecord {
+    return {
+      auditId: row.audit_id,
+      planId: row.plan_id,
+      action: row.action,
+      ...(row.from_state ? { fromState: row.from_state } : {}),
+      toState: row.to_state,
+      actorId: row.actor_id,
+      details: parseJsonRecord(row.details_json),
+      createdAt: row.created_at,
+    };
+  }
+
+  private insertProductionGateAudit(
+    planId: string,
+    action: string,
+    fromState: KmProductionGateState | null,
+    toState: KmProductionGateState,
+    actorId: string,
+    details: Record<string, unknown>,
+    now: string,
+  ): void {
+    this.db.prepare(`INSERT INTO km_production_gate_audit(audit_id,plan_id,action,from_state,to_state,actor_id,details_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?)`).run(kmId('pga'), planId, action, fromState, toState, actorId, canonicalJsonStringify(details), now);
+  }
+
   private knowledgeToMemoryImportJobFromRow(row: any): KnowledgeToMemoryImportJob {
     return {
       jobId: row.job_id,
@@ -4104,6 +4361,18 @@ export class ObservationStore {
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
+  private migrateToPhase18(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 18) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE18_SCHEMA);
+      const columns = new Set((this.db.prepare('PRAGMA table_info(km_production_gate_plans)').all() as Array<{ name: string }>).map(row => row.name));
+      if (!columns.has('confirmation_token_used_at')) this.db.exec('ALTER TABLE km_production_gate_plans ADD COLUMN confirmation_token_used_at TEXT;');
+      this.db.exec('PRAGMA user_version=18;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
   private migrateToPhase11(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -4245,6 +4514,9 @@ export class ObservationStore {
       'km_import_jobs',
       'km_import_items',
       'km_import_audit',
+      'km_production_gate_plans',
+      'km_production_gate_audit',
+      'km_production_gate_kill_state',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;
