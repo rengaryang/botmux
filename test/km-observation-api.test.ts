@@ -363,6 +363,65 @@ describe('KM observation dashboard API', () => {
     }));
   });
 
+  it('serves exact-bot canary closeout JSON and markdown without creating production intents', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-km-canary-closeout-api-'));
+    const deps = {
+      enabled: true,
+      actorId: 'operator-1',
+      openStore: async () => ObservationStore.open(dataDir),
+    };
+    const seed = await ObservationStore.open(dataDir);
+    const golden = seed.upsertGoldenCase({
+      title: 'Chinese reply preference',
+      queryRedacted: '以后请用中文回复',
+      expectedClaims: [{ claimKey: 'response.language', claimTextHash: `sha256:${'a'.repeat(64)}` }],
+      sourceRefs: [{ kind: 'reviewed-distillation-example', ref: 'case-1' }],
+      provenance: {
+        explicitlyReviewed: true,
+        redactionStatus: 'redacted',
+        rulesClaims: [{ claimKey: 'response.language', evidenceRefs: [{ kind: 'golden-case', ref: 'case-1' }] }],
+        piClaims: [{ claimKey: 'response.language', evidenceRefs: [{ kind: 'golden-case', ref: 'case-1' }] }],
+        cost: { piInvoked: false, externalCalls: 0 },
+      },
+      actorId: 'reviewer-1',
+    }).item;
+    seed.recordShadowComparison({
+      caseId: golden.caseId,
+      revision: golden.revision,
+      rulesClaims: [{ claimKey: 'response.language', evidenceRefs: [{ kind: 'golden-case', ref: 'case-1' }] }],
+      piClaims: [{ claimKey: 'response.language', evidenceRefs: [{ kind: 'golden-case', ref: 'case-1' }] }],
+      cost: { piInvoked: false, externalCalls: 0 },
+    });
+    seed.shadowReadinessReport({ thresholds: { minReviewedCases: 1, minComparisons: 1 } });
+    seed.close();
+
+    const json = response();
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, json.res,
+      new URL('http://localhost/api/km/canary-closeout?now=2026-08-28T00:00:00.000Z'), deps);
+    expect(json.bodies[0]).toEqual(expect.objectContaining({
+      botAppId: 'cli_aacca607f9ccdcf8',
+      safety: expect.objectContaining({ previewOnly: true, noLiveInjectionActivatedByReport: true }),
+      productionGate: expect.objectContaining({
+        exactBotOnly: true,
+        validActionScopedApprovalPresent: false,
+        previewHandoff: expect.objectContaining({ effective: false, sideEffectsExecuted: false }),
+      }),
+    }));
+    const after = await ObservationStore.open(dataDir);
+    expect(after.listProductionGatePlans({ limit: 10, actionKind: 'prompt-canary' })).toEqual([]);
+    after.close();
+
+    const markdownChunks: string[] = [];
+    const mdRes = {
+      writeHead: vi.fn(),
+      end: vi.fn(value => markdownChunks.push(String(value))),
+    } as any;
+    await handleKmObservationApi({ method: 'GET', headers: {} } as any, mdRes,
+      new URL('http://localhost/api/km/canary-closeout?format=markdown&now=2026-08-28T00:00:00.000Z'), deps);
+    expect(mdRes.writeHead).toHaveBeenCalledWith(200, { 'Content-Type': 'text/markdown; charset=utf-8' });
+    expect(markdownChunks[0]).toContain('KM Canary Closeout Report');
+  });
+
   it('serves trace/evolution reads and enforces approval grade through the store', async () => {
     const listTrace = vi.fn(() => [{ edgeId: 'edge-1' }]);
     const listEvolution = vi.fn(() => [{ proposalId: 'evo-1' }]);

@@ -29,6 +29,11 @@ import {
   createKmProductionGateIntent,
   expireKmProductionGatePlan,
 } from '../services/km/production-gate.js';
+import {
+  KM_CANARY_BOT_APP_ID,
+  buildKmCanaryCloseoutReport,
+  renderKmCanaryCloseoutMarkdown,
+} from '../services/km/canary-closeout-report.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -180,6 +185,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/production-gates/kill-switch'
     || /^\/api\/km\/production-gates\/[^/]+$/.test(url.pathname)
     || /^\/api\/km\/production-gates\/[^/]+\/(approve|intent|expire|audit|handoff)$/.test(url.pathname)
+    || url.pathname === '/api/km/canary-closeout'
     || url.pathname === '/api/km/backend-runtime'
     || url.pathname === '/api/km/backend-outbox'
     || url.pathname === '/api/km/backend-migrations'
@@ -753,6 +759,25 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/production-gates/kill-switch') {
       if (!store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');
       jsonRes(res, 200, store.getProductionGateKillState()); return true;
+    }
+    if (url.pathname === '/api/km/canary-closeout') {
+      if (!store.listGoldenCases || !store.listShadowComparisons || !store.shadowReadinessReportLatest
+        || !store.listRetrievalAudits || !store.listInjectionSnapshots || !store.listProductionGatePlans
+        || !store.getProductionGateKillState) throw new Error('km_canary_closeout_unavailable');
+      const report = buildKmCanaryCloseoutReport({
+        store: store as any,
+        botAppId: url.searchParams.get('botAppId') ?? KM_CANARY_BOT_APP_ID,
+        now: url.searchParams.get('now') ?? undefined,
+        windowHours: url.searchParams.get('windowHours') ? positiveInteger(url.searchParams.get('windowHours'), 24, 168) : undefined,
+        reportLimit: url.searchParams.get('limit') ? positiveInteger(url.searchParams.get('limit'), 100, 500) : undefined,
+      });
+      if (url.searchParams.get('format') === 'markdown') {
+        res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8' });
+        res.end(renderKmCanaryCloseoutMarkdown(report));
+      } else {
+        jsonRes(res, 200, report);
+      }
+      return true;
     }
     const productionGateAudit = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)\/audit$/);
     if (productionGateAudit) {

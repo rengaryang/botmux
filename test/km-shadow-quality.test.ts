@@ -135,10 +135,22 @@ describe('KM golden set and Pi shadow quality', () => {
     expect(first.created).toBe(true);
     expect(second.created).toBe(false);
     expect(first.item.metrics).toEqual(expect.objectContaining({
+      expectedCount: 1,
+      rulesTruePositive: 1,
+      rulesFalsePositive: 1,
+      rulesFalseNegative: 0,
+      piTruePositive: 1,
+      piFalsePositive: 1,
+      piFalseNegative: 0,
+      rulesFalsePositiveRate: 0.5,
+      rulesFalseNegativeRate: 0,
+      piFalsePositiveRate: 0.5,
+      piFalseNegativeRate: 0,
       claimOverlap: 1,
       rulesUnique: 1,
       piUnique: 1,
       routingDisagreement: 1,
+      extractorDisagreement: 3,
       evidenceCoverage: 0.75,
       schemaFailures: 1,
     }));
@@ -162,6 +174,12 @@ describe('KM golden set and Pi shadow quality', () => {
     expect(relabeled.metrics.falsePositiveLabels).toBe(1);
     const blocked = store.shadowReadinessReport({ thresholds: { minReviewedCases: 1, minComparisons: 1, maxSchemaFailures: 0, maxFalsePositiveLabels: 0 } });
     expect(blocked.ready).toBe(false);
+    expect(blocked.metrics).toEqual(expect.objectContaining({
+      rulesFalsePositive: 1,
+      piFalsePositive: 1,
+      extractorDisagreement: 3,
+      extractorDisagreementRate: 1,
+    }));
     expect(blocked.reasonCodes).toEqual(expect.arrayContaining(['schema_failures_above_threshold', 'false_positive_labels_above_threshold']));
     const latest = store.shadowReadinessReportLatest();
     expect(latest?.windowHash).toBe(blocked.windowHash);
