@@ -23,6 +23,14 @@
 6. Dry-run prompt-memory readiness with live injection still off and confirm new audit rows have `requestedMode`, `effectiveMode`, `disposition`, selected item IDs, `promptHash`, and no raw prompt content.
 7. Confirm `BOTMUX_KM_CANARY_BOT_APP_IDS` contains only the exact bot app IDs approved for the current canary window.
 
+## Local closeout report
+
+Use `GET /api/km/canary-closeout?botAppId=cli_aacca607f9ccdcf8` to generate the deterministic local closeout bundle for the approved canary bot. Add `format=markdown` for the operator-facing report.
+
+The closeout report is preview-only and inert. It reads reviewed golden cases, shadow comparisons, readiness, retrieval audits, prompt snapshot summaries, import-job counts, and prompt-canary production-gate state from local SQLite. It also includes an exact-bot production-gate handoff preview and rollback checklist, but it does not persist a gate, create an approval intent, call Pi, call external memory providers, mutate prompts, write formal knowledge pages, or edit the central KM Dashboard page.
+
+Before canary activation, the report should show reviewed/redacted golden bootstrap validation, FP/FN and disagreement calibration, `unexpectedLiveInjection=0`, and no valid action-scoped approval unless a separate operator-approved prompt-canary gate exists for exactly `cli_aacca607f9ccdcf8`.
+
 ## Prompt-Memory Canary Gates
 
 Stop at two human gates:

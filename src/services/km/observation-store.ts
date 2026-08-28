@@ -1044,10 +1044,21 @@ export interface KmShadowComparisonMetrics {
   expectedCount: number;
   rulesClaimCount: number;
   piClaimCount: number;
+  rulesTruePositive: number;
+  rulesFalsePositive: number;
+  rulesFalseNegative: number;
+  piTruePositive: number;
+  piFalsePositive: number;
+  piFalseNegative: number;
+  rulesFalsePositiveRate: number;
+  rulesFalseNegativeRate: number;
+  piFalsePositiveRate: number;
+  piFalseNegativeRate: number;
   claimOverlap: number;
   rulesUnique: number;
   piUnique: number;
   routingDisagreement: number;
+  extractorDisagreement: number;
   evidenceCoverage: number;
   privacyBlocks: number;
   schemaFailures: number;
@@ -2694,24 +2705,43 @@ export class ObservationStore {
     const comparisonRow = this.db.prepare('SELECT COUNT(*) comparisons FROM km_shadow_comparisons').get() as any;
     const rows = this.db.prepare('SELECT metrics_json FROM km_shadow_comparisons').all() as any[];
     const aggregate: Record<string, number> = { reviewedCases: Number(goldenRow.reviewed_cases ?? 0), comparisons: Number(comparisonRow.comparisons ?? 0),
-      claimOverlap: 0, rulesUnique: 0, piUnique: 0, routingDisagreement: 0, privacyBlocks: 0, schemaFailures: 0,
+      expectedCount: 0, rulesClaimCount: 0, piClaimCount: 0,
+      rulesTruePositive: 0, rulesFalsePositive: 0, rulesFalseNegative: 0,
+      piTruePositive: 0, piFalsePositive: 0, piFalseNegative: 0,
+      claimOverlap: 0, rulesUnique: 0, piUnique: 0, routingDisagreement: 0, extractorDisagreement: 0,
+      privacyBlocks: 0, schemaFailures: 0,
       falsePositiveLabels: 0, falseNegativeLabels: 0, avgEvidenceCoverage: 0 };
     let coverageTotal = 0;
     for (const row of rows) {
       const metrics = JSON.parse(row.metrics_json) as KmShadowComparisonMetrics;
-      aggregate.claimOverlap += metrics.claimOverlap;
-      aggregate.rulesUnique += metrics.rulesUnique;
-      aggregate.piUnique += metrics.piUnique;
-      aggregate.routingDisagreement += metrics.routingDisagreement;
-      aggregate.privacyBlocks += metrics.privacyBlocks;
-      aggregate.schemaFailures += metrics.schemaFailures;
-      aggregate.falsePositiveLabels += metrics.falsePositiveLabels;
-      aggregate.falseNegativeLabels += metrics.falseNegativeLabels;
-      coverageTotal += metrics.evidenceCoverage;
+      aggregate.expectedCount += Number(metrics.expectedCount ?? 0);
+      aggregate.rulesClaimCount += Number(metrics.rulesClaimCount ?? 0);
+      aggregate.piClaimCount += Number(metrics.piClaimCount ?? 0);
+      aggregate.rulesTruePositive += Number(metrics.rulesTruePositive ?? 0);
+      aggregate.rulesFalsePositive += Number(metrics.rulesFalsePositive ?? 0);
+      aggregate.rulesFalseNegative += Number(metrics.rulesFalseNegative ?? 0);
+      aggregate.piTruePositive += Number(metrics.piTruePositive ?? 0);
+      aggregate.piFalsePositive += Number(metrics.piFalsePositive ?? 0);
+      aggregate.piFalseNegative += Number(metrics.piFalseNegative ?? 0);
+      aggregate.claimOverlap += Number(metrics.claimOverlap ?? 0);
+      aggregate.rulesUnique += Number(metrics.rulesUnique ?? 0);
+      aggregate.piUnique += Number(metrics.piUnique ?? 0);
+      aggregate.routingDisagreement += Number(metrics.routingDisagreement ?? 0);
+      aggregate.extractorDisagreement += Number(metrics.extractorDisagreement ?? (Number(metrics.rulesUnique ?? 0) + Number(metrics.piUnique ?? 0) + Number(metrics.routingDisagreement ?? 0)));
+      aggregate.privacyBlocks += Number(metrics.privacyBlocks ?? 0);
+      aggregate.schemaFailures += Number(metrics.schemaFailures ?? 0);
+      aggregate.falsePositiveLabels += Number(metrics.falsePositiveLabels ?? 0);
+      aggregate.falseNegativeLabels += Number(metrics.falseNegativeLabels ?? 0);
+      coverageTotal += Number(metrics.evidenceCoverage ?? 0);
     }
     aggregate.avgEvidenceCoverage = rows.length ? Number((coverageTotal / rows.length).toFixed(4)) : 0;
     const denominator = Math.max(1, aggregate.claimOverlap + aggregate.rulesUnique + aggregate.piUnique);
     aggregate.routingDisagreementRate = Number((aggregate.routingDisagreement / denominator).toFixed(4));
+    aggregate.extractorDisagreementRate = Number((aggregate.extractorDisagreement / denominator).toFixed(4));
+    aggregate.rulesFalsePositiveRate = Number((aggregate.rulesFalsePositive / Math.max(1, aggregate.rulesClaimCount)).toFixed(4));
+    aggregate.rulesFalseNegativeRate = Number((aggregate.rulesFalseNegative / Math.max(1, aggregate.expectedCount)).toFixed(4));
+    aggregate.piFalsePositiveRate = Number((aggregate.piFalsePositive / Math.max(1, aggregate.piClaimCount)).toFixed(4));
+    aggregate.piFalseNegativeRate = Number((aggregate.piFalseNegative / Math.max(1, aggregate.expectedCount)).toFixed(4));
     const reasonCodes: string[] = [];
     if (aggregate.reviewedCases < thresholds.minReviewedCases) reasonCodes.push('insufficient_reviewed_golden_cases');
     if (aggregate.comparisons < thresholds.minComparisons) reasonCodes.push('insufficient_shadow_comparisons');
@@ -4552,6 +4582,7 @@ export class ObservationStore {
   ): KmShadowComparisonMetrics {
     const rulesKeys = new Set(rulesClaims.map(claim => claim.claimKey));
     const piKeys = new Set(piClaims.map(claim => claim.claimKey));
+    const expectedKeys = new Set(golden.expectedClaims.map(claim => claim.claimKey));
     const overlap = [...rulesKeys].filter(key => piKeys.has(key)).length;
     const routeByKey = (claims: KmShadowComparison['rulesClaims']) => new Map(claims.map(claim => [claim.claimKey, claim.route ?? '']));
     const rulesRoutes = routeByKey(rulesClaims);
@@ -4566,10 +4597,21 @@ export class ObservationStore {
       expectedCount: golden.expectedClaims.length,
       rulesClaimCount: rulesKeys.size,
       piClaimCount: piKeys.size,
+      rulesTruePositive: [...rulesKeys].filter(key => expectedKeys.has(key)).length,
+      rulesFalsePositive: [...rulesKeys].filter(key => !expectedKeys.has(key)).length,
+      rulesFalseNegative: [...expectedKeys].filter(key => !rulesKeys.has(key)).length,
+      piTruePositive: [...piKeys].filter(key => expectedKeys.has(key)).length,
+      piFalsePositive: [...piKeys].filter(key => !expectedKeys.has(key)).length,
+      piFalseNegative: [...expectedKeys].filter(key => !piKeys.has(key)).length,
+      rulesFalsePositiveRate: Number(([...rulesKeys].filter(key => !expectedKeys.has(key)).length / Math.max(1, rulesKeys.size)).toFixed(4)),
+      rulesFalseNegativeRate: Number(([...expectedKeys].filter(key => !rulesKeys.has(key)).length / Math.max(1, expectedKeys.size)).toFixed(4)),
+      piFalsePositiveRate: Number(([...piKeys].filter(key => !expectedKeys.has(key)).length / Math.max(1, piKeys.size)).toFixed(4)),
+      piFalseNegativeRate: Number(([...expectedKeys].filter(key => !piKeys.has(key)).length / Math.max(1, expectedKeys.size)).toFixed(4)),
       claimOverlap: overlap,
       rulesUnique: [...rulesKeys].filter(key => !piKeys.has(key)).length,
       piUnique: [...piKeys].filter(key => !rulesKeys.has(key)).length,
       routingDisagreement,
+      extractorDisagreement: [...rulesKeys].filter(key => !piKeys.has(key)).length + [...piKeys].filter(key => !rulesKeys.has(key)).length + routingDisagreement,
       evidenceCoverage: allClaims.length === 0 ? 0 : Number((claimsWithEvidence / allClaims.length).toFixed(4)),
       privacyBlocks: allClaims.filter(claim => claim.privacyBlocked).length,
       schemaFailures: allClaims.filter(claim => claim.schemaFailure).length,
