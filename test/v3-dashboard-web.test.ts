@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import React from 'react';
+import { readFileSync } from 'node:fs';
 import TestRenderer, { act } from 'react-test-renderer';
 import {
   buildGraphLayout,
@@ -57,6 +58,19 @@ function response(ok: boolean, status: number, body: unknown = {}): Response {
     json: async () => body,
   } as Response;
 }
+
+describe('v3 dashboard layout', () => {
+  const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+  it('allocates a dedicated row for execution profiles before the run list', () => {
+    expect(css).toMatch(/main:has\(\.workflows-page \.v3r-runs-section\) \.workflows-page\s*\{[^}]*grid-template-rows:\s*auto auto minmax\(0, 1fr\);/s);
+  });
+
+  it('falls back to document scrolling on short or narrow viewports', () => {
+    expect(css).toMatch(/@media \(max-height: 820px\), \(max-width: 1180px\)\s*\{[\s\S]*?main:has\(\.workflows-page \.v3r-runs-section\)\s*\{[^}]*overflow-y:\s*auto;/);
+    expect(css).toMatch(/@media \(max-height: 820px\), \(max-width: 1180px\)\s*\{[\s\S]*?\.v3r-run-list\s*\{[^}]*height:\s*auto;[^}]*overflow:\s*visible;/);
+  });
+});
 
 describe('v3 dashboard model', () => {
   it('stops detail polling for terminal states, but keeps polling through cancelling/blocked', () => {
