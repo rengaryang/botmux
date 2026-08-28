@@ -94,6 +94,7 @@ export function executionProfileToSnapshot(profile: WorkflowExecutionProfile): B
     executionProfileId: profile.profileId,
     directCli: true,
     cliId: profile.cli,
+    ...(profile.provider ? { provider: profile.provider } : {}),
     ...(profile.model ? { model: profile.model } : {}),
     workingDir: profile.workingDir,
     sandbox: profile.sandbox.enabled,
@@ -194,6 +195,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'executionProfileId',
     'directCli',
     'cliPathOverride',
+    'provider',
     'model',
     'sandbox',
     'sandboxPaths',
@@ -228,7 +230,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'model', 'executionProfileId', 'costTier'] as const) {
+    for (const field of ['cliPathOverride', 'provider', 'model', 'executionProfileId', 'costTier'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
@@ -277,6 +279,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
       ...(obj.executionProfileId !== undefined ? { executionProfileId: obj.executionProfileId as string } : {}),
       ...(obj.directCli !== undefined ? { directCli: obj.directCli as boolean } : {}),
+      ...(obj.provider !== undefined ? { provider: obj.provider as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),

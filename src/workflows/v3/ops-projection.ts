@@ -113,6 +113,7 @@ export interface RunNodeView {
     selector: string;
     profileId?: string;
     cli: string;
+    provider?: string;
     model?: string;
     workingDir: string;
     timeoutSec: number;
@@ -520,6 +521,7 @@ export function projectRun(runId: string, runDir: string): RunView {
         selector: dagNode.selector ?? '',
         ...(execution.executionProfileId ? { profileId: execution.executionProfileId } : {}),
         cli: execution.cliId,
+        ...(execution.provider ? { provider: execution.provider } : {}),
         ...(execution.model ? { model: execution.model } : {}),
         workingDir: execution.workingDir,
         timeoutSec: Math.min(dagNode.timeoutSec ?? execution.timeoutDefaultSec ?? 1800, execution.timeoutMaxSec ?? dagNode.timeoutSec ?? 1800),

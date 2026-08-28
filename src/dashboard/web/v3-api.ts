@@ -6,6 +6,20 @@ import { controlCsrfHeaders } from './control-csrf.js';
 
 export type V3Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
+export interface WorkflowModelChoice {
+  value: string;
+  provider?: string;
+  model: string;
+  label: string;
+}
+
+export interface WorkflowModelChoices {
+  models: string[];
+  choices: WorkflowModelChoice[];
+  source: 'static' | 'live';
+  detectedAt?: number;
+}
+
 export interface V3RunDetailOk {
   ok: true;
   view: RunView;
@@ -30,6 +44,15 @@ export type V3RunCancelResult =
     status: number;
     error: string;
   };
+
+export async function fetchWorkflowModelChoices(cli: string, fetcher: V3Fetch = fetch): Promise<WorkflowModelChoices> {
+  const response = await fetcher(`/api/cli-options/models?key=${encodeURIComponent(cli)}`);
+  if (!response.ok) return { models: [], choices: [], source: 'static' };
+  const body = await response.json() as Partial<WorkflowModelChoices>;
+  const models = Array.isArray(body.models) ? body.models.filter((item): item is string => typeof item === 'string') : [];
+  const choices = Array.isArray(body.choices) ? body.choices.filter((item): item is WorkflowModelChoice => Boolean(item) && typeof item.value === 'string' && typeof item.model === 'string') : models.map(value => ({ value, model: value, label: value }));
+  return { models, choices, source: body.source === 'live' ? 'live' : 'static', ...(typeof body.detectedAt === 'number' ? { detectedAt: body.detectedAt } : {}) };
+}
 
 export async function fetchWorkflowExecutionProfiles(goal = '', fetcher: V3Fetch = fetch): Promise<{ profiles: WorkflowExecutionProfile[]; recommendations: WorkflowProfileRecommendation[] }> {
   const response = await fetcher(`/api/v3/execution-profiles?goal=${encodeURIComponent(goal)}`);

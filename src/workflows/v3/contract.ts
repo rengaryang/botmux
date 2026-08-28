@@ -161,6 +161,7 @@ export interface BotSnapshot {
   executionProfileId?: string;
   directCli?: boolean;
   cliPathOverride?: string;
+  provider?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. */

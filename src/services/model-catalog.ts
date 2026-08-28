@@ -22,6 +22,13 @@ import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 
 export type ModelSource = 'static' | 'live';
 
+export interface ModelChoiceDetail {
+  value: string;
+  provider?: string;
+  model: string;
+  label: string;
+}
+
 /** live 探测成功结果的缓存时长（毫秒）。导出供测试断言 TTL 行为。 */
 export const MODEL_DETECT_TTL_MS = 10 * 60 * 1000;
 
@@ -194,8 +201,22 @@ export function isKnownSelectionKey(key: string): boolean {
  *  detectedAt 为合并完成时刻（epoch millis）。fail-soft 语义同上游三个函数。 */
 export interface ModelChoicesResponse {
   readonly models: string[];
+  readonly choices: ModelChoiceDetail[];
   readonly source: ModelSource;
   readonly detectedAt: number;
+}
+
+export function modelChoiceDetails(models: readonly string[], providerQualified = false): ModelChoiceDetail[] {
+  return models.map(value => {
+    const slash = providerQualified ? value.indexOf('/') : -1;
+    // Only callers backed by a provider-aware catalogue opt into splitting.
+    // Other CLI model ids may legitimately contain slashes (for example
+    // OpenRouter) and must remain a single model value.
+    if (slash <= 0 || slash === value.length - 1) return { value, model: value, label: value };
+    const provider = value.slice(0, slash);
+    const model = value.slice(slash + 1);
+    return { value, provider, model, label: `${model} · ${provider}` };
+  });
 }
 
 export async function buildModelChoicesResponse(
@@ -206,5 +227,5 @@ export async function buildModelChoicesResponse(
   const staticChoices = staticModelChoices(key);
   const live = await detectModels(key, opts);
   const { models, source } = mergeModelChoices(staticChoices, live);
-  return { models, source, detectedAt: now() };
+  return { models, choices: modelChoiceDetails(models, key === 'pi'), source, detectedAt: now() };
 }

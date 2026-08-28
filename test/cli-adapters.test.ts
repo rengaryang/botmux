@@ -42,7 +42,7 @@ import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
-import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createPiAdapter, parsePiListModels } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
@@ -1076,6 +1076,19 @@ describe('pi buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
     expect(adapter.maxInitialPromptArgBytes).toBeUndefined();
     expect(adapter.altScreen).toBe(true);
+  });
+
+  it('parses provider-qualified models from Pi model catalogue output', () => {
+    expect(parsePiListModels([
+      'provider          model        context  max-out  thinking  images',
+      'bytedance-hybrid  glm-5.3      500K     65.5K    yes       no',
+      'codex-lb          gpt-5.6-sol  272K     65.5K    yes       yes',
+      'sol-mirror        gpt-5.6-sol  400K     65.5K    yes       yes',
+    ].join('\n'))).toEqual([
+      'bytedance-hybrid/glm-5.3',
+      'codex-lb/gpt-5.6-sol',
+      'sol-mirror/gpt-5.6-sol',
+    ]);
   });
 
   it('pins the configured model instead of inheriting Pi defaults', () => {

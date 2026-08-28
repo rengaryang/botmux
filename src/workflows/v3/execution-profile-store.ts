@@ -9,6 +9,7 @@ export interface WorkflowExecutionProfile {
   profileId: string;
   displayName: string;
   cli: CliId;
+  provider?: string;
   model?: string;
   workingDir: string;
   sandbox: { enabled: boolean; network: boolean; readWrite: string[]; readOnly: string[]; deny: string[] };
@@ -39,7 +40,10 @@ export function validateWorkflowExecutionProfile(raw: unknown, now = new Date().
   if (!displayName) throw new Error('workflow_profile_name_required');
   if (!V3_SUPPORTED_CLIS.includes(cli)) throw new Error('workflow_profile_cli_unsupported');
   if (!isAbsolute(workingDir)) throw new Error('workflow_profile_working_dir_absolute_required');
-  const model = typeof value.model === 'string' && value.model.trim() ? value.model.trim() : undefined;
+  const provider = typeof value.provider === 'string' && value.provider.trim() ? value.provider.trim() : undefined;
+  const rawModel = typeof value.model === 'string' && value.model.trim() ? value.model.trim() : undefined;
+  if (provider && rawModel?.includes('/') && !rawModel.startsWith(`${provider}/`)) throw new Error('workflow_profile_provider_model_mismatch');
+  const model = provider && rawModel && !rawModel.includes('/') ? `${provider}/${rawModel}` : rawModel;
   const sandboxRaw = (value.sandbox ?? {}) as Record<string, unknown>;
   const envRaw = (value.envPolicy ?? {}) as Record<string, unknown>;
   const timeoutRaw = (value.timeoutPolicy ?? {}) as Record<string, unknown>;
@@ -54,7 +58,7 @@ export function validateWorkflowExecutionProfile(raw: unknown, now = new Date().
   const costTier = String(value.costTier ?? 'medium');
   if (!['low', 'medium', 'high'].includes(costTier)) throw new Error('workflow_profile_cost_tier_invalid');
   return {
-    schemaVersion: 1, profileId, displayName, cli, ...(model ? { model } : {}), workingDir,
+    schemaVersion: 1, profileId, displayName, cli, ...(provider ? { provider } : {}), ...(model ? { model } : {}), workingDir,
     sandbox: {
       enabled: sandboxRaw.enabled !== false,
       network: sandboxRaw.network !== false,

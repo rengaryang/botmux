@@ -5,6 +5,7 @@ import {
   createModelCatalog,
   detectModels,
   mergeModelChoices,
+  modelChoiceDetails,
   staticModelChoices,
 } from '../src/services/model-catalog.js';
 import { TTADK_MODEL_SUGGESTIONS } from '../src/setup/cli-selection.js';
@@ -186,11 +187,24 @@ describe('detectModels（live 探测，fail-soft）', () => {
   });
 });
 
+describe('modelChoiceDetails（Provider / Model 结构化候选）', () => {
+  it('保留普通模型并拆分 provider-qualified Pi 模型', () => {
+    expect(modelChoiceDetails(['sonnet', 'bytedance-hybrid/glm-5.3'], true)).toEqual([
+      { value: 'sonnet', model: 'sonnet', label: 'sonnet' },
+      { value: 'bytedance-hybrid/glm-5.3', provider: 'bytedance-hybrid', model: 'glm-5.3', label: 'glm-5.3 · bytedance-hybrid' },
+    ]);
+    expect(modelChoiceDetails(['openrouter/anthropic/claude'])).toEqual([
+      { value: 'openrouter/anthropic/claude', model: 'openrouter/anthropic/claude', label: 'openrouter/anthropic/claude' },
+    ]);
+  });
+});
+
 describe('buildModelChoicesResponse（端点 200 响应体构造）', () => {
   it('无 live 探测能力时：静态候选 + source=static + detectedAt', async () => {
     // claude-code 无 detectModels → live=null → source=static
     const body = await buildModelChoicesResponse('claude-code', { now: () => 42_000 });
     expect(body.models).toContain('sonnet');
+    expect(body.choices).toContainEqual({ value: 'sonnet', model: 'sonnet', label: 'sonnet' });
     expect(body.source).toBe('static');
     expect(body.detectedAt).toBe(42_000);
   });
