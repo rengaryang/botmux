@@ -170,6 +170,7 @@ type ProductionGateKillState = { enabled: boolean; reason: string; actorId: stri
 type ProductionGateList = { items: ProductionGatePlan[]; killSwitch: ProductionGateKillState };
 type CanaryRuntimeStatus = {
   runtime: { active: boolean; planId?: string; botAppId: string; window?: { start: string; end: string }; reason: string };
+  legacyEnvironmentActive?: boolean;
   restartRequired: boolean;
   autoFallback: 'shadow';
 };
@@ -939,9 +940,9 @@ function KmPage(): React.JSX.Element {
               <button disabled={!canaryRuntime?.runtime.active} onClick={() => void rollbackCanary()}>立即回落 Shadow</button>
             </div>
           </div>
-          <div className={`km-canary-status ${canaryRuntime?.runtime.active ? 'is-live' : ''}`}>
+          <div className={`km-canary-status ${canaryRuntime?.runtime.active || canaryRuntime?.legacyEnvironmentActive ? 'is-live' : ''}`}>
             <span className="km-canary-pulse" aria-hidden="true" />
-            <div><small>当前运行态</small><strong>{canaryRuntime?.runtime.active ? 'LIVE CANARY' : 'SHADOW / 未激活'}</strong></div>
+            <div><small>当前运行态</small><strong>{canaryRuntime?.runtime.active ? 'LIVE CANARY' : canaryRuntime?.legacyEnvironmentActive ? 'LIVE · 旧版环境配置' : 'SHADOW / 未激活'}</strong></div>
             <div><small>Bot</small><strong>{canaryRuntime?.runtime.botAppId ?? canaryForm.botAppId}</strong></div>
             <div><small>窗口结束</small><strong>{canaryRuntime?.runtime.window?.end ? new Date(canaryRuntime.runtime.window.end).toLocaleString() : '—'}</strong></div>
             <div><small>原因</small><strong>{canaryRuntime?.runtime.reason ?? 'not_loaded'}</strong></div>
