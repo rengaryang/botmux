@@ -79,6 +79,14 @@ export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode
 type RunNodeInternalDeps = Required<Pick<EphemeralPoolDeps, 'factory' | 'workerPath' | 'quiesceMs' | 'cancelGraceMs' | 'manifestPollMs' | 'manifestSettleMs'>> &
   Pick<EphemeralPoolDeps, 'resolveLarkAppSecret'>;
 
+function directProfileHostEnv(snapshot: RunNodeRequest['botSnapshot']): NodeJS.ProcessEnv {
+  if (!snapshot.directCli) return stripPm2GracefulExitMarker(process.env);
+  const always = new Set(['PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'XDG_RUNTIME_DIR']);
+  const denied = new Set(snapshot.envDenylist ?? []);
+  const allowed = new Set([...always, ...(snapshot.envAllowlist ?? [])]);
+  return Object.fromEntries(Object.entries(stripPm2GracefulExitMarker(process.env)).filter(([key]) => allowed.has(key) && !denied.has(key)));
+}
+
 async function runNodeImpl(
   req: RunNodeRequest,
   deps: RunNodeInternalDeps,
@@ -146,7 +154,7 @@ async function runNodeImpl(
         // "only daemon/dashboard carry the marker" invariant — harmless today
         // (the worker doesn't read the graceful helper and its CLI children go
         // through redactChildEnv), but this keeps the boundary honest.
-        ...stripPm2GracefulExitMarker(process.env),
+        ...directProfileHostEnv(req.botSnapshot),
         ...req.env,
         [GOAL_ENV.V3_MARKER]: '1',
         BOTMUX_WORKFLOW: '1',

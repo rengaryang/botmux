@@ -221,8 +221,9 @@ describe('v3 ephemeral pool', () => {
     const base = request();
     const req: RunNodeRequest = {
       ...base,
-      botSnapshot: { ...base.botSnapshot, larkAppId: 'profile:direct-pi', executionProfileId: 'direct-pi', directCli: true, cliId: 'pi' },
+      botSnapshot: { ...base.botSnapshot, larkAppId: 'profile:direct-pi', executionProfileId: 'direct-pi', directCli: true, cliId: 'pi', envAllowlist: ['WORKFLOW_PROFILE_SAFE'], envDenylist: ['WORKFLOW_PROFILE_DENIED'] },
     };
+    process.env.WORKFLOW_PROFILE_SAFE = 'safe'; process.env.WORKFLOW_PROFILE_DENIED = 'denied'; process.env.WORKFLOW_PROFILE_UNLISTED = 'hidden';
     const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret });
     const result = pool.runNode(req);
     await waitFor(() => factory.lastOpts !== undefined);
@@ -234,6 +235,10 @@ describe('v3 ephemeral pool', () => {
     await expect(result).resolves.toMatchObject({ status: 'ok' });
     expect(resolveLarkAppSecret).not.toHaveBeenCalled();
     expect(worker.init).toMatchObject({ apiOnly: true, larkAppId: 'local_direct-pi', larkAppSecret: '' });
+    expect(factory.lastOpts?.env.WORKFLOW_PROFILE_SAFE).toBe('safe');
+    expect(factory.lastOpts?.env.WORKFLOW_PROFILE_DENIED).toBeUndefined();
+    expect(factory.lastOpts?.env.WORKFLOW_PROFILE_UNLISTED).toBeUndefined();
+    delete process.env.WORKFLOW_PROFILE_SAFE; delete process.env.WORKFLOW_PROFILE_DENIED; delete process.env.WORKFLOW_PROFILE_UNLISTED;
   });
 
   it('passes frozen sandbox policy to the goal-mode worker init', async () => {
