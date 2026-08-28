@@ -170,7 +170,7 @@ type ProductionGateKillState = { enabled: boolean; reason: string; actorId: stri
 type ProductionGateList = { items: ProductionGatePlan[]; killSwitch: ProductionGateKillState };
 type CanaryRuntimeStatus = {
   runtime: { active: boolean; planId?: string; botAppId: string; window?: { start: string; end: string }; reason: string };
-  restartRequired: false;
+  restartRequired: boolean;
   autoFallback: 'shadow';
 };
 
