@@ -78,6 +78,25 @@ describe('Slice C0 — chat side-effect isolation', () => {
     expect(out.stderr).toMatch(/refused inside workflow/);
   });
 
+  it('allows offline KM ops-readiness drill but refuses mutating KM backfill in workflow mode', () => {
+    const out = runCli(['km', 'ops-readiness', '--now', '2026-08-28T00:00:00.000Z'], {
+      BOTMUX_WORKFLOW: '1',
+    });
+    expect(out.status).toBe(0);
+    expect(out.stderr).not.toMatch(/refused inside workflow/);
+    expect(JSON.parse(out.stdout)).toEqual(expect.objectContaining({
+      drillVersion: 'km-ops-readiness-drill-v1',
+      safety: expect.objectContaining({ realTransportEnabled: false }),
+    }));
+
+    const denied = runCli(['km', 'backfill'], {
+      BOTMUX_WORKFLOW: '1',
+    });
+    expect(denied.status).toBe(2);
+    expect(denied.stderr).toContain('botmux km backfill refused inside workflow');
+    expect(denied.stderr).toContain('Only local, offline KM introspection');
+  });
+
   it('botmux schedule list (read-only) is allowed in workflow mode', () => {
     const out = runCli(['schedule', 'list'], {
       BOTMUX_WORKFLOW: '1',

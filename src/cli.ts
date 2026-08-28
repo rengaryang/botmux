@@ -13832,6 +13832,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'workflow',
     'template',
     'v3',
+    'km',
   ]);
   const rootDenied = !allowedRoot.has(command);
   const mcpSub = command === 'mcp' ? (process.argv[3] ?? '') : '';
@@ -13871,6 +13872,11 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
   const v3Sub = command === 'v3' ? (process.argv[3] ?? '') : '';
+  const kmSub = command === 'km' ? (process.argv[3] ?? '') : '';
+  const kmDenied = command === 'km' && !(
+    kmSub === 'ops-readiness' ||
+    (kmSub === 'backfill' && process.argv.slice(4).includes('--dry-run'))
+  );
   const workflowMutation =
     (command === 'workflow' && blockedWorkflowSub.has(workflowSub)) ||
     (command === 'template' && blockedTemplateSub.has(templateSub)) ||
@@ -13878,6 +13884,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
   if (
     rootDenied ||
     mcpDenied ||
+    kmDenied ||
     (isSchedule && blockedScheduleSub.has(scheduleSub)) ||
     workflowMutation
   ) {
@@ -13893,11 +13900,15 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
             ? templateSub
             : command === 'v3'
               ? v3Sub
+              : command === 'km'
+                ? kmSub
               : '';
     const guidance = mcpDenied
       ? 'Only the botmux-owned Plugin MCP gateway bootstrap (`mcp serve`) is available inside a workflow subagent.'
       : workflowMutation
         ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
+        : kmDenied
+          ? 'Only local, offline KM introspection is available inside a workflow subagent.'
         : rootDenied
           ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
           : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
@@ -14708,13 +14719,40 @@ switch (command) {
   }
   case 'km': {
     // `botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]`
+    // `botmux km ops-readiness [--output <file>] [--now <ISO>] [--data-dir <dir>] [--keep-data-dir]`
     // Read-only backfill of historical turn.completed events into the KM
     // observation store. Dry-run (default: no, requires --execute to write).
     const kmArgs = process.argv.slice(3);
     const kmSub = kmArgs[0] ?? 'help';
-    if (kmSub !== 'backfill') {
+    if (kmSub !== 'backfill' && kmSub !== 'ops-readiness') {
       console.error('用法: botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]');
+      console.error('      botmux km ops-readiness [--output <file>] [--now <ISO>] [--data-dir <dir>] [--keep-data-dir]');
       process.exitCode = 2;
+      break;
+    }
+    if (kmSub === 'ops-readiness') {
+      const flags = kmArgs.slice(1);
+      const outputIdx = flags.indexOf('--output');
+      const dataDirIdx = flags.indexOf('--data-dir');
+      const nowIdx = flags.indexOf('--now');
+      const output = outputIdx >= 0 && flags[outputIdx + 1] ? flags[outputIdx + 1] : undefined;
+      const dataDir = dataDirIdx >= 0 && flags[dataDirIdx + 1] ? flags[dataDirIdx + 1] : undefined;
+      const now = nowIdx >= 0 && flags[nowIdx + 1] ? flags[nowIdx + 1] : undefined;
+      const keepDataDir = flags.includes('--keep-data-dir');
+      const { runKmOpsReadinessDrill } = await import('./services/km/ops-readiness-drill.js');
+      const report = await runKmOpsReadinessDrill({
+        ...(dataDir ? { dataDir: resolve(dataDir) } : {}),
+        ...(now ? { now } : {}),
+        keepDataDir,
+      });
+      const body = `${JSON.stringify(report, null, 2)}\n`;
+      if (output) {
+        const target = resolve(output);
+        mkdirSync(dirname(target), { recursive: true });
+        atomicWriteFileSync(target, body, { mode: 0o600 });
+      } else {
+        process.stdout.write(body);
+      }
       break;
     }
     {
