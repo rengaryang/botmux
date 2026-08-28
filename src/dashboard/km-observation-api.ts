@@ -22,6 +22,13 @@ import {
   executeKnowledgeToMemoryImport,
 } from '../services/km/knowledge-to-memory-import.js';
 import type { CentralSinkRuntimeStatus } from '../services/km/central-sink-runtime.js';
+import {
+  approveKmProductionGatePlan,
+  buildKmProductionGateHandoff,
+  buildKmProductionGatePlan,
+  createKmProductionGateIntent,
+  expireKmProductionGatePlan,
+} from '../services/km/production-gate.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -89,6 +96,13 @@ export interface KmObservationApiStore {
   createKnowledgeToMemoryImportPreview?(input: Parameters<ObservationStore['createKnowledgeToMemoryImportPreview']>[0]): ReturnType<ObservationStore['createKnowledgeToMemoryImportPreview']>;
   submitKnowledgeToMemoryImportReview?(input: Parameters<ObservationStore['submitKnowledgeToMemoryImportReview']>[0]): ReturnType<ObservationStore['submitKnowledgeToMemoryImportReview']>;
   runKnowledgeToMemoryImport?(input: Parameters<ObservationStore['runKnowledgeToMemoryImport']>[0]): ReturnType<ObservationStore['runKnowledgeToMemoryImport']>;
+  createProductionGatePlan?(input: Parameters<ObservationStore['createProductionGatePlan']>[0]): ReturnType<ObservationStore['createProductionGatePlan']>;
+  getProductionGatePlan?(planId: string): ReturnType<ObservationStore['getProductionGatePlan']>;
+  listProductionGatePlans?(input?: Parameters<ObservationStore['listProductionGatePlans']>[0]): ReturnType<ObservationStore['listProductionGatePlans']>;
+  listProductionGateAudit?(planId: string, limit?: number): ReturnType<ObservationStore['listProductionGateAudit']>;
+  transitionProductionGatePlan?(input: Parameters<ObservationStore['transitionProductionGatePlan']>[0]): ReturnType<ObservationStore['transitionProductionGatePlan']>;
+  getProductionGateKillState?(): ReturnType<ObservationStore['getProductionGateKillState']>;
+  setProductionGateKillState?(input: Parameters<ObservationStore['setProductionGateKillState']>[0]): ReturnType<ObservationStore['setProductionGateKillState']>;
   close(): void;
 }
 
@@ -161,6 +175,10 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/imports'
     || /^\/api\/km\/imports\/[^/]+$/.test(url.pathname)
     || /^\/api\/km\/imports\/[^/]+\/execute$/.test(url.pathname)
+    || url.pathname === '/api/km/production-gates'
+    || url.pathname === '/api/km/production-gates/kill-switch'
+    || /^\/api\/km\/production-gates\/[^/]+$/.test(url.pathname)
+    || /^\/api\/km\/production-gates\/[^/]+\/(approve|intent|expire|audit|handoff)$/.test(url.pathname)
     || url.pathname === '/api/km/backend-runtime'
     || url.pathname === '/api/km/backend-outbox'
     || url.pathname === '/api/km/backend-migrations'
@@ -292,6 +310,91 @@ export async function handleKmObservationApi(
           actorId: ctx.actorId,
           idempotencyKey: ctx.idempotencyKey,
         }), { afterHash: response => response.job.configHash }); return true;
+    }
+
+    if (url.pathname === '/api/km/production-gates' && req.method === 'POST') {
+      if (!store.createProductionGatePlan) throw new Error('km_production_gate_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 201, 'production_gate.plan_created', String(body.actionKind ?? 'production-gate'), () => {
+        const built = buildKmProductionGatePlan({
+          actionKind: String(body.actionKind ?? '') as any,
+          target: typeof body.target === 'object' && body.target !== null ? body.target as Record<string, unknown> : {},
+          scope: typeof body.scope === 'object' && body.scope !== null ? body.scope as Record<string, unknown> : {},
+          actorId: ctx.actorId,
+          riskAck: typeof body.riskAck === 'object' && body.riskAck !== null ? body.riskAck as Record<string, unknown> : {},
+          ttlSeconds: typeof body.ttlSeconds === 'number' ? body.ttlSeconds : undefined,
+          confirmationToken: typeof body.confirmationToken === 'string' ? body.confirmationToken : undefined,
+        });
+        const plan = store!.createProductionGatePlan!(built.plan);
+        return {
+          plan,
+          confirmationToken: built.confirmationToken,
+          handoff: buildKmProductionGateHandoff(plan),
+          effective: false,
+          sideEffectsExecuted: false,
+        };
+      }, { afterHash: response => response.plan.previewHash });
+      return true;
+    }
+
+    const productionGateApprove = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)\/approve$/);
+    if (productionGateApprove) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.getProductionGatePlan || !store.transitionProductionGatePlan) throw new Error('km_production_gate_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'production_gate.approved', decodeURIComponent(productionGateApprove[1]), () => ({
+        plan: approveKmProductionGatePlan(store as any, {
+          planId: decodeURIComponent(productionGateApprove[1]),
+          actorId: ctx.actorId,
+          approvalGrade: String(body.approvalGrade ?? '') as any,
+          confirmationToken: String(body.confirmationToken ?? ''),
+          previewHash: String(body.previewHash ?? ''),
+          riskAck: typeof body.riskAck === 'object' && body.riskAck !== null ? body.riskAck as Record<string, unknown> : {},
+        }),
+        effective: false,
+        sideEffectsExecuted: false,
+      }), { afterHash: response => response.plan.previewHash });
+      return true;
+    }
+
+    const productionGateIntent = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)\/intent$/);
+    if (productionGateIntent) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.getProductionGatePlan || !store.transitionProductionGatePlan || !store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'production_gate.intent_created', decodeURIComponent(productionGateIntent[1]), () =>
+        createKmProductionGateIntent(store as any, {
+          planId: decodeURIComponent(productionGateIntent[1]),
+          actorId: ctx.actorId,
+          confirmationToken: String(body.confirmationToken ?? ''),
+          previewHash: String(body.previewHash ?? ''),
+        }), { afterHash: response => response.intent.signedIntentHash });
+      return true;
+    }
+
+    const productionGateExpire = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)\/expire$/);
+    if (productionGateExpire) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.getProductionGatePlan || !store.transitionProductionGatePlan) throw new Error('km_production_gate_unavailable');
+      const { raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'production_gate.expired', decodeURIComponent(productionGateExpire[1]), () => ({
+        plan: expireKmProductionGatePlan(store as any, { planId: decodeURIComponent(productionGateExpire[1]), actorId: ctx.actorId }),
+      }), { afterHash: response => response.plan.previewHash });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/production-gates/kill-switch' && req.method === 'PUT') {
+      if (!store.setProductionGateKillState) throw new Error('km_production_gate_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'production_gate.kill_switch_changed', 'global', () => ({
+        killSwitch: store!.setProductionGateKillState!({
+          enabled: Boolean(body.enabled),
+          reason: String(body.reason ?? ''),
+          actorId: ctx.actorId,
+        }),
+        mutatesExistingRuntimeGates: false,
+      }), { afterHash: response => createHash('sha256').update(JSON.stringify(response.killSwitch)).digest('hex') });
+      return true;
     }
 
     const importExecute = url.pathname.match(/^\/api\/km\/imports\/([^/]+)\/execute$/);
@@ -626,6 +729,42 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/imports') {
       if (!store.listKnowledgeToMemoryImportJobs) throw new Error('km_import_unavailable');
       jsonRes(res, 200, { items: store.listKnowledgeToMemoryImportJobs(positiveInteger(url.searchParams.get('limit'), 20, 100)) }); return true;
+    }
+    if (url.pathname === '/api/km/production-gates') {
+      if (!store.listProductionGatePlans || !store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');
+      const actionKind = url.searchParams.get('actionKind') ?? undefined;
+      const state = url.searchParams.get('state') ?? undefined;
+      jsonRes(res, 200, {
+        items: store.listProductionGatePlans({
+          limit: positiveInteger(url.searchParams.get('limit'), 20, 100),
+          ...(actionKind ? { actionKind: actionKind as any } : {}),
+          ...(state ? { state: state as any } : {}),
+        }),
+        killSwitch: store.getProductionGateKillState(),
+      }); return true;
+    }
+    if (url.pathname === '/api/km/production-gates/kill-switch') {
+      if (!store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');
+      jsonRes(res, 200, store.getProductionGateKillState()); return true;
+    }
+    const productionGateAudit = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)\/audit$/);
+    if (productionGateAudit) {
+      if (!store.listProductionGateAudit) throw new Error('km_production_gate_unavailable');
+      jsonRes(res, 200, { items: store.listProductionGateAudit(decodeURIComponent(productionGateAudit[1]), positiveInteger(url.searchParams.get('limit'), 100, 500)) }); return true;
+    }
+    const productionGateHandoff = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)\/handoff$/);
+    if (productionGateHandoff) {
+      if (!store.getProductionGatePlan) throw new Error('km_production_gate_unavailable');
+      const plan = store.getProductionGatePlan(decodeURIComponent(productionGateHandoff[1]));
+      if (!plan) throw new Error('km_production_gate_plan_not_found');
+      jsonRes(res, 200, buildKmProductionGateHandoff(plan)); return true;
+    }
+    const productionGateStatus = url.pathname.match(/^\/api\/km\/production-gates\/([^/]+)$/);
+    if (productionGateStatus) {
+      if (!store.getProductionGatePlan) throw new Error('km_production_gate_unavailable');
+      const plan = store.getProductionGatePlan(decodeURIComponent(productionGateStatus[1]));
+      if (!plan) throw new Error('km_production_gate_plan_not_found');
+      jsonRes(res, 200, plan); return true;
     }
     const importStatus = url.pathname.match(/^\/api\/km\/imports\/([^/]+)$/);
     if (importStatus) {
