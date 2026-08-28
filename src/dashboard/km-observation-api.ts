@@ -34,6 +34,11 @@ import {
   buildKmCanaryCloseoutReport,
   renderKmCanaryCloseoutMarkdown,
 } from '../services/km/canary-closeout-report.js';
+import {
+  activateKmCanaryRelease,
+  resolveKmCanaryRuntimeAuthorization,
+  rollbackKmCanaryRelease,
+} from '../services/km/canary-release.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -62,6 +67,7 @@ export interface KmObservationApiStore {
   listRetrievalAudits?(limit: number): ReturnType<ObservationStore['listRetrievalAudits']>;
   listInjectionSnapshots?(limit: number): ReturnType<ObservationStore['listInjectionSnapshots']>;
   listPipelineProfiles?(botAppId?: string): ReturnType<ObservationStore['listPipelineProfiles']>;
+  getEffectivePipelineProfile?(botAppId: string): ReturnType<ObservationStore['getEffectivePipelineProfile']>;
   putPipelineProfile?(profile: Parameters<ObservationStore['putPipelineProfile']>[0], state?: Parameters<ObservationStore['putPipelineProfile']>[1]): ReturnType<ObservationStore['putPipelineProfile']>;
   setPipelineProfileState?(input: Parameters<ObservationStore['setPipelineProfileState']>[0]): ReturnType<ObservationStore['setPipelineProfileState']>;
   listMemoryProviderConfigs?(): ReturnType<ObservationStore['listMemoryProviderConfigs']>;
@@ -138,6 +144,10 @@ function mutationContext(req: IncomingMessage, deps: KmObservationApiDeps, route
   return { actorId, idempotencyKey: key.trim(), route, requestHash: `sha256:${createHash('sha256').update(raw).digest('hex')}` };
 }
 
+function stableCanaryResponseHash(value: unknown): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
+}
+
 function positiveInteger(raw: string | null, fallback: number, max: number): number {
   if (!raw) return fallback;
   const value = Number(raw);
@@ -186,6 +196,9 @@ export async function handleKmObservationApi(
     || /^\/api\/km\/production-gates\/[^/]+$/.test(url.pathname)
     || /^\/api\/km\/production-gates\/[^/]+\/(approve|intent|expire|audit|handoff)$/.test(url.pathname)
     || url.pathname === '/api/km/canary-closeout'
+    || url.pathname === '/api/km/canary-release/status'
+    || url.pathname === '/api/km/canary-release/activate'
+    || /^\/api\/km\/canary-release\/[^/]+\/rollback$/.test(url.pathname)
     || url.pathname === '/api/km/backend-runtime'
     || url.pathname === '/api/km/backend-outbox'
     || url.pathname === '/api/km/backend-migrations'
@@ -362,6 +375,47 @@ export async function handleKmObservationApi(
         effective: false,
         sideEffectsExecuted: false,
       }), { afterHash: response => response.plan.previewHash });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/canary-release/activate' && req.method === 'POST') {
+      if (!store.getProductionGatePlan || !store.listProductionGatePlans || !store.transitionProductionGatePlan || !store.getProductionGateKillState || !store.getEffectivePipelineProfile) {
+        throw new Error('km_canary_release_unavailable');
+      }
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const requestedPlan = store.getProductionGatePlan(String(body.planId ?? ''));
+      const exactBotAppId = String((requestedPlan?.target as { botAppId?: unknown } | undefined)?.botAppId ?? '');
+      if (requestedPlan?.actionKind !== 'prompt-canary' || store.getEffectivePipelineProfile(exactBotAppId)?.injectionMode !== 'canary') {
+        throw new KmApiError(422, 'km_canary_release_profile_not_canary');
+      }
+      executeMutation(ctx, 200, 'canary.release_activated', String(body.planId ?? ''), () => {
+        const plan = activateKmCanaryRelease(store as any, {
+          planId: String(body.planId ?? ''), actorId: ctx.actorId,
+          approvalGrade: String(body.approvalGrade ?? 'G2') as any,
+          confirmationToken: String(body.confirmationToken ?? ''), previewHash: String(body.previewHash ?? ''),
+          riskAck: typeof body.riskAck === 'object' && body.riskAck !== null ? body.riskAck as Record<string, unknown> : {},
+        });
+        return {
+          plan,
+          runtime: resolveKmCanaryRuntimeAuthorization(store as any, String((plan.target as any).botAppId ?? '')),
+          restartRequired: false,
+          autoFallback: 'shadow',
+        };
+      }, { afterHash: response => stableCanaryResponseHash(response) });
+      return true;
+    }
+
+    const canaryRollback = url.pathname.match(/^\/api\/km\/canary-release\/([^/]+)\/rollback$/);
+    if (canaryRollback) {
+      if (req.method !== 'POST') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+      if (!store.getProductionGatePlan || !store.transitionProductionGatePlan) throw new Error('km_canary_release_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      executeMutation(ctx, 200, 'canary.release_rolled_back', decodeURIComponent(canaryRollback[1]), () => {
+        const plan = rollbackKmCanaryRelease(store as any, {
+          planId: decodeURIComponent(canaryRollback[1]), actorId: ctx.actorId, reason: String(body.reason ?? 'dashboard_operator_rollback'),
+        });
+        return { plan, effective: false, fallback: 'shadow', restartRequired: false };
+      }, { afterHash: response => stableCanaryResponseHash(response) });
       return true;
     }
 
@@ -760,6 +814,18 @@ export async function handleKmObservationApi(
       if (!store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');
       jsonRes(res, 200, store.getProductionGateKillState()); return true;
     }
+    if (url.pathname === '/api/km/canary-release/status') {
+      if (!store.listProductionGatePlans || !store.getProductionGateKillState) throw new Error('km_canary_release_unavailable');
+      const botAppId = String(url.searchParams.get('botAppId') ?? '').trim();
+      if (!botAppId) throw new KmApiError(400, 'km_canary_release_bot_required');
+      jsonRes(res, 200, {
+        runtime: resolveKmCanaryRuntimeAuthorization(store as any, botAppId),
+        restartRequired: false,
+        autoFallback: 'shadow',
+      });
+      return true;
+    }
+
     if (url.pathname === '/api/km/canary-closeout') {
       if (!store.listGoldenCases || !store.listShadowComparisons || !store.shadowReadinessReportLatest
         || !store.listRetrievalAudits || !store.listInjectionSnapshots || !store.listProductionGatePlans

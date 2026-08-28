@@ -1,5 +1,5 @@
 import { Readable } from 'node:stream';
-import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -48,6 +48,42 @@ describe('KM observation dashboard API', () => {
     expect(handled).toBe(true);
     expect(res.writeHead).toHaveBeenCalledWith(404, expect.anything());
     expect(bodies).toEqual([{ error: 'km_observation_disabled' }]);
+  });
+
+  it('activates and rolls back an exact-bot Canary through the governed runtime API', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-km-canary-api-'));
+    try {
+      const store = await ObservationStore.open(dir);
+      const riskAck = { acknowledged: true, rollback: 'shadow' };
+      const now = new Date();
+      const { buildKmProductionGatePlan } = await import('../src/services/km/production-gate.js');
+      const built = buildKmProductionGatePlan({
+        actionKind: 'prompt-canary', actorId: 'operator-1', confirmationToken: 'api-token', ttlSeconds: 3600,
+        now: now.toISOString(), riskAck,
+        target: { botAppId: 'cli_api', window: { start: new Date(now.getTime() - 1000).toISOString(), end: new Date(now.getTime() + 3600000).toISOString() } },
+        scope: { botAppId: 'cli_api', sessionClass: 'wizard' },
+      });
+      store.createProductionGatePlan(built.plan);
+      store.putPipelineProfile({
+        schemaVersion: 1, profileId: 'api-canary', revision: 1, botAppId: 'cli_api', sourceProvider: 'observation-source-v1',
+        windowProvider: 'bounded-transcript-window-v1', primaryExtractor: 'builtin.rules-v1', shadowExtractors: [],
+        knowledgeRouter: 'builtin.layer-router-v1', memoryPolicy: 'safe-auto-activation-v1',
+        memoryBackends: { writePolicy: 'single', primary: 'sqlite', mirrors: [] }, injectionMode: 'canary',
+        budgets: { sourceBytes: 262144, sourceTokens: 32000, outputClaims: 20, promptTokens: 1800 },
+      }, 'shadow');
+      store.close();
+      const deps = { enabled: true, actorId: 'operator-2', openStore: () => ObservationStore.open(dir) };
+      const activate = response();
+      await handleKmObservationApi(Object.assign(Readable.from([Buffer.from(JSON.stringify({
+        planId: built.plan.planId, approvalGrade: 'G2', confirmationToken: 'api-token', previewHash: built.plan.previewHash, riskAck,
+      }))]), { method: 'POST', headers: { 'idempotency-key': 'activate-1' } }) as any, activate.res,
+      new URL('http://localhost/api/km/canary-release/activate'), deps);
+      expect(activate.bodies[0]).toMatchObject({ runtime: { active: true, botAppId: 'cli_api', reason: 'active' }, restartRequired: false, autoFallback: 'shadow' });
+      const rollback = response();
+      await handleKmObservationApi(Object.assign(Readable.from([Buffer.from(JSON.stringify({ reason: 'operator' }))]), { method: 'POST', headers: { 'idempotency-key': 'rollback-1' } }) as any,
+        rollback.res, new URL(`http://localhost/api/km/canary-release/${built.plan.planId}/rollback`), deps);
+      expect(rollback.bodies[0]).toMatchObject({ plan: { state: 'rolled_back' }, effective: false, fallback: 'shadow' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('returns store health and closes the request-scoped store', async () => {
