@@ -28,6 +28,7 @@ import {
   isHostNode,
   isLoopNode,
   loopInstanceId,
+  executionSelector,
   validateDag,
   type V3Dag,
   type V3InputRef,
@@ -689,12 +690,12 @@ export async function runWorkflow(
     botSnapshots.set(key, deps.resolveBotSnapshot(bot));
   };
   for (const node of dag.nodes) {
-    if (isGoalNode(node)) freezeBot(node.bot);
+    if (isGoalNode(node)) freezeBot(executionSelector(node));
     if (isHostNode(node) && !deps.hostExecutors?.has(node.executor)) {
       throw new Error(`v3 runtime: host executor "${node.executor}" is not registered`);
     }
     if (isLoopNode(node)) {
-      for (const b of node.body.nodes) freezeBot(b.bot ?? node.bot);
+      for (const b of node.body.nodes) freezeBot(executionSelector(b, executionSelector(node)));
     }
   }
 
@@ -1030,7 +1031,8 @@ export async function runWorkflow(
           if (!a.instanceId) throw new Error(`v3 runtime: host node "${node.id}" has no runtime instance`);
           if (startHost(node, events, a.instanceId)) startedThisTick++;
         } else {
-          const botKey = node.bot ?? '';
+          const inherited = a.loop ? executionSelector(nodesById.get(a.loop.loopId)!) : undefined;
+          const botKey = executionSelector(node, inherited) ?? '';
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
@@ -2646,7 +2648,10 @@ export async function runWorkflow(
       env,
       ...(opts.chatBinding ? { chatBinding: opts.chatBinding } : {}),
       workerFence: leaseAcquisition.hostToken as RunNodeRequest['workerFence'],
-      timeoutMs: (node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC) * 1000,
+      timeoutMs: Math.min(
+        node.timeoutSec ?? effSnap.timeoutDefaultSec ?? DEFAULT_NODE_TIMEOUT_SEC,
+        effSnap.timeoutMaxSec ?? node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC,
+      ) * 1000,
       cancelSignal: controller.signal,
       // Worker terminal is ready mid-run → stamp nodeSessionReady so the
       // dashboard can attach to the LIVE terminal.  Sync appendEvent (no await

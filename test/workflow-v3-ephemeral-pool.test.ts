@@ -289,6 +289,28 @@ describe('v3 ephemeral pool', () => {
     await promise;
   });
 
+  it('starts a direct CLI execution profile without resolving a Lark secret', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const resolveLarkAppSecret = vi.fn();
+    const base = request();
+    const req: RunNodeRequest = {
+      ...base,
+      botSnapshot: { ...base.botSnapshot, larkAppId: 'profile:direct-pi', executionProfileId: 'direct-pi', directCli: true, cliId: 'pi' },
+    };
+    const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret });
+    const result = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(result).resolves.toMatchObject({ status: 'ok' });
+    expect(resolveLarkAppSecret).not.toHaveBeenCalled();
+    expect(worker.init).toMatchObject({ apiOnly: true, larkAppId: 'local_direct-pi', larkAppSecret: '' });
+  });
+
   it('passes frozen sandbox policy to the goal-mode worker init', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

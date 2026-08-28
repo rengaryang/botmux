@@ -26,12 +26,15 @@ import { isValidRunId, listRuns, projectRunById, ptyLogPathFor } from '../workfl
 import { workflowDaemonMutationPath } from '../workflows/v3/daemon-ipc-client.js';
 import { readRunEnvelope, V3_RUN_ENVELOPE_FILE } from '../workflows/v3/run-envelope.js';
 import { readGrillState } from '../workflows/v3/grill-state.js';
+import { WorkflowExecutionProfileStore } from '../workflows/v3/execution-profile-store.js';
+import { collectWorkflowProfileHistory, recommendWorkflowProfiles } from '../workflows/v3/model-recommender.js';
 
 export type V3RunsApiDeps = {
   /** Root of the v3 run dirs (`~/.botmux/v3-runs` in production). */
   runsDir: string;
   /** Route a mutation to the daemon that owns the immutable run binding. */
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
+  executionProfileStore?: WorkflowExecutionProfileStore;
 };
 
 /** Cap a single pty-log response so a runaway log can't exhaust the dashboard. */
@@ -52,6 +55,46 @@ export async function handleV3RunsApi(
     return true;
   }
 
+  let m: RegExpMatchArray | null;
+  const profileStore = deps.executionProfileStore ?? new WorkflowExecutionProfileStore();
+
+  if (req.method === 'GET' && url.pathname === '/api/v3/execution-profiles') {
+    const profiles = profileStore.list();
+    const history = collectWorkflowProfileHistory(deps.runsDir);
+    jsonRes(res, 200, { profiles, recommendations: recommendWorkflowProfiles({ goal: url.searchParams.get('goal') ?? '', profiles, history }) });
+    return true;
+  }
+
+  if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/v3\/runs\/([^/]+)\/plan$/))) {
+    let runId: string;
+    try { runId = decodeURIComponent(m[1]!); } catch { jsonRes(res, 400, { ok: false, error: 'bad_run_id' }); return true; }
+    const view = projectRunById(deps.runsDir, runId);
+    if (!view) { jsonRes(res, 404, { error: 'unknown_run' }); return true; }
+    jsonRes(res, 200, { runId, nodes: view.nodes.filter(node => node.execution).map(node => ({ nodeId: node.id, task: node.goal, ...node.execution })) });
+    return true;
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/v3/execution-profiles') {
+    if (!authed) { jsonRes(res, 401, { ok: false, error: 'auth_required' }); return true; }
+    let body: unknown;
+    try { body = await readJson(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    try { jsonRes(res, 200, { ok: true, profile: profileStore.put(body) }); }
+    catch (error) { jsonRes(res, 422, { ok: false, error: error instanceof Error ? error.message : 'workflow_profile_invalid' }); }
+    return true;
+  }
+
+  const disableProfile = url.pathname.match(/^\/api\/v3\/execution-profiles\/([^/]+)\/disable$/);
+  if (req.method === 'POST' && disableProfile) {
+    if (!authed) { jsonRes(res, 401, { ok: false, error: 'auth_required' }); return true; }
+    try { jsonRes(res, 200, { ok: true, profile: profileStore.disable(decodeURIComponent(disableProfile[1]!)) }); }
+    catch (error) { jsonRes(res, 422, { ok: false, error: error instanceof Error ? error.message : 'workflow_profile_invalid' }); }
+    return true;
+  }
+
+  if (url.pathname.startsWith('/api/v3/execution-profiles')) {
+    jsonRes(res, 405, { ok: false, error: 'method_not_allowed' }); return true;
+  }
+
   // GET /api/v3/runs
   if (req.method === 'GET' && url.pathname === '/api/v3/runs') {
     jsonRes(res, 200, { runs: listRuns(deps.runsDir) });
@@ -59,7 +102,6 @@ export async function handleV3RunsApi(
   }
 
   // GET /api/v3/runs/:id
-  let m: RegExpMatchArray | null;
   if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/v3\/runs\/([^/]+)$/))) {
     let runId: string;
     try {
@@ -202,6 +244,12 @@ function resolveV3RunOwner(runsDir: string, runId: string): V3RunOwnerResolution
     ? grill.chatBinding?.larkAppId?.trim()
     : undefined;
   return larkAppId ? { kind: 'ok', larkAppId } : { kind: 'unroutable' };
+}
+
+async function readJson(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = []; let bytes = 0;
+  for await (const chunk of req) { const value = Buffer.from(chunk); bytes += value.length; if (bytes > 128 * 1024) throw new Error('too_large'); chunks.push(value); }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
 function streamPtyLog(res: ServerResponse, path: string): void {

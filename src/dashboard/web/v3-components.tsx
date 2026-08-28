@@ -4,7 +4,8 @@ import { SectionHeader } from './dashboard-components.js';
 import { confirm } from './confirm-modal.js';
 import { useT } from './react-hooks.js';
 import { ui } from './ui.js';
-import { cancelV3Run, fetchV3RunDetail, fetchV3Runs } from './v3-api.js';
+import { cancelV3Run, disableWorkflowExecutionProfile, fetchV3RunDetail, fetchV3Runs, fetchWorkflowExecutionProfiles, saveWorkflowExecutionProfile } from './v3-api.js';
+import type { WorkflowExecutionProfile } from '../../workflows/v3/execution-profile-store.js';
 import {
   V3_DECISION_LABEL,
   V3_GRAPH,
@@ -113,6 +114,25 @@ function useV3RunDetail(runId: string): DetailPollState {
 function V3ListPage(): React.JSX.Element {
   const tr = useT();
   const runs = useV3RunsList();
+  const [profiles, setProfiles] = useState<WorkflowExecutionProfile[]>([]);
+  const [goal, setGoal] = useState('');
+  const [recommendations, setRecommendations] = useState<Array<{ profileId: string; score: number; coldStart: boolean; reasons: string[] }>>([]);
+  const [form, setForm] = useState({ profileId: '', displayName: '', cli: 'pi', model: '', workingDir: '/data00/repo', costTier: 'medium' });
+  const [profileNotice, setProfileNotice] = useState('');
+  const refreshProfiles = useCallback(async () => {
+    const result = await fetchWorkflowExecutionProfiles(goal); setProfiles(result.profiles); setRecommendations(result.recommendations);
+  }, [goal]);
+  useEffect(() => { void refreshProfiles(); }, [refreshProfiles]);
+  const saveProfile = useCallback(async () => {
+    try {
+      await saveWorkflowExecutionProfile({
+        ...form, schemaVersion: 1, enabled: true, revision: 1, updatedAt: new Date().toISOString(),
+        sandbox: { enabled: true, network: true, readWrite: [form.workingDir], readOnly: [], deny: [] },
+        envPolicy: { inherit: 'safe-host', allow: [], deny: [] }, timeoutPolicy: { defaultSec: 1800, maxSec: 14400 },
+      } as WorkflowExecutionProfile);
+      setProfileNotice('Execution Profile 已保存'); await refreshProfiles();
+    } catch (error) { setProfileNotice(error instanceof Error ? error.message : String(error)); }
+  }, [form, refreshProfiles]);
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
@@ -128,6 +148,22 @@ function V3ListPage(): React.JSX.Element {
         </div>
         {headingActions}
       </div>
+      <section className="overview-block v3r-profile-section">
+        <SectionHeader title="Execution Profiles" hint="Workflow 启动时按 Profile 选择 CLI / 模型 / 工作目录" />
+        <div className="v3r-profile-form">
+          <input value={form.profileId} onChange={e => setForm({ ...form, profileId: e.target.value })} placeholder="Profile ID" />
+          <input value={form.displayName} onChange={e => setForm({ ...form, displayName: e.target.value })} placeholder="显示名称" />
+          <select value={form.cli} onChange={e => setForm({ ...form, cli: e.target.value })}><option>claude-code</option><option>codex</option><option>seed</option><option>traex</option><option>relay</option><option>pi</option></select>
+          <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="Model（可选）" />
+          <input value={form.workingDir} onChange={e => setForm({ ...form, workingDir: e.target.value })} placeholder="绝对 Working Directory" />
+          <select value={form.costTier} onChange={e => setForm({ ...form, costTier: e.target.value })}><option value="low">低成本</option><option value="medium">中成本</option><option value="high">高成本</option></select>
+          <button type="button" onClick={() => void saveProfile()} disabled={!form.profileId || !form.workingDir}>保存 Profile</button>
+        </div>
+        <div className="v3r-recommend-bar"><input value={goal} onChange={e => setGoal(e.target.value)} placeholder="输入任务目标，查看确定性推荐评分" /><button onClick={() => void refreshProfiles()}>评分</button><span>{profileNotice}</span></div>
+        <div className="v3r-profile-table-wrap"><table className="v3r-profile-table"><thead><tr><th>Profile</th><th>CLI</th><th>模型</th><th>工作目录</th><th>成本</th><th>推荐分</th><th>历史</th><th>状态</th></tr></thead><tbody>
+          {profiles.map(profile => { const rec = recommendations.find(item => item.profileId === profile.profileId); return <tr key={profile.profileId}><td><strong>{profile.displayName}</strong><small>{profile.profileId} · r{profile.revision}</small></td><td><code>{profile.cli}</code></td><td>{profile.model || 'CLI 默认'}</td><td><code>{profile.workingDir}</code></td><td>{profile.costTier}</td><td>{rec?.score ?? '—'}{rec?.coldStart ? <small> cold start</small> : null}</td><td title={rec?.reasons.join('\n')}>{rec?.reasons[1] ?? '暂无样本'}</td><td>{profile.enabled ? '启用' : '停用'} {profile.enabled ? <button onClick={() => { if (window.confirm(`停用 ${profile.profileId}？`)) void disableWorkflowExecutionProfile(profile.profileId).then(refreshProfiles); }}>停用</button> : null}</td></tr>; })}
+        </tbody></table></div>
+      </section>
       <section className="overview-block v3r-runs-section">
         <div className="v3r-run-list">
           {runs.length ? runs.map((run) => (
@@ -254,6 +290,12 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           {cancelNotice}
         </div>
       ) : null}
+      {view ? <section className="overview-block v3r-plan-table-section">
+        <SectionHeader title="节点执行计划" hint="Gate-2 冻结后的 CLI / 模型 / 成本 / 超时 / 工作目录 / 风险" />
+        <div className="v3r-profile-table-wrap"><table className="v3r-profile-table"><thead><tr><th>节点</th><th>任务</th><th>Profile / CLI</th><th>模型</th><th>预计成本</th><th>超时</th><th>工作目录</th><th>风险 / Gate</th></tr></thead><tbody>
+          {view.nodes.filter(node => !node.loop).map(node => <tr key={node.id}><td><code>{node.id}</code></td><td>{trunc(node.goal ?? 'host/loop', 52)}</td><td>{node.execution?.profileId ?? node.execution?.selector ?? 'host'}<small>{node.execution?.cli ?? 'deterministic'}</small></td><td>{node.execution?.model ?? 'CLI 默认'}</td><td>{node.execution?.costTier ?? '—'}<small>金额需可信价格表</small></td><td>{node.execution ? `${node.execution.timeoutSec}s` : '—'}</td><td><code>{node.execution?.workingDir ?? '—'}</code></td><td>{node.execution?.riskLevel ?? '—'} / {node.execution?.gated ? '需确认' : '无 Gate'}</td></tr>)}
+        </tbody></table></div>
+      </section> : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader
