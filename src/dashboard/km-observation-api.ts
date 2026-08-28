@@ -79,6 +79,7 @@ export interface KmObservationApiStore {
   listKmConfigAudit?(limit: number): ReturnType<ObservationStore['listKmConfigAudit']>;
   listMemoryPolicyDecisions?(limit: number): ReturnType<ObservationStore['listMemoryPolicyDecisions']>;
   retrievalQualitySummary?(): ReturnType<ObservationStore['retrievalQualitySummary']>;
+  dashboardMetrics?(input?: Parameters<ObservationStore['dashboardMetrics']>[0]): ReturnType<ObservationStore['dashboardMetrics']>;
   evalEvolutionStatus?(): ReturnType<ObservationStore['evalEvolutionStatus']>;
   kmRetentionStatus?(input?: Parameters<ObservationStore['kmRetentionStatus']>[0]): ReturnType<ObservationStore['kmRetentionStatus']>;
   listKmRetentionReports?(limit: number): ReturnType<ObservationStore['listKmRetentionReports']>;
@@ -184,6 +185,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/backend-migrations'
     || url.pathname === '/api/km/config-audit'
     || url.pathname === '/api/km/memory-policy-decisions'
+    || url.pathname === '/api/km/dashboard-metrics'
     || url.pathname === '/api/km/retrieval/quality'
     || url.pathname === '/api/km/retention'
     || url.pathname === '/api/km/retention/reports'
@@ -677,6 +679,11 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/retrieval/quality') {
       if (!store.retrievalQualitySummary) throw new Error('km_retrieval_quality_unavailable');
       jsonRes(res, 200, store.retrievalQualitySummary()); return true;
+    }
+    if (url.pathname === '/api/km/dashboard-metrics') {
+      if (!store.dashboardMetrics) throw new Error('km_dashboard_metrics_unavailable');
+      jsonRes(res, 200, store.dashboardMetrics({ rankingLimit: positiveInteger(url.searchParams.get('rankingLimit'), 10, 50) }));
+      return true;
     }
     if (url.pathname === '/api/km/retention') {
       if (deps.retentionRuntimeStatus) jsonRes(res, 200, await deps.retentionRuntimeStatus());
