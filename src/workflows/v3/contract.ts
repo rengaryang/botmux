@@ -118,14 +118,13 @@ export type { GoalAnswer, GoalAsk } from './event-contract.js';
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
 /**
- * v3 goal-mode is delivered via the native `/goal` command.  Keep this list
- * capability-based and explicit. Claude Code, Codex, Seed, and Traex have
- * direct `/goal` execution evidence (Traex 0.200.16+ also needs its automation
- * hook-trust flag). Relay is admitted from its exact Claude-family adapter and
- * slash-command compatibility with Seed; a Relay-binary smoke remains pending
- * on hosts where that binary is installed. The manifest watcher and goal env
- * contract are CLI-neutral after dispatch. The runtime rejects a run whose
- * nodes resolve to any other CLI at start time.
+ * v3 goal-mode is delivered through a capability-specific command. Claude
+ * Code, Codex, Seed, Traex, and Relay use the native `/goal` command. Pi has no
+ * native `/goal`; it receives an ordinary, file-backed prompt and completion is
+ * determined exclusively by the stable manifest watcher. The same frozen bot,
+ * goal env, sandbox, timeout, cancellation, and outer-worker fence apply to
+ * both paths. Keep this list capability-based and explicit; adding a CLI
+ * requires dispatch and lifecycle contract tests, not just an allowlist edit.
  */
 export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'claude-code',
@@ -133,6 +132,7 @@ export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'seed',
   'traex',
   'relay',
+  'pi',
 ];
 
 export function isV3SupportedCli(cliId: CliId): boolean {
