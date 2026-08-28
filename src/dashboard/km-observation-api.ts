@@ -18,6 +18,7 @@ import {
   createKnowledgeToMemoryImportPreview,
   executeKnowledgeToMemoryImport,
 } from '../services/km/knowledge-to-memory-import.js';
+import type { CentralSinkRuntimeStatus } from '../services/km/central-sink-runtime.js';
 
 export interface KmObservationApiStore {
   schemaVersion(): number;
@@ -39,6 +40,8 @@ export interface KmObservationApiStore {
   listEvalRuns?(limit: number): ReturnType<ObservationStore['listEvalRuns']>;
   decideProposal?(input: Parameters<ObservationStore['decideProposal']>[0]): ReturnType<ObservationStore['decideProposal']>;
   listSyncStatus?(): ReturnType<ObservationStore['listSyncStatus']>;
+  listSyncOutbox?(input: Parameters<ObservationStore['listSyncOutbox']>[0]): ReturnType<ObservationStore['listSyncOutbox']>;
+  configureSyncSink?(input: Parameters<ObservationStore['configureSyncSink']>[0]): ReturnType<ObservationStore['configureSyncSink']>;
   listKmProviders?(): ReturnType<ObservationStore['listKmProviders']>;
   listDistillationJobs?(limit: number): ReturnType<ObservationStore['listDistillationJobs']>;
   listRetrievalAudits?(limit: number): ReturnType<ObservationStore['listRetrievalAudits']>;
@@ -60,6 +63,9 @@ export interface KmObservationApiStore {
   executeKmMutation?<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string; statusCode: number;
     action: string; targetRef: string; beforeHash?: string; afterHash?: (response: T) => string | undefined }, operation: () => T):
     { statusCode: number; response: T; replayed: boolean };
+  getKmMutationReplay?<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string }): { statusCode: number; response: T; replayed: true } | null;
+  recordKmMutation?<T>(input: { actorId: string; idempotencyKey: string; route: string; requestHash: string; statusCode: number;
+    action: string; targetRef: string; response: T; beforeHash?: string; afterHash?: string }): { statusCode: number; response: T; replayed: false };
   listKmConfigAudit?(limit: number): ReturnType<ObservationStore['listKmConfigAudit']>;
   listMemoryPolicyDecisions?(limit: number): ReturnType<ObservationStore['listMemoryPolicyDecisions']>;
   retrievalQualitySummary?(): ReturnType<ObservationStore['retrievalQualitySummary']>;
@@ -90,6 +96,8 @@ export interface KmObservationApiDeps {
   openStore(): Promise<KmObservationApiStore>;
   backendRuntimeStatus?(): Promise<KmBackendRuntimeStatus>;
   retentionRuntimeStatus?(): Promise<KmRetentionRuntimeStatus>;
+  centralSinkRuntimeStatus?(): Promise<CentralSinkRuntimeStatus>;
+  centralSinkDrill?(input: { sinkId: string; drill: 'status' | 'partial-ack' | 'replay' | 'conflict'; actorId: string; idempotencyKey: string }): Promise<Record<string, unknown>>;
 }
 
 class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -133,6 +141,10 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/eval/runs'
     || url.pathname === '/api/km/evolution/proposals'
     || url.pathname === '/api/km/sync/sinks'
+    || url.pathname === '/api/km/sync/outbox'
+    || url.pathname === '/api/km/central-sink/status'
+    || url.pathname === '/api/km/central-sink/sinks'
+    || url.pathname === '/api/km/central-sink/drills'
     || url.pathname === '/api/km/providers'
     || url.pathname === '/api/km/exports'
     || /^\/api\/km\/exports\/[^/]+$/.test(url.pathname)
@@ -213,6 +225,54 @@ export async function handleKmObservationApi(
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw); const config = KmMemoryProviderConfigSchema.parse(body);
       executeMutation(ctx, 200, 'provider.configured', config.providerId, () => ({ providerId: config.providerId,
         configHash: store!.putMemoryProviderConfig!(config), realTransportEnabled: false }), { afterHash: response => response.configHash }); return true;
+    }
+
+    if (url.pathname === '/api/km/central-sink/sinks' && req.method === 'PUT') {
+      if (!store.configureSyncSink) throw new Error('km_sync_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const sinkId = String(body.sinkId ?? '').trim();
+      const endpointRef = String(body.endpointRef ?? '').trim();
+      if (!sinkId || !endpointRef) throw new KmApiError(422, 'km_central_sink_config_required');
+      executeMutation(ctx, 200, 'central_sink.configured', sinkId, () => ({
+        sink: store!.configureSyncSink!({
+          sinkId,
+          protocolVersion: Number(body.protocolVersion ?? 1),
+          endpointRef,
+          enabled: Boolean(body.enabled),
+          redactionPolicy: typeof body.redactionPolicy === 'object' && body.redactionPolicy !== null ? body.redactionPolicy as Record<string, unknown> : {},
+          batchLimit: typeof body.batchLimit === 'number' ? body.batchLimit : undefined,
+          timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : undefined,
+          maxAttempts: typeof body.maxAttempts === 'number' ? body.maxAttempts : undefined,
+          credentialRef: typeof body.credentialRef === 'string' ? body.credentialRef : undefined,
+          allowlist: Array.isArray(body.allowlist) ? body.allowlist.map(String) : undefined,
+          payloadMaxBytes: typeof body.payloadMaxBytes === 'number' ? body.payloadMaxBytes : undefined,
+          rollback: typeof body.rollback === 'object' && body.rollback !== null ? body.rollback as Record<string, unknown> : undefined,
+        }),
+        realTransportEnabled: false,
+      }), { afterHash: response => createHash('sha256').update(JSON.stringify(response.sink)).digest('hex') }); return true;
+    }
+
+    if (url.pathname === '/api/km/central-sink/drills' && req.method === 'POST') {
+      if (!deps.centralSinkDrill) throw new Error('km_central_sink_drill_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const sinkId = String(body.sinkId ?? '').trim();
+      const drill = String(body.drill ?? '').trim();
+      if (!sinkId || !['status','partial-ack','replay','conflict'].includes(drill)) throw new KmApiError(422, 'km_central_sink_drill_invalid');
+      if (!store.getKmMutationReplay || !store.recordKmMutation) throw new Error('km_mutation_guard_unavailable');
+      const replay = store.getKmMutationReplay<Record<string, unknown>>(ctx);
+      if (replay) { jsonRes(res, replay.statusCode, replay.response); return true; }
+      const drillResult = await deps.centralSinkDrill({ sinkId, drill: drill as any, actorId: ctx.actorId, idempotencyKey: ctx.idempotencyKey });
+      const response = { accepted: true, drill, sinkId, realTransportEnabled: false, result: drillResult };
+      const recorded = store.recordKmMutation({
+        ...ctx,
+        statusCode: 200,
+        action: `central_sink.drill.${drill}`,
+        targetRef: sinkId,
+        response,
+        afterHash: createHash('sha256').update(JSON.stringify(drillResult)).digest('hex'),
+      });
+      jsonRes(res, recorded.statusCode, recorded.response);
+      return true;
     }
 
     if (url.pathname === '/api/km/imports' && req.method === 'POST') {
@@ -551,6 +611,25 @@ export async function handleKmObservationApi(
     if (url.pathname === '/api/km/sync/sinks') {
       if (!store.listSyncStatus) throw new Error('km_sync_unavailable');
       jsonRes(res, 200, { items: store.listSyncStatus() });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/central-sink/sinks') {
+      if (!store.listSyncStatus) throw new Error('km_sync_unavailable');
+      jsonRes(res, 200, { items: store.listSyncStatus() });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/sync/outbox') {
+      if (!store.listSyncOutbox) throw new Error('km_sync_unavailable');
+      const sinkId = url.searchParams.get('sinkId') ?? undefined;
+      jsonRes(res, 200, { items: store.listSyncOutbox({ ...(sinkId ? { sinkId } : {}), limit: positiveInteger(url.searchParams.get('limit'), 50, 100) }) });
+      return true;
+    }
+
+    if (url.pathname === '/api/km/central-sink/status') {
+      if (!deps.centralSinkRuntimeStatus) throw new Error('km_central_sink_unavailable');
+      jsonRes(res, 200, await deps.centralSinkRuntimeStatus());
       return true;
     }
 

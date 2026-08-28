@@ -28,6 +28,14 @@ type EvalRun = { evalRunId: string; evaluatorName: string; targetType: string; t
 type EvolutionProposal = { proposalId: string; state: string; proposalType: string; targetRef: string; approvalGrade: string; summary: string };
 type TraceEdge = { edgeId: string; fromType: string; fromId: string; toType: string; toId: string; edgeType: string };
 type SyncStatus = { sinkId: string; endpointRef: string; enabled: boolean; status: string; pending: number; quarantined: number; lastLocalSeq: number; lastAckAt?: string };
+type CentralSinkStatus = {
+  enabled: boolean;
+  leaseName: string;
+  protocol: { envelopeVersion: 1; signing: string; credentialMode: string; realTransportEnabled: false; networkLibrariesAllowed: false };
+  defaults: { batchLimit: number; leaseMs: number; timeoutMs: number; maxAttempts: number };
+  sinks: SyncStatus[];
+  rollback: { automaticRemoteRollback: false; localDisableOnly: true };
+};
 type ProviderStatus = { providerId: string; kind: string; version: string; status: string; descriptor?: { capabilities?: string[]; execution?: string; supportsShadow?: boolean } };
 type DistillationJob = { jobId: string; state: string; botAppId: string; profileId: string; attempts: number; lastError?: string };
 type RetrievalAudit = { retrievalRunId: string; botAppId: string; mode: string; candidateCount: number; eligibleCount: number; latencyMs: number };
@@ -163,6 +171,7 @@ function KmPage(): React.JSX.Element {
   const [traceId, setTraceId] = useState('');
   const [traceEdges, setTraceEdges] = useState<TraceEdge[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus[]>([]);
+  const [centralSink, setCentralSink] = useState<CentralSinkStatus>();
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [jobs, setJobs] = useState<DistillationJob[]>([]);
   const [retrievals, setRetrievals] = useState<RetrievalAudit[]>([]);
@@ -183,12 +192,13 @@ function KmPage(): React.JSX.Element {
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
+  const [sinkForm, setSinkForm] = useState({ sinkId: 'central-mock', endpointRef: 'mock://central', enabled: false, batchLimit: 25, timeoutMs: 5000, maxAttempts: 5, credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET', payloadMaxBytes: 65536 });
   const [importForm, setImportForm] = useState({ source: 'knowledge-items', allowlistedRoots: '', markdownFiles: '', defaultScope: 'workspace', defaultSubject: 'default' });
 
   const load = async (type?: string) => {
     try {
       setError('');
-      const [h, list, knowledgeList, exportList, memoryList, importJobList, evalList, proposalList, syncList, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [h, list, knowledgeList, exportList, memoryList, importJobList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -198,6 +208,7 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: EvalRun[] }>('/api/km/eval/runs?limit=20'),
         getJson<{ items: EvolutionProposal[] }>('/api/km/evolution/proposals?limit=20'),
         getJson<{ items: SyncStatus[] }>('/api/km/sync/sinks'),
+        getJson<CentralSinkStatus>('/api/km/central-sink/status'),
         getJson<{ items: ProviderStatus[] }>('/api/km/providers'),
         getJson<{ items: DistillationJob[] }>('/api/km/distillation/jobs?limit=20'),
         getJson<{ items: RetrievalAudit[] }>('/api/km/retrieval/runs?limit=20'),
@@ -224,6 +235,7 @@ function KmPage(): React.JSX.Element {
       setEvalRuns(evalList.items);
       setProposals(proposalList.items);
       setSyncStatus(syncList.items);
+      setCentralSink(centralSinkStatus);
       setProviders(providerList.items); setJobs(jobList.items); setRetrievals(retrievalList.items); setInjections(injectionList.items);
       setProfiles(profileList.items); setProviderConfigs(providerConfigList.items);
       setBackendRuntime(backendRuntimeStatus); setBackendOutbox(backendOutboxList.items); setBackendMigrations(backendMigrationList.items);
@@ -297,6 +309,26 @@ function KmPage(): React.JSX.Element {
     try { const result = await mutateJson<Record<string, unknown>>(`/api/km/provider-configs/${encodeURIComponent(providerId)}/health`, 'POST', {});
       setNotice(`配置检查：${providerId} = ${String(result.status)}（未发网络请求）`); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const saveSink = async () => {
+    try {
+      await mutateJson('/api/km/central-sink/sinks', 'PUT', {
+        ...sinkForm,
+        protocolVersion: 1,
+        redactionPolicy: { mode: 'allowlisted-metadata-only' },
+        allowlist: [new URL(sinkForm.endpointRef).host].filter(Boolean),
+        rollback: { localDisableOnly: true, automaticRemoteRollback: false },
+      });
+      setNotice('Central sink 配置已保存；真实 transport 仍关闭');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const runSinkDrill = async (sinkId: string, drill: 'status' | 'partial-ack' | 'replay' | 'conflict') => {
+    try {
+      const result = await mutateJson<Record<string, unknown>>('/api/km/central-sink/drills', 'POST', { sinkId, drill });
+      setNotice(`Central sink drill ${drill}: ${JSON.stringify(result.result ?? result)}`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const scanImport = async () => {
     try {
@@ -391,6 +423,7 @@ function KmPage(): React.JSX.Element {
         <article><span>蒸馏积压</span><strong>{(health?.backlog.queued ?? 0) + (health?.backlog.retryWait ?? 0)}</strong></article>
         <article><span>有效模式</span><strong>{health?.capabilities.effectiveModes.join('/') ?? '—'}</strong></article>
         <article><span>Backend Worker</span><strong>{backendRuntime?.enabled ? '已开启' : '未开启'}</strong></article>
+        <article><span>Central Sink</span><strong>{centralSink?.enabled ? '已开启' : '未开启'}</strong></article>
         <article><span>Backend Outbox</span><strong>{backendRuntime?.outbox.pending ?? '—'}/{backendRuntime?.outbox.total ?? '—'}</strong></article>
         <article><span>Backend 隔离</span><strong>{backendRuntime?.outbox.quarantined ?? '—'}</strong></article>
         <article><span>Eval 运行</span><strong>{health?.evalEvolution.evalRuns ?? '—'}</strong></article>
@@ -611,8 +644,30 @@ function KmPage(): React.JSX.Element {
 
       <section className="panel">
         <h2>Central Sink / Sync（默认禁用）</h2>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+          <input value={sinkForm.sinkId} onChange={e => setSinkForm({ ...sinkForm, sinkId: e.target.value })} placeholder="Sink ID" />
+          <input value={sinkForm.endpointRef} onChange={e => setSinkForm({ ...sinkForm, endpointRef: e.target.value })} placeholder="mock://central 或 inmemory://central" />
+          <input value={sinkForm.credentialRef} onChange={e => setSinkForm({ ...sinkForm, credentialRef: e.target.value })} placeholder="env:SECRET_NAME" />
+          <input type="number" min="1" max="100" value={sinkForm.batchLimit} onChange={e => setSinkForm({ ...sinkForm, batchLimit: Number(e.target.value) })} title="Batch limit" />
+          <input type="number" min="100" max="30000" value={sinkForm.timeoutMs} onChange={e => setSinkForm({ ...sinkForm, timeoutMs: Number(e.target.value) })} title="Timeout ms" />
+          <input type="number" min="1" max="50" value={sinkForm.maxAttempts} onChange={e => setSinkForm({ ...sinkForm, maxAttempts: Number(e.target.value) })} title="Max attempts" />
+          <input type="number" min="1024" max="262144" value={sinkForm.payloadMaxBytes} onChange={e => setSinkForm({ ...sinkForm, payloadMaxBytes: Number(e.target.value) })} title="Payload max bytes" />
+          <label><input type="checkbox" checked={sinkForm.enabled} onChange={e => setSinkForm({ ...sinkForm, enabled: e.target.checked })} /> Enabled</label>
+          <button disabled={!sinkForm.sinkId.trim() || !sinkForm.endpointRef.trim()} onClick={() => void saveSink()}>保存 Sink</button>
+        </div>
+        <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          Runtime 需要 BOTMUX_KM_CENTRAL_SINK_ENABLED=true；只执行 mock:// 与 inmemory://。HTTPS/HTTP 仅可保存为关闭配置，不能启用真实传输。
+        </p>
+        {centralSink && <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          protocol v{centralSink.protocol.envelopeVersion} · {centralSink.protocol.signing} · {centralSink.protocol.credentialMode} · rollback: local-disable-only
+        </p>}
         <div className="feedback-deliveries">
-          {syncStatus.map(sink => <div key={sink.sinkId}><code>{sink.sinkId}</code><span>{sink.endpointRef}</span><span>pending {sink.pending} · quarantine {sink.quarantined} · seq {sink.lastLocalSeq}</span><b>{sink.enabled ? sink.status : 'disabled'}</b></div>)}
+          {syncStatus.map(sink => <div key={sink.sinkId}><code>{sink.sinkId}</code><span>{sink.endpointRef}</span><span>pending {sink.pending} · quarantine {sink.quarantined} · seq {sink.lastLocalSeq}</span><b>{sink.enabled ? sink.status : 'disabled'}{' '}
+            <button onClick={() => void runSinkDrill(sink.sinkId, 'status')}>Status</button>{' '}
+            <button onClick={() => void runSinkDrill(sink.sinkId, 'replay')}>Replay</button>{' '}
+            <button onClick={() => void runSinkDrill(sink.sinkId, 'partial-ack')}>Partial Ack</button>{' '}
+            <button onClick={() => void runSinkDrill(sink.sinkId, 'conflict')}>Conflict</button>
+          </b></div>)}
           {syncStatus.length === 0 && <p style={{ color: 'var(--text-dim)' }}>未配置 Sink；本地能力不受影响。</p>}
         </div>
       </section>

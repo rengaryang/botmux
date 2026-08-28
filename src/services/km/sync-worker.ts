@@ -33,12 +33,27 @@ export class MockSyncSinkProvider implements SyncSinkProvider {
   }
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`km_sync_timeout:${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** One bounded pass. The caller owns scheduling; no background network loop is started here. */
 export async function runSyncOnce(input: {
   store: ObservationStore; sinkId: string; sourceHostId: string;
-  provider: SyncSinkProvider; signingSecret: string; limit?: number; now?: number;
+  provider: SyncSinkProvider; signingSecret: string; limit?: number; now?: number; leaseMs?: number;
+  timeoutMs?: number; baseDelayMs?: number; maxAttempts?: number;
 }): Promise<{ attempted: number; accepted: number; quarantined: number; status: SyncBatchAck['status'] | 'idle' }> {
-  const claim = input.store.claimSyncBatch({ sinkId: input.sinkId, limit: input.limit ?? 50, now: input.now });
+  const claim = input.store.claimSyncBatch({ sinkId: input.sinkId, limit: input.limit ?? 50, now: input.now, leaseMs: input.leaseMs });
   if (claim.items.length === 0) return { attempted: 0, accepted: 0, quarantined: 0, status: 'idle' };
   const createdAt = new Date(input.now ?? Date.now()).toISOString();
   const batch: SyncBatch = {
@@ -49,9 +64,13 @@ export async function runSyncOnce(input: {
     createdAt,
   };
   try {
-    const ack = await input.provider.send(batch, signSyncBatch(batch, input.signingSecret));
+    const ack = await withTimeout(
+      input.provider.send(batch, signSyncBatch(batch, input.signingSecret)),
+      Math.max(100, Math.min(input.timeoutMs ?? 5_000, 30_000)),
+      input.sinkId,
+    );
     if (ack.status === 'auth_failed') {
-      input.store.failSyncClaim({ claimToken: claim.claimToken, error: 'auth_failed', now: input.now });
+      input.store.failSyncClaim({ claimToken: claim.claimToken, error: 'auth_failed', now: input.now, baseDelayMs: input.baseDelayMs, maxAttempts: input.maxAttempts });
       return { attempted: claim.items.length, accepted: 0, quarantined: 0, status: ack.status };
     }
     input.store.acknowledgeSync({ sinkId: input.sinkId, batchId: batch.batchId, acceptedEventIds: ack.acceptedEventIds, centralCursor: ack.cursor });
@@ -63,7 +82,7 @@ export async function runSyncOnce(input: {
     }
     return { attempted: claim.items.length, accepted: ack.acceptedEventIds.length, quarantined, status: ack.status };
   } catch (error) {
-    input.store.failSyncClaim({ claimToken: claim.claimToken, error: error instanceof Error ? error.message : String(error), now: input.now });
+    input.store.failSyncClaim({ claimToken: claim.claimToken, error: error instanceof Error ? error.message : String(error), now: input.now, baseDelayMs: input.baseDelayMs, maxAttempts: input.maxAttempts });
     throw error;
   }
 }
