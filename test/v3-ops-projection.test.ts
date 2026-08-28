@@ -9,6 +9,7 @@ import {
   listRuns,
   isValidRunId,
   ptyLogPathFor,
+  summarizeRunReliability,
 } from '../src/workflows/v3/ops-projection.js';
 
 /** Build a run dir with a dag.json + a journal, return its path. */
@@ -109,6 +110,122 @@ describe('v3 ops-projection — projectRun', () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  it('projects timeout/orphan attempt reliability without exposing artifact paths', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-reliability-'));
+    try {
+      const runDir = join(base, 'reliability-260602-0907');
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId: 'reliability-260602-0907',
+        nodes: [
+          { id: 'slow', type: 'goal', goal: 'slow task', depends: [], inputs: [] },
+          { id: 'peer', type: 'goal', goal: 'peer task', depends: [], inputs: [] },
+        ],
+      }));
+      const jp = join(runDir, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId: 'reliability-260602-0907' });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'slow', instanceId: 'slow#001', attemptId: 'slow#001/attempts/001' });
+      appendEvent(jp, {
+        type: 'nodeFailed',
+        nodeId: 'slow',
+        instanceId: 'slow#001',
+        attemptId: 'slow#001/attempts/001',
+        errorClass: 'timeout',
+        errorCode: 'NODE_TIMEOUT',
+      });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'peer', instanceId: 'peer#001', attemptId: 'peer#001/attempts/001' });
+      appendEvent(jp, {
+        type: 'nodeAttemptDrainObserved',
+        nodeId: 'peer',
+        instanceId: 'peer#001',
+        attemptId: 'peer#001/attempts/001',
+        reason: 'orphanRecovery',
+        status: 'pending',
+        leaseReason: 'signal_sent',
+        signal: 'SIGINT',
+        workerPid: 1234,
+        workerProcStart: 'start-a',
+      });
+      appendEvent(jp, {
+        type: 'nodeAttemptDrainObserved',
+        nodeId: 'peer',
+        instanceId: 'peer#001',
+        attemptId: 'peer#001/attempts/001',
+        reason: 'orphanRecovery',
+        status: 'pending',
+        leaseReason: 'signal_sent',
+        signal: 'SIGKILL',
+        workerPid: 1234,
+        workerProcStart: 'start-a',
+      });
+      appendEvent(jp, {
+        type: 'nodeAttemptDrained',
+        nodeId: 'peer',
+        instanceId: 'peer#001',
+        attemptId: 'peer#001/attempts/001',
+        reason: 'orphanRecovery',
+      });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'peer', instanceId: 'peer#001', attemptId: 'peer#001/attempts/002' });
+      appendEvent(jp, {
+        type: 'nodeBlocked',
+        nodeId: 'peer',
+        instanceId: 'peer#001',
+        attemptId: 'peer#001/attempts/002',
+        errorClass: 'workerError',
+        errorCode: 'ORPHAN_RECOVERY_EXHAUSTED',
+      });
+
+      const view = projectRun('reliability-260602-0907', runDir);
+      expect(view.reliability).toMatchObject({
+        dispatchedAttempts: 3,
+        completedAttempts: 3,
+        openAttempts: 0,
+        timeoutFailures: 1,
+        orphanRecoveries: 1,
+        orphanRecoveryRate: 1 / 3,
+        drainObservations: 2,
+        signals: { sigint: 1, sigkill: 1 },
+        orphanRecoveryExhausted: true,
+      });
+      expect(view.reliability.diagnostics.join('\n')).toContain('NODE_TIMEOUT');
+      expect(view.reliability.diagnostics.join('\n')).toContain('ORPHAN_RECOVERY');
+      expect(view.reliability.diagnostics.join('\n')).toContain('SIGKILL_USED');
+      expect(view.reliability.diagnostics.join('\n')).toContain('ORPHAN_RECOVERY_EXHAUSTED');
+      const peer = view.nodes.find((node) => node.id === 'peer')!;
+      expect(peer.reliability).toMatchObject({
+        dispatchedAttempts: 2,
+        completedAttempts: 2,
+        orphanRecoveries: 1,
+        signals: { sigint: 1, sigkill: 1 },
+        orphanRecoveryExhausted: true,
+        lastDrain: {
+          status: 'pending',
+          reason: 'signal_sent',
+          signal: 'SIGKILL',
+          workerPid: 1234,
+          workerProcStart: 'start-a',
+        },
+      });
+      expect(JSON.stringify(view)).not.toContain(runDir);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('v3 ops-projection — reliability summary', () => {
+  it('keeps duplicate close noise from inflating completed attempt counts', () => {
+    const events = [
+      { ts: 1, type: 'nodeDispatched', nodeId: 'a', attemptId: 'a/attempts/001' },
+      { ts: 2, type: 'nodeFailed', nodeId: 'a', attemptId: 'a/attempts/001', errorClass: 'timeout' },
+      { ts: 3, type: 'nodeFailed', nodeId: 'a', attemptId: 'a/attempts/001', errorClass: 'workerError' },
+    ] as const;
+    const summary = summarizeRunReliability(events);
+    expect(summary.dispatchedAttempts).toBe(1);
+    expect(summary.completedAttempts).toBe(1);
+    expect(summary.timeoutFailures).toBe(1);
   });
 });
 

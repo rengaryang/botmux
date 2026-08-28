@@ -218,6 +218,18 @@ export type V3Event =
       reason: 'terminalPeer' | 'obsoleteAttempt' | 'orphanRecovery' | 'runCancellation';
     }
   | {
+      type: 'nodeAttemptDrainObserved';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      reason: 'terminalPeer' | 'obsoleteAttempt' | 'orphanRecovery' | 'runCancellation';
+      status: 'closed' | 'pending' | 'unknown';
+      leaseReason?: string;
+      signal?: 'SIGINT' | 'SIGKILL';
+      workerPid?: number;
+      workerProcStart?: string;
+    }
+  | {
       type: 'nodeRevisitRequested';
       nodeId: string;
       instanceId: string;

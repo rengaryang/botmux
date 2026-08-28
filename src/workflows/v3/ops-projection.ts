@@ -16,7 +16,9 @@ import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { readJournal } from './journal.js';
+import { openV3WorkerAttempts } from './attempt-ledger.js';
 import { materialize, type V3RunStatus } from './state.js';
+import type { StoredEvent } from './event-contract.js';
 import type { V3NodeStatus } from './orchestrator.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
@@ -103,6 +105,9 @@ export interface RunNodeView {
    *  membership ref from the dispatch event.  The id stays opaque — group by
    *  THIS, never parse the id string. */
   loop?: { loopId: string; iteration: number; bodyNodeId: string };
+  /** Read-only workflow reliability projection. No absolute paths or free-text
+   *  worker output are exposed; this is safe for link-shareable run views. */
+  reliability: RunNodeReliabilityView;
 }
 
 export interface RunView {
@@ -111,6 +116,38 @@ export interface RunView {
   failedNodeId?: string;
   blockedNodeId?: string;
   nodes: RunNodeView[];
+  reliability: RunReliabilityView;
+}
+
+export interface RunNodeReliabilityView {
+  dispatchedAttempts: number;
+  completedAttempts: number;
+  openAttempts: number;
+  timeoutFailures: number;
+  orphanRecoveries: number;
+  drainObservations: number;
+  signals: { sigint: number; sigkill: number };
+  orphanRecoveryExhausted: boolean;
+  lastDrain?: {
+    status: 'closed' | 'pending' | 'unknown';
+    reason?: string;
+    signal?: 'SIGINT' | 'SIGKILL';
+    workerPid?: number;
+    workerProcStart?: string;
+  };
+}
+
+export interface RunReliabilityView {
+  dispatchedAttempts: number;
+  completedAttempts: number;
+  openAttempts: number;
+  timeoutFailures: number;
+  orphanRecoveries: number;
+  orphanRecoveryRate: number;
+  drainObservations: number;
+  signals: { sigint: number; sigkill: number };
+  orphanRecoveryExhausted: boolean;
+  diagnostics: string[];
 }
 
 interface DagNodeLite {
@@ -174,6 +211,184 @@ function readDagNodes(runDir: string): DagNodeLite[] {
   }
 }
 
+function emptyNodeReliability(): RunNodeReliabilityView {
+  return {
+    dispatchedAttempts: 0,
+    completedAttempts: 0,
+    openAttempts: 0,
+    timeoutFailures: 0,
+    orphanRecoveries: 0,
+    drainObservations: 0,
+    signals: { sigint: 0, sigkill: 0 },
+    orphanRecoveryExhausted: false,
+  };
+}
+
+function nodeReliability(
+  map: Map<string, RunNodeReliabilityView>,
+  nodeId: string,
+): RunNodeReliabilityView {
+  const existing = map.get(nodeId);
+  if (existing) return existing;
+  const fresh = emptyNodeReliability();
+  map.set(nodeId, fresh);
+  return fresh;
+}
+
+function summarizeReliability(events: readonly StoredEvent[]): {
+  run: RunReliabilityView;
+  nodes: Map<string, RunNodeReliabilityView>;
+} {
+  const nodes = new Map<string, RunNodeReliabilityView>();
+  const dispatched = new Set<string>();
+  const completed = new Set<string>();
+  const dispatchedByNode = new Map<string, Set<string>>();
+  const completedByNode = new Map<string, Set<string>>();
+  let drainObservations = 0;
+  const signals = { sigint: 0, sigkill: 0 };
+
+  for (const event of events) {
+    if (event.type === 'nodeDispatched') {
+      dispatched.add(event.attemptId);
+      const node = nodeReliability(nodes, event.nodeId);
+      const set = dispatchedByNode.get(event.nodeId) ?? new Set<string>();
+      if (!set.has(event.attemptId)) {
+        set.add(event.attemptId);
+        dispatchedByNode.set(event.nodeId, set);
+        node.dispatchedAttempts += 1;
+      }
+      continue;
+    }
+    if (
+      event.type === 'nodeSucceeded' ||
+      event.type === 'nodeFailed' ||
+      event.type === 'nodeBlocked' ||
+      event.type === 'nodeAttemptDrained'
+    ) {
+      completed.add(event.attemptId);
+      const node = nodeReliability(nodes, event.nodeId);
+      const set = completedByNode.get(event.nodeId) ?? new Set<string>();
+      if (!set.has(event.attemptId)) {
+        set.add(event.attemptId);
+        completedByNode.set(event.nodeId, set);
+        node.completedAttempts += 1;
+      }
+      if (event.type === 'nodeFailed' && event.errorClass === 'timeout') node.timeoutFailures += 1;
+      if (event.type === 'nodeAttemptDrained' && event.reason === 'orphanRecovery') node.orphanRecoveries += 1;
+      if (
+        event.type === 'nodeBlocked' &&
+        event.errorCode === 'ORPHAN_RECOVERY_EXHAUSTED'
+      ) node.orphanRecoveryExhausted = true;
+      continue;
+    }
+    if (event.type === 'nodeCancelled' && event.reason === 'runCancelled' && event.attemptId) {
+      completed.add(event.attemptId);
+      const node = nodeReliability(nodes, event.nodeId);
+      const set = completedByNode.get(event.nodeId) ?? new Set<string>();
+      if (!set.has(event.attemptId)) {
+        set.add(event.attemptId);
+        completedByNode.set(event.nodeId, set);
+        node.completedAttempts += 1;
+      }
+      continue;
+    }
+    if (event.type === 'nodeAttemptDrainObserved') {
+      drainObservations += 1;
+      const node = nodeReliability(nodes, event.nodeId);
+      node.drainObservations += 1;
+      node.lastDrain = {
+        status: event.status,
+        ...(event.leaseReason ? { reason: event.leaseReason } : {}),
+        ...(event.signal ? { signal: event.signal } : {}),
+        ...(event.workerPid !== undefined ? { workerPid: event.workerPid } : {}),
+        ...(event.workerProcStart ? { workerProcStart: event.workerProcStart } : {}),
+      };
+      if (event.signal === 'SIGINT') {
+        signals.sigint += 1;
+        node.signals.sigint += 1;
+      } else if (event.signal === 'SIGKILL') {
+        signals.sigkill += 1;
+        node.signals.sigkill += 1;
+      }
+    }
+  }
+
+  let openAttempts: ReturnType<typeof openV3WorkerAttempts> = [];
+  try {
+    openAttempts = openV3WorkerAttempts(events);
+    for (const attempt of openAttempts) {
+      nodeReliability(nodes, attempt.nodeId).openAttempts += 1;
+    }
+  } catch {
+    // The runtime path fails closed on ledger corruption. The read-only
+    // projection keeps reporting the durable counters it can still compute.
+  }
+
+  const nodeValues = [...nodes.values()];
+  const dispatchedAttempts = dispatched.size;
+  const orphanRecoveries = nodeValues.reduce((sum, item) => sum + item.orphanRecoveries, 0);
+  const timeoutFailures = nodeValues.reduce((sum, item) => sum + item.timeoutFailures, 0);
+  const orphanRecoveryExhausted = nodeValues.some((item) => item.orphanRecoveryExhausted);
+  const diagnostics: string[] = [];
+  const goalCliTimeouts = events.filter(
+    (event) => event.type === 'runCancelRequested' && event.reason === 'goal-cli-timeout',
+  ).length;
+  if (goalCliTimeouts > 0) {
+    diagnostics.push(
+      'GOAL_CLI_TIMEOUT: outer goal-run timeout requested bounded cancellation; the external caller must re-drive the same runId or raise its own 900s budget.',
+    );
+  }
+  if (openAttempts.length > 0) {
+    diagnostics.push(
+      `OPEN_ATTEMPTS: ${openAttempts.length} attempt(s) still lack durable close proof; re-drive the same runId to drain or recover, not a new run.`,
+    );
+  }
+  if (timeoutFailures > 0) {
+    diagnostics.push(
+      `NODE_TIMEOUT: ${timeoutFailures} attempt(s) exceeded their bounded timeout; increase node timeoutSec or the goal-run --timeout only when the work genuinely needs more time.`,
+    );
+  }
+  if (orphanRecoveries > 0) {
+    diagnostics.push(
+      `ORPHAN_RECOVERY: ${orphanRecoveries} attempt(s) were drained after driver loss; replacement attempts are journal-numbered to avoid duplicate dispatch directories.`,
+    );
+  }
+  if (signals.sigkill > 0) {
+    diagnostics.push(
+      `SIGKILL_USED: ${signals.sigkill} external drain signal(s) escalated past SIGINT grace; inspect worker shutdown responsiveness.`,
+    );
+  }
+  if (orphanRecoveryExhausted) {
+    diagnostics.push(
+      'ORPHAN_RECOVERY_EXHAUSTED: automatic orphan recovery reached its cap; inspect daemon/CLI stability before manually retrying the blocked attempt.',
+    );
+  }
+
+  return {
+    run: {
+      dispatchedAttempts,
+      completedAttempts: completed.size,
+      openAttempts: openAttempts.length,
+      timeoutFailures,
+      orphanRecoveries,
+      orphanRecoveryRate: dispatchedAttempts === 0 ? 0 : orphanRecoveries / dispatchedAttempts,
+      drainObservations,
+      signals,
+      orphanRecoveryExhausted,
+      diagnostics,
+    },
+    nodes,
+  };
+}
+
+export function summarizeRunReliability(events: readonly StoredEvent[]): RunReliabilityView {
+  return summarizeReliability(events).run;
+}
+
+export function summarizeRunNodeReliability(events: readonly StoredEvent[]): Map<string, RunNodeReliabilityView> {
+  return summarizeReliability(events).nodes;
+}
+
 /**
  * Project an already-resolved run dir into a `RunView`.  Read-only + defensive:
  * a missing journal / dag still yields a (possibly sparse) view rather than
@@ -196,12 +411,15 @@ export function projectRun(runId: string, runDir: string): RunView {
   }
   const snap = materialize(events);
   const dagNodes = readDagNodes(runDir);
+  const reliabilitySummary = summarizeReliability(events);
+  const reliability = reliabilitySummary.run;
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
   const manifests = new Map<string, string>();
   const errors = new Map<string, { errorClass: string; errorCode?: string }>();
   const loopRefs = new Map<string, { loopId: string; iteration: number; bodyNodeId: string }>();
   const loopDecisions = new Map<string, Array<{ iteration: number; decision: 'exit' | 'continue' | 'exhausted' }>>();
+  const reliabilityByNode = reliabilitySummary.nodes;
   for (const e of events) {
     if (e.type === 'nodeSessionReady') {
       sessions.set(e.nodeId, { ...e.sessionInfo, ptyLogPath: e.ptyLogPath });
@@ -259,6 +477,7 @@ export function projectRun(runId: string, runDir: string): RunView {
       attemptId: snap.attempts.get(id),
       hasPtyLog: Boolean(sess?.ptyLogPath),
       hasManifest: manifests.has(id),
+      reliability: reliabilityByNode.get(id) ?? emptyNodeReliability(),
     };
     if (sess) {
       view.webTerminal = {
@@ -297,6 +516,7 @@ export function projectRun(runId: string, runDir: string): RunView {
     failedNodeId: snap.failedNodeId,
     blockedNodeId: snap.blockedNodeId,
     nodes,
+    reliability,
   };
 }
 

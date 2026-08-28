@@ -56,6 +56,7 @@ import {
   type V3ManualCliRunEnvelope,
 } from './run-envelope.js';
 import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
+import { summarizeRunReliability } from './ops-projection.js';
 import {
   createDefaultHostExecutorRegistry,
   createDefaultProviderReconcilers,
@@ -202,6 +203,21 @@ function printOutcome(runDir: string): void {
       const ge = e as any;
       console.log(`  🛑 ${ge.nodeId}  gate → ${ge.resolution} (by ${ge.by})`);
     }
+  }
+  const reliability = summarizeRunReliability(events);
+  if (
+    reliability.openAttempts > 0 ||
+    reliability.timeoutFailures > 0 ||
+    reliability.orphanRecoveries > 0 ||
+    reliability.drainObservations > 0
+  ) {
+    console.log(`\n── 可靠性诊断 ──`);
+    console.log(`  attempts: dispatched=${reliability.dispatchedAttempts}, completed=${reliability.completedAttempts}, open=${reliability.openAttempts}`);
+    console.log(`  timeout=${reliability.timeoutFailures}, orphanRecovery=${reliability.orphanRecoveries}, orphanRate=${reliability.orphanRecoveryRate.toFixed(3)}`);
+    if (reliability.signals.sigint || reliability.signals.sigkill) {
+      console.log(`  drain signals: SIGINT=${reliability.signals.sigint}, SIGKILL=${reliability.signals.sigkill}`);
+    }
+    for (const diagnostic of reliability.diagnostics) console.log(`  - ${diagnostic}`);
   }
 }
 

@@ -280,6 +280,39 @@ describe('runWorkflow — Saved Workflow parameter isolation', () => {
   });
 });
 
+describe('runWorkflow — worker timeout diagnostics', () => {
+  it('classifies a bounded worker deadline as timeout instead of generic workerError', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-timeout-'));
+    try {
+      const dag = validateDag({
+        runId: 'timeout-classification',
+        nodes: [{ id: 'slow', type: 'goal', goal: 'wait', depends: [], inputs: [] }],
+      });
+      const runNode: RunNode = async (req) => ({
+        status: 'fail',
+        diagnosticReason: 'timeout',
+        manifestPath: req.env[GOAL_ENV.MANIFEST_PATH]!,
+      });
+      const outcome = await runWorkflow(dag, {
+        runNode,
+        validateManifest,
+        resolveBotSnapshot,
+      }, { baseDir: base });
+
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'failed', failedNodeId: 'slow' });
+      const events = readJournal(join(base, 'timeout-classification', 'journal.ndjson'));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'nodeFailed',
+        nodeId: 'slow',
+        errorClass: 'timeout',
+        errorCode: 'NODE_TIMEOUT',
+      }));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('runWorkflow — model override reaches the worker snapshot', () => {
   it('envelope-backed run uses frozen snapshots and never rewrites authorized artifacts', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-rt-pinned-'));

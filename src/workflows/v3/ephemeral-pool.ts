@@ -461,6 +461,7 @@ async function runNodeImpl(
           status: 'cancelled',
           manifestPath,
           cancelReason,
+        diagnosticReason: 'cancelled',
           sessionInfo: sessionInfo(),
         });
         return;
@@ -469,7 +470,7 @@ async function runNodeImpl(
       const status = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
       const reason = pendingResult?.reason ?? 'worker-exit';
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
-      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
+      resolve({ status, manifestPath, diagnosticReason: reason, sessionInfo: sessionInfo() });
     });
 
     try {

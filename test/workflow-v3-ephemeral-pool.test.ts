@@ -333,6 +333,36 @@ describe('v3 ephemeral pool', () => {
     });
   });
 
+  it('bounds cancellation escalation from SIGINT to SIGKILL when the worker ignores close', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const ac = new AbortController();
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      cancelGraceMs: 5,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode({ ...request(), cancelSignal: ac.signal });
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+
+    ac.abort('user-requested');
+    await waitFor(() => worker.kills.includes('SIGINT'));
+    await waitFor(() => worker.kills.includes('SIGKILL'));
+    expect(worker.kills.indexOf('SIGINT')).toBeLessThan(worker.kills.indexOf('SIGKILL'));
+
+    worker.emitExit(137);
+    await expect(promise).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: 'user-requested',
+      diagnosticReason: 'cancelled',
+    });
+  });
+
   it('returns cancelled without resolving secrets or spawning when already aborted', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);
@@ -622,6 +652,34 @@ describe('v3 ephemeral pool', () => {
     await waitFor(() => worker.kills.includes('SIGTERM'));
     worker.emitExit(0);
     await expect(promise).resolves.toMatchObject({ status: 'ok' });
+  });
+
+  it('reports hard deadline timeout and bounds close escalation to SIGTERM then SIGKILL', async () => {
+    const worker = new ScriptedWorker({ autoReadyAfterInit: true });
+    const factory = factoryFor(worker);
+    const req = { ...request(), timeoutMs: 5 };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      cancelGraceMs: 5,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    await waitFor(() => worker.readyEmitted);
+    worker.emitMessage({ type: 'prompt_ready' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    await waitFor(() => worker.kills.includes('SIGKILL'));
+
+    worker.emitExit(1);
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      diagnosticReason: 'timeout',
+      manifestPath: req.env[GOAL_ENV.MANIFEST_PATH],
+    });
+    expect(worker.kills.indexOf('SIGTERM')).toBeLessThan(worker.kills.indexOf('SIGKILL'));
   });
 });
 

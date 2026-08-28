@@ -17,6 +17,7 @@ import { validateDag, MAX_NODE_TIMEOUT_SEC, type V3Dag } from './dag.js';
 import { v3DriveLeaseTarget } from './drive-lease.js';
 import { createEphemeralPool } from './ephemeral-pool.js';
 import { readJournal, type StoredEvent } from './journal.js';
+import { summarizeRunReliability } from './ops-projection.js';
 import { readAndValidateManifest, ManifestValidationError } from './manifest.js';
 import { runWorkflow, type V3RuntimeDeps } from './runtime.js';
 import { materialize, type V3RunStatus } from './state.js';
@@ -86,6 +87,7 @@ export interface GoalRunResultV1 {
   exitCode: number;
   summary?: string;
   error?: { code: string; message: string };
+  diagnostics?: string[];
   artifacts?: ManifestFile[];
   runDirectory?: {
     path: string;
@@ -285,6 +287,7 @@ export async function projectGoalRunTerminal(
         message: settle.message ?? `${settle.type === 'nodeBlocked' ? 'goal blocked' : 'goal failed'} (${settle.errorClass})`,
       }
     : undefined;
+  const reliability = summarizeRunReliability(events);
   return {
     schemaVersion: GOAL_RUN_RESULT_SCHEMA,
     runId,
@@ -292,6 +295,7 @@ export async function projectGoalRunTerminal(
     exitCode: exitCodeFor(snapshot.runStatus),
     ...(manifest?.summary ? { summary: manifest.summary } : {}),
     ...(error ? { error } : {}),
+    ...(reliability.diagnostics.length ? { diagnostics: reliability.diagnostics } : {}),
     ...(manifest?.files.length ? { artifacts: manifest.files } : {}),
     runDirectory: { path: runDir, stability: 'informative-only' },
   };
@@ -353,18 +357,22 @@ async function executeGoalRun(args: GoalRunArgs, deps: GoalCliDependencies): Pro
   // signal/timeout that arrives during authorization is remembered and becomes
   // the runtime's durable cancellation cut as soon as the journal starts.
   const abortController = new AbortController();
-  const abort = (): void => {
-    if (!abortController.signal.aborted) abortController.abort('goal-cli');
+  const abort = (reason: unknown): void => {
+    if (!abortController.signal.aborted) abortController.abort(reason);
   };
-  deps.signalEmitter.on('SIGINT', abort);
-  deps.signalEmitter.on('SIGTERM', abort);
-  const timeout = args.timeoutMs === undefined ? undefined : setTimeout(abort, args.timeoutMs);
+  const abortOnSigint = (): void => abort({ kind: 'goalCliSignal', signal: 'SIGINT' });
+  const abortOnSigterm = (): void => abort({ kind: 'goalCliSignal', signal: 'SIGTERM' });
+  deps.signalEmitter.on('SIGINT', abortOnSigint);
+  deps.signalEmitter.on('SIGTERM', abortOnSigterm);
+  const timeout = args.timeoutMs === undefined
+    ? undefined
+    : setTimeout(() => abort({ kind: 'goalCliTimeout', timeoutMs: args.timeoutMs }), args.timeoutMs);
   try {
     return await executeGoalRunCore(args, deps, abortController.signal);
   } finally {
     if (timeout) clearTimeout(timeout);
-    deps.signalEmitter.off('SIGINT', abort);
-    deps.signalEmitter.off('SIGTERM', abort);
+    deps.signalEmitter.off('SIGINT', abortOnSigint);
+    deps.signalEmitter.off('SIGTERM', abortOnSigterm);
   }
 }
 

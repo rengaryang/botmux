@@ -344,6 +344,13 @@ describe('botmux goal run — machine terminal contract', () => {
     const events = readJournal(join(base, result.runId!, 'journal.ndjson'));
     expect(materialize(events).runStatus).toBe('cancelled');
     expect(events.at(-1)?.type).toBe('runCancelled');
+    if (!signal) {
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'runCancelRequested',
+        reason: 'goal-cli-timeout',
+      }));
+      expect(result.diagnostics?.join('\n')).toContain('GOAL_CLI_TIMEOUT');
+    }
   });
 
   it.runIf(process.platform === 'linux')('kill -9 leaves a retryable journal; same runId re-drives as attempt 002', async () => {

@@ -227,6 +227,10 @@ export interface RunNodeResult {
    *  (runtime validates the manifest at `manifestPath` after `runNode`
    *  resolves — codex point 4: NOT v0.2 final_output semantics). */
   status: 'ok' | 'fail' | 'cancelled';
+  /** Non-secret pool diagnostic for the process-level settlement path. Runtime
+   *  uses bounded vocabulary values such as `timeout` for journal
+   *  classification; callers must not treat this as user-authored content. */
+  diagnosticReason?: string;
   /** Preserved AbortSignal.reason for a cancelled worker. The runtime treats
    *  this as audit/control metadata only; it is never rendered to users. */
   cancelReason?: unknown;
