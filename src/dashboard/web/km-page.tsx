@@ -11,7 +11,9 @@ import {
 } from './km-dashboard-components.js';
 import {
   buildKmDashboardModel,
+  buildKmDashboardModelFromMetrics,
   KM_DASHBOARD_EXPECTED_CONTRACT,
+  type KmOpsMetricsRaw,
   type KmOpsTabId,
 } from './km-dashboard-model.js';
 
@@ -259,6 +261,7 @@ function KmPage(): React.JSX.Element {
   const [goldenCases, setGoldenCases] = useState<GoldenCase[]>([]);
   const [shadowComparisons, setShadowComparisons] = useState<ShadowComparison[]>([]);
   const [shadowReadiness, setShadowReadiness] = useState<ShadowReadiness>();
+  const [dashboardMetrics, setDashboardMetrics] = useState<KmOpsMetricsRaw>();
   const [goldenForm, setGoldenForm] = useState({ title: '', queryRedacted: '', claimKey: '', claimTextHash: `sha256:${'0'.repeat(64)}` });
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
@@ -279,7 +282,11 @@ function KmPage(): React.JSX.Element {
     try {
       setLoading(true);
       setError('');
-      const [h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+        getJson<KmOpsMetricsRaw>('/api/km/dashboard-metrics?rankingLimit=10').then(
+          metrics => ({ ok: true as const, metrics }),
+          error => ({ ok: false as const, error }),
+        ),
         getJson<Health>('/api/km/health'),
         getJson<{ items: ObservationEvent[] }>(`/api/km/observations?limit=100${type ? `&type=${encodeURIComponent(type)}` : ''}`),
         getJson<{ items: KnowledgeItem[] }>('/api/km/knowledge?limit=20'),
@@ -326,6 +333,8 @@ function KmPage(): React.JSX.Element {
       setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items); setRetrievalQuality(quality);
       setRetention(retentionStatus);
       setGoldenCases(goldenList.items); setShadowComparisons(comparisonList.items); setShadowReadiness(readiness);
+      setDashboardMetrics(metricsResult.ok ? metricsResult.metrics : undefined);
+      if (!metricsResult.ok) console.warn('KM dashboard metrics API unavailable, using fallback model', metricsResult.error);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -596,7 +605,7 @@ function KmPage(): React.JSX.Element {
 
   const funnel = funnelCounts(events);
   const maxFunnel = Math.max(1, ...Object.values(funnel));
-  const dashboardModel = useMemo(() => buildKmDashboardModel({
+  const dashboardModel = useMemo(() => dashboardMetrics ? buildKmDashboardModelFromMetrics(dashboardMetrics) : buildKmDashboardModel({
     health,
     knowledge,
     memory,
@@ -609,7 +618,7 @@ function KmPage(): React.JSX.Element {
     backendRuntime,
     centralSink,
     shadowReadiness,
-  }), [health, knowledge, memory, importJobs, retrievalQuality, retention, productionGates, events, retrievals, backendRuntime, centralSink, shadowReadiness]);
+  }), [dashboardMetrics, health, knowledge, memory, importJobs, retrievalQuality, retention, productionGates, events, retrievals, backendRuntime, centralSink, shadowReadiness]);
   const selectTab = (tab: KmOpsTabId) => {
     setActiveTab(tab);
     persistKmTab(tab);

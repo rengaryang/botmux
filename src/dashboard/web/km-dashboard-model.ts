@@ -58,7 +58,7 @@ export type KmRankingItem = {
 
 export type KmDashboardModel = {
   generatedAt: string;
-  source: 'fallback';
+  source: 'fallback' | 'metrics-api';
   summary: string;
   kpis: KmMetricPoint[];
   layerDistribution: KmDistributionSlice[];
@@ -97,6 +97,55 @@ type ImportJobLike = { state?: string };
 type BackendRuntimeLike = { enabled?: boolean; outbox?: { pending?: number; total?: number; quarantined?: number } };
 type CentralSinkLike = { enabled?: boolean };
 type ShadowReadinessLike = { ready?: boolean; reasonCodes?: string[] };
+
+export type KmOpsMetricsRaw = {
+  schemaVersion: 1;
+  source: 'sqlite';
+  generatedAt: string;
+  kpis: {
+    totalKnowledge: number;
+    activeMemory: number;
+    healthPercent: number;
+    retrievalRuns: number;
+    auditEvents: number;
+  };
+  totals: {
+    knowledgeTotal: number;
+    knowledgeUsable: number;
+    memoryTotal: number;
+    memoryActive: number;
+    memoryUsable: number;
+    retrievalTotal: number;
+    retrievalLast7d: number;
+    retrievalLast30d: number;
+    wouldInjectTotal: number;
+    actualInjectTotal: number;
+    auditEventsTotal: number;
+    pendingReviewTotal: number;
+    conflictTotal: number;
+    staleKnowledge: number;
+    staleMemory: number;
+  };
+  distributions: {
+    knowledgeByLayer: Array<{ key: string; count: number }>;
+    knowledgeByState: Array<{ key: string; count: number }>;
+    memoryByState: Array<{ key: string; count: number }>;
+    memoryByScope: Array<{ key: string; count: number }>;
+    knowledgeByFreshness: Array<{ key: string; count: number }>;
+    knowledgeByCategory: Array<{ key: string; count: number }>;
+  };
+  trends: {
+    last7d: Array<{ date: string; knowledgeCreated: number; memoryCreated: number; retrievalRuns: number; wouldInject: number; actualInject: number }>;
+  };
+  rankings: {
+    recallHot: Array<{ itemId: string; itemKind: string; title: string; count: number; lastSeenAt: string; state?: string; targetLayer?: string; category?: string; scope?: string }>;
+    readHot: Array<{ itemId: string; itemKind: string; title: string; count: number; lastSeenAt: string; state?: string; targetLayer?: string; category?: string; scope?: string }>;
+    pendingReview: Array<{ itemId: string; itemKind: string; title: string; state: string; updatedAt: string; ageDays: number; targetLayer?: string; category?: string; scope?: string }>;
+    conflicts: Array<{ itemId: string; itemKind: string; title: string; state: string; updatedAt: string; ageDays: number; targetLayer?: string; category?: string; scope?: string }>;
+    stale: Array<{ itemId: string; itemKind: string; title: string; state: string; updatedAt: string; ageDays: number; targetLayer?: string; category?: string; scope?: string }>;
+  };
+  emptyStates: Array<{ key: string; empty: boolean; title: string; detail: string }>;
+};
 
 export type KmDashboardModelInput = {
   health?: HealthLike;
@@ -173,6 +222,12 @@ function distribution(counts: Record<string, number>, labels: Record<string, str
     }));
 }
 
+function distributionFromBuckets(items: Array<{ key: string; count: number }>, labels: Record<string, string> = {}): KmDistributionSlice[] {
+  const counts: Record<string, number> = {};
+  for (const item of items) counts[item.key] = (counts[item.key] ?? 0) + item.count;
+  return distribution(counts, labels);
+}
+
 function topN(counts: Record<string, number>, limit: number): Array<[string, number]> {
   return Object.entries(counts)
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -195,6 +250,77 @@ function eventTrend(events: EventLike[], retrievals: RetrievalLike[], gates: Pro
     });
   }
   return days;
+}
+
+function shortDateLabel(date: string): string {
+  const parts = date.split('-');
+  if (parts.length === 3) return `${Number(parts[1])}/${Number(parts[2])}`;
+  return date;
+}
+
+function rankMeta(item: { itemKind: string; state?: string; targetLayer?: string; category?: string; scope?: string; lastSeenAt?: string }): string {
+  const parts = [
+    item.itemKind === 'knowledge' ? (LAYER_LABELS[item.targetLayer ?? ''] ?? item.targetLayer) : item.scope,
+    STATE_LABELS[item.state ?? ''] ?? item.state,
+    item.category,
+  ].filter(Boolean);
+  return parts.length ? parts.join(' · ') : (item.lastSeenAt ? `最后命中 ${item.lastSeenAt.slice(0, 10)}` : 'metrics API');
+}
+
+export function buildKmDashboardModelFromMetrics(metrics: KmOpsMetricsRaw): KmDashboardModel {
+  const conflictTotal = num(metrics.totals.conflictTotal);
+  const pendingReviewTotal = num(metrics.totals.pendingReviewTotal);
+  const staleTotal = num(metrics.totals.staleKnowledge) + num(metrics.totals.staleMemory);
+  const totalItems = num(metrics.totals.knowledgeTotal) + num(metrics.totals.memoryTotal);
+  const categoryBuckets = metrics.distributions.knowledgeByCategory.length
+    ? metrics.distributions.knowledgeByCategory
+    : metrics.distributions.memoryByScope;
+  const hotKnowledgeSource = metrics.rankings.readHot.length
+    ? metrics.rankings.readHot
+    : metrics.rankings.pendingReview;
+
+  return {
+    generatedAt: metrics.generatedAt,
+    source: 'metrics-api',
+    summary: totalItems > 0
+      ? `指标来自 SQLite 聚合：${metrics.totals.knowledgeTotal} 条知识、${metrics.totals.memoryTotal} 条记忆，近 30 天召回 ${metrics.totals.retrievalLast30d} 次。`
+      : '暂无知识指标，已接入 metrics API 并等待本地观测数据写入。',
+    kpis: [
+      { key: 'knowledge', label: '知识总量', value: metrics.kpis.totalKnowledge, unit: '条', helper: `可用 ${metrics.totals.knowledgeUsable} 条`, tone: 'blue', tooltip: '来自 /api/km/dashboard-metrics 的 totalKnowledge。' },
+      { key: 'memory', label: '在用记忆', value: metrics.kpis.activeMemory, unit: '条', helper: `总记忆 ${metrics.totals.memoryTotal} 条`, tone: 'ink', tooltip: 'active 且未过期的本地 memory item 数。' },
+      { key: 'health', label: '健康知识占比', value: metrics.kpis.healthPercent, unit: '%', helper: staleTotal ? `陈旧/过期 ${staleTotal} 条` : '无陈旧项', tone: 'cyan', tooltip: '知识与记忆可用项占总项的百分比。' },
+      { key: 'retrieval', label: '召回运行次数', value: metrics.kpis.retrievalRuns, unit: '次', helper: `近 7 天 ${metrics.totals.retrievalLast7d} 次`, tone: 'green', tooltip: '近 30 天 retrieval_runs 聚合计数。' },
+      { key: 'audit', label: '审计与闸门', value: metrics.kpis.auditEvents, unit: '项', helper: pendingReviewTotal ? `待复核 ${pendingReviewTotal} 项` : '无待复核项', tone: 'slate', tooltip: '观测、配置、导入和 production gate 审计事件总数。' },
+    ],
+    layerDistribution: distributionFromBuckets(metrics.distributions.knowledgeByLayer, LAYER_LABELS),
+    healthDistribution: distributionFromBuckets(metrics.distributions.knowledgeByFreshness, HEALTH_LABELS),
+    stateDistribution: distributionFromBuckets([...metrics.distributions.knowledgeByState, ...metrics.distributions.memoryByState], STATE_LABELS),
+    categoryDistribution: distributionFromBuckets(categoryBuckets),
+    trend: metrics.trends.last7d.map(point => ({
+      label: shortDateLabel(point.date),
+      observations: num(point.knowledgeCreated) + num(point.memoryCreated),
+      retrievals: num(point.retrievalRuns),
+      gates: num(point.wouldInject) + num(point.actualInject),
+    })),
+    hotSkills: metrics.rankings.recallHot.map(item => ({
+      id: item.itemId,
+      title: item.title,
+      value: item.count,
+      meta: rankMeta(item),
+    })),
+    hotKnowledge: hotKnowledgeSource.map(item => ({
+      id: item.itemId,
+      title: item.title,
+      value: 'count' in item ? item.count : 1,
+      meta: rankMeta(item),
+    })),
+    riskBadges: [
+      { label: 'Metrics API 已接入', tone: 'ok', detail: `数据源 ${metrics.source}，最近生成 ${metrics.generatedAt.slice(0, 19)}` },
+      { label: pendingReviewTotal ? '存在待复核项' : '无待复核项', tone: pendingReviewTotal ? 'warn' : 'ok', detail: pendingReviewTotal ? `需要复核 ${pendingReviewTotal} 条知识或记忆` : '审核队列为空' },
+      { label: conflictTotal ? '存在冲突项' : '无冲突项', tone: conflictTotal ? 'danger' : 'ok', detail: conflictTotal ? `冲突或隔离 ${conflictTotal} 条` : '未发现冲突或隔离数据' },
+      { label: staleTotal ? '存在陈旧项' : '新鲜度正常', tone: staleTotal ? 'warn' : 'ok', detail: staleTotal ? `陈旧知识/记忆 ${staleTotal} 条` : '没有过期或待复核的陈旧项' },
+    ],
+  };
 }
 
 export function buildKmDashboardModel(input: KmDashboardModelInput): KmDashboardModel {
