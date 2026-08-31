@@ -86,13 +86,10 @@ import {
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
-<<<<<<< HEAD
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
-=======
 import { getSkillFeedbackStore, type TurnCompletionEventPayload } from './services/skill-feedback-store.js';
->>>>>>> 9dff85c4 (feat(km): complete P0 memory data loop)
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
@@ -379,7 +376,7 @@ import {
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, tryHandleInteractiveModelCommand } from './core/command-handler.js';
 import { parseTopicHeader, parseTopicHeaderWithLifecycleAliases, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
@@ -21960,6 +21957,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
+    const existingInteractiveDs = activeSessions.get(sessionKey(anchor, larkAppId));
+    if (await tryHandleInteractiveModelCommand({
+      cmd,
+      commandContent,
+      rootId: anchor,
+      messageId: parsed.messageId,
+      invokerOpenId: senderOpenId,
+      ds: existingInteractiveDs,
+      deps: invocationDeps,
+    })) return;
     if (forceTopicMode !== 'worktree' && resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
@@ -24090,6 +24097,15 @@ async function handleThreadReplyAdmitted(
     const passthroughCliId = existingDs?.session.cliLaunchSnapshot?.cliId
       ?? existingDs?.session.cliId
       ?? getBot(larkAppId).config.cliId;
+    if (await tryHandleInteractiveModelCommand({
+      cmd,
+      commandContent,
+      rootId: anchor,
+      messageId: parsed.messageId,
+      invokerOpenId: threadSenderOpenId,
+      ds: existingDs,
+      deps: invocationDeps,
+    })) return;
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
