@@ -90,7 +90,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, mojoLivePatchForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -120,6 +120,10 @@ import { hasProtectedSessionMutationOwnership } from '../../core/session-mutatio
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
+import { buildModelChoicesResponse } from '../../services/model-catalog.js';
+import { interactiveModelCapability } from '../../services/interactive-cli-commands.js';
+import { claimModelPickerBinding, issueModelPickerBinding } from '../../services/model-picker-state.js';
+import { buildModelPickerCard, buildModelPickerResolvedCard } from './model-picker-card.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -1478,6 +1482,101 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       createClient: (appId: string) => createDaemonClientFor(appId),
       locale: overviewLocale,
     });
+  }
+
+  // ─── CLI interactive command picker: `/model` ────────────────────────
+  if (
+    typeof value?.action === 'string'
+    && ['cli_model_provider', 'cli_model_search', 'cli_model_page', 'cli_model_select'].includes(value.action)
+    && larkAppId
+  ) {
+    const loc = localeForBot(larkAppId);
+    const nonce = value.nonce;
+    const binding = typeof nonce === 'string'
+      ? claimModelPickerBinding(nonce, { larkAppId, invokerOpenId: operatorOpenId })
+      : undefined;
+    if (!binding) {
+      return { toast: { type: 'warning', content: '模型选择卡已过期，请重新发送 `/model`。' } };
+    }
+    if (!operatorOpenId || operatorOpenId !== binding.invokerOpenId) {
+      return { toast: { type: 'error', content: '只有发起该选择器的用户可以操作。' } };
+    }
+    // Every security-relevant field comes from the one-shot server binding.
+    // action.value is untrusted and is used only for cosmetic filter state.
+    const ds = getSessionByActionValue(
+      activeSessions,
+      binding.rootId,
+      larkAppId,
+      binding.sessionId,
+      value.action,
+    );
+    if (!ds || ds.session.sessionId !== binding.sessionId || sessionCliId(ds) !== binding.cliId) {
+      return { toast: { type: 'warning', content: '会话或 CLI 已变化，请重新发送 `/model`。' } };
+    }
+    if (!canTalk(ds.larkAppId, ds.chatId, operatorOpenId, undefined, undefined, ds.chatType)
+      && !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      return { toast: { type: 'warning', content: '当前用户没有操作此会话的权限。' } };
+    }
+    const capability = interactiveModelCapability(binding.cliId);
+    if (capability.sessionMode !== 'raw_input') {
+      return { toast: { type: 'warning', content: '当前 CLI 不支持会话内快捷切换模型。' } };
+    }
+    if (!ds.worker || ds.worker.killed || !workerHasInitialized(ds)) {
+      return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+    }
+    if (capability.requiresIdle && !isLiveWorkerIdleOrLimited(ds)) {
+      return { toast: { type: 'warning', content: '当前 CLI 正在运行任务，请等待空闲后重试。' } };
+    }
+
+    const catalog = await buildModelChoicesResponse(binding.cliId);
+    const selectedProvider = value.action === 'cli_model_provider'
+      ? String(action?.option ?? '')
+      : String(value.provider ?? '');
+    const nextProvider = selectedProvider === '__all__' ? '' : selectedProvider;
+    const nextSearch = value.action === 'cli_model_search'
+      ? String((action as any)?.input_value ?? '').trim()
+      : String(value.search ?? '');
+    const nextPage = value.action === 'cli_model_search' || value.action === 'cli_model_provider'
+      ? 0
+      : Number(value.page ?? 0) || 0;
+
+    if (value.action === 'cli_model_select') {
+      const requested = String(value.model ?? '');
+      if (!catalog.choices.some(choice => choice.value === requested)) {
+        return { toast: { type: 'error', content: '模型不在当前 CLI 的可用目录中，未执行。' } };
+      }
+      let command: string;
+      try { command = capability.buildInvocation(requested); }
+      catch { return { toast: { type: 'error', content: '模型值无效，未执行。' } }; }
+      const accepted = sendWorkerSessionInput(ds, {
+        type: 'raw_input',
+        content: command,
+        ...(mojoLivePatchForSession(ds) ?? {}),
+      });
+      if (!accepted) {
+        return { toast: { type: 'error', content: 'CLI 输入通道不可用，未执行。' } };
+      }
+      rememberLastCliInput(ds, command, command);
+      logger.info(`[${tag(ds)}] interactive /model selected ${requested}`);
+      return buildModelPickerResolvedCard(sessionCliDisplayName(ds), requested);
+    }
+
+    const nextNonce = issueModelPickerBinding(binding);
+    return JSON.parse(buildModelPickerCard({
+      cliName: sessionCliDisplayName(ds),
+      activeModel: ds.activeModel,
+      choices: catalog.choices,
+      source: catalog.source,
+      binding: {
+        rootId: binding.rootId,
+        sessionId: binding.sessionId,
+        cliId: binding.cliId,
+        invokerOpenId: binding.invokerOpenId,
+        nonce: nextNonce,
+      },
+      state: { search: nextSearch, provider: nextProvider, page: nextPage },
+      locale: loc,
+    }));
   }
 
   // ─── /relay picker: state-changing actions (select / page / search) ────

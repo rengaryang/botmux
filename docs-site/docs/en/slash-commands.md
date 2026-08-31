@@ -70,7 +70,9 @@ The group-level setting overrides the dashboard "Bot Config → Regular Group Mo
 
 ## 🔀 Passthrough to the Underlying CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands.
+`/compact` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands.
+
+`/model` opens a Lark model picker for a supported active, idle terminal CLI session (falling back to static candidates when live discovery is unavailable). `/model <name>` remains a literal passthrough. Structured runners never receive terminal bytes and instead report that in-session shortcut switching is unsupported.
 
 `/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input or Riff backends the keystroke can't reach Codex's executor, so `/fast` fails closed there with a clear notice instead of a silent no-op.
 

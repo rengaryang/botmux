@@ -1968,7 +1968,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toMatch(/需要活跃的 CLI 进程|需要在已有会话内使用/);
   });
 
-  it('routes slash text by the frozen session CLI: Codex App structured, interactive Codex raw', async () => {
+  it('routes slash text by the frozen session CLI: Codex App structured, interactive Codex opens model picker', async () => {
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -1997,11 +1997,8 @@ describe('/rename production routing — must not pre-create a session (review P
       },
     );
     expect(appSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
-    expect(appSend).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'message',
-      turnId: 'om_model_app',
-      content: expect.stringContaining('/model'),
-    }));
+    expect(appSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
+    expect(repliedText()).toContain('结构化会话协议');
 
     // Inverse control: changing the bot default to Codex App must not remove
     // native slash support from an already-running interactive Codex session.
@@ -2017,6 +2014,9 @@ describe('/rename production routing — must not pre-create a session (review P
     const tuiSend = vi.fn();
     const tuiSession = seedLiveChatSession(tuiSend);
     tuiSession.session.cliId = 'codex';
+    tuiSession.workerReady = true;
+    tuiSession.lastScreenStatus = 'idle';
+    mocks.replyMessage.mockClear();
     await handleThreadReply(
       makeEventData('om_model_tui', '/model', 'om_model_tui_root'),
       {
@@ -2029,11 +2029,9 @@ describe('/rename production routing — must not pre-create a session (review P
         larkAppId: APP,
       },
     );
-    expect(tuiSend).toHaveBeenCalledWith({
-      type: 'raw_input',
-      content: '/model',
-      turnId: 'om_model_tui',
-    });
+    expect(tuiSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
+    expect(String(mocks.replyMessage.mock.calls.at(-1)?.[2])).toContain('cli_model_select');
+    expect(mocks.replyMessage.mock.calls.at(-1)?.[3]).toBe('interactive');
   });
 
   it('routes the ADAPTER-SCOPED /goal by frozen CLI too (not just builtin /model)', async () => {

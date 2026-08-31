@@ -273,7 +273,7 @@ import {
 } from './core/dispatch-report-binding.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, tryHandleInteractiveModelCommand } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -17919,6 +17919,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
+    const existingInteractiveDs = activeSessions.get(sessionKey(anchor, larkAppId));
+    if (await tryHandleInteractiveModelCommand({
+      cmd,
+      commandContent,
+      rootId: anchor,
+      messageId: parsed.messageId,
+      invokerOpenId: senderOpenId,
+      ds: existingInteractiveDs,
+      deps: invocationDeps,
+    })) return;
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
@@ -19354,6 +19364,15 @@ async function handleThreadReplyAdmitted(
     // `/botconfig cli` cannot make an old Codex App session receive raw_input
     // (or make an old interactive TUI lose its native slash commands).
     const passthroughCliId = existingDs?.session.cliId ?? getBot(larkAppId).config.cliId;
+    if (await tryHandleInteractiveModelCommand({
+      cmd,
+      commandContent,
+      rootId: anchor,
+      messageId: parsed.messageId,
+      invokerOpenId: threadSenderOpenId,
+      ds: existingDs,
+      deps: invocationDeps,
+    })) return;
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({

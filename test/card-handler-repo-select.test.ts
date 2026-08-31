@@ -98,6 +98,13 @@ vi.mock('../src/core/worker-pool.js', () => {
   deliverEphemeralOrReply: vi.fn(),
   closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
+  workerHasInitialized: vi.fn((ds: any) => ds.workerReady === true),
+  sendWorkerSessionInput: vi.fn((ds: any, message: any) => {
+    if (!ds.worker || ds.worker.killed) return false;
+    ds.worker.send(message);
+    return true;
+  }),
+  mojoLivePatchForSession: vi.fn(() => undefined),
   CARD_POSTING_SENTINEL: '__posting__',
   };
 });
@@ -157,8 +164,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
-import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
+import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, sendWorkerSessionInput } from '../src/core/worker-pool.js';
+import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir, rememberLastCliInput } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
@@ -176,6 +183,7 @@ import {
   __testOnly_resetBotTurnMutationGates,
   withBotTurnMutation,
 } from '../src/core/bot-turn-mutation-gate.js';
+import { issueModelPickerBinding, __testOnlyResetModelPickerBindings } from '../src/services/model-picker-state.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -275,6 +283,7 @@ function deferred<T>() {
 
 beforeEach(() => {
   __testOnly_resetBotTurnMutationGates();
+  __testOnlyResetModelPickerBindings();
   vi.clearAllMocks();
   vi.mocked(deleteMessage).mockReset().mockResolvedValue(true);
   vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
@@ -305,6 +314,74 @@ afterEach(async () => {
 });
 
 // ─── Tests ────────────────────────────────────────────────────────────────
+
+describe('/model interactive picker callback', () => {
+  function modelEvent(nonce: string, model: string, operator = OWNER) {
+    return {
+      operator: { open_id: operator },
+      action: {
+        value: {
+          action: 'cli_model_select', nonce, model,
+          // Forged values must be ignored in favor of the server binding.
+          root_id: 'om_forged', session_id: 'forged', cli_id: 'codex-app', invoker_open_id: operator,
+        },
+      },
+      context: { open_message_id: 'om_model_card' },
+    };
+  }
+
+  it('validates the server binding and sends a provider-qualified native command to the exact idle session', async () => {
+    const ds = makeDs({ workerReady: true, lastScreenStatus: 'idle' });
+    ds.session.cliId = 'pi';
+    const { deps } = makeDeps(ds);
+    const nonce = issueModelPickerBinding({
+      larkAppId: APP_ID, rootId: ROOT_ID, sessionId: ds.session.sessionId,
+      cliId: 'pi', invokerOpenId: OWNER,
+    });
+
+    const result = await handleCardAction(modelEvent(nonce, 'bytedance-hybrid/glm-5.3'), deps, APP_ID);
+
+    expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, {
+      type: 'raw_input', content: '/model bytedance-hybrid/glm-5.3',
+    });
+    expect(rememberLastCliInput).toHaveBeenCalledWith(
+      ds,
+      '/model bytedance-hybrid/glm-5.3',
+      '/model bytedance-hybrid/glm-5.3',
+    );
+    expect((result as any).header.title.content).toContain('已发送');
+  });
+
+  it('rejects a forged model without writing to the worker', async () => {
+    const ds = makeDs({ workerReady: true, lastScreenStatus: 'idle' });
+    ds.session.cliId = 'pi';
+    const { deps } = makeDeps(ds);
+    const nonce = issueModelPickerBinding({
+      larkAppId: APP_ID, rootId: ROOT_ID, sessionId: ds.session.sessionId,
+      cliId: 'pi', invokerOpenId: OWNER,
+    });
+
+    const result = await handleCardAction(modelEvent(nonce, 'evil/model\n/clear'), deps, APP_ID);
+
+    expect((result as any).toast.type).toBe('error');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+  });
+
+  it('does not let another operator consume the invoker one-shot nonce', async () => {
+    const ds = makeDs({ workerReady: true, lastScreenStatus: 'idle' });
+    ds.session.cliId = 'pi';
+    const { deps } = makeDeps(ds);
+    const nonce = issueModelPickerBinding({
+      larkAppId: APP_ID, rootId: ROOT_ID, sessionId: ds.session.sessionId,
+      cliId: 'pi', invokerOpenId: OWNER,
+    });
+
+    const denied = await handleCardAction(modelEvent(nonce, 'bytedance-hybrid/glm-5.3', 'ou_other'), deps, APP_ID);
+    expect((denied as any).toast.type).toBe('warning');
+    const accepted = await handleCardAction(modelEvent(nonce, 'bytedance-hybrid/glm-5.3'), deps, APP_ID);
+    expect((accepted as any).header.title.content).toContain('已发送');
+  });
+});
 
 describe('repo select card — plain switch', () => {
   it('refuses a card repo switch over a live Riff generation before teardown or refork', async () => {

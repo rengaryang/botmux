@@ -26,7 +26,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, workerHasInitialized, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -98,6 +98,10 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { buildModelChoicesResponse } from '../services/model-catalog.js';
+import { interactiveModelCapability } from '../services/interactive-cli-commands.js';
+import { buildModelPickerCard } from '../im/lark/model-picker-card.js';
+import { issueModelPickerBinding } from '../services/model-picker-state.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { rehomeReplyTargetState } from './reply-target.js';
@@ -464,6 +468,85 @@ export interface CommandHandlerDeps {
   invocationReplyTarget?: FrozenSessionReplyTarget;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+}
+
+/**
+ * Turn a bare `/model` passthrough into a Lark-native picker for the exact
+ * frozen CLI session. Argument-bearing `/model foo` deliberately returns false
+ * so the caller preserves the CLI's native passthrough behavior.
+ */
+export async function tryHandleInteractiveModelCommand(args: {
+  cmd: string;
+  commandContent: string;
+  rootId: string;
+  messageId: string;
+  invokerOpenId?: string;
+  ds?: DaemonSession;
+  deps: CommandHandlerDeps;
+}): Promise<boolean> {
+  if (args.cmd !== '/model' || args.commandContent.trim().toLowerCase() !== '/model') return false;
+  const ds = args.ds;
+  if (!ds) return false;
+  const loc = localeForBot(ds.larkAppId);
+  const cliId = (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) as CliId;
+  const capability = interactiveModelCapability(cliId);
+  if (capability.sessionMode !== 'raw_input') {
+    await args.deps.sessionReply(
+      args.rootId,
+      `${sessionCliDisplayName(ds)} 当前使用结构化会话协议，不支持通过终端快捷指令切换模型。`,
+      'text',
+      ds.larkAppId,
+      args.messageId,
+    );
+    return true;
+  }
+  if (!args.invokerOpenId) {
+    await args.deps.sessionReply(args.rootId, '无法确认操作人，未打开模型选择器。', 'text', ds.larkAppId, args.messageId);
+    return true;
+  }
+  if (!ds.worker || ds.worker.killed || !workerHasInitialized(ds)) {
+    await args.deps.sessionReply(args.rootId, t('cmd.no_active_session', undefined, loc), 'text', ds.larkAppId, args.messageId);
+    return true;
+  }
+  if (capability.requiresIdle && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited') {
+    await args.deps.sessionReply(args.rootId, '当前 CLI 正在运行任务，请等待空闲后再使用 `/model`。', 'text', ds.larkAppId, args.messageId);
+    return true;
+  }
+
+  const catalog = await buildModelChoicesResponse(cliId);
+  if (catalog.choices.length === 0) {
+    await args.deps.sessionReply(
+      args.rootId,
+      `${sessionCliDisplayName(ds)} 暂时无法枚举可用模型；仍可使用 \`/model <模型名>\` 原样发送给 CLI。`,
+      'text',
+      ds.larkAppId,
+      args.messageId,
+    );
+    return true;
+  }
+  const nonce = issueModelPickerBinding({
+    larkAppId: ds.larkAppId,
+    rootId: args.rootId,
+    sessionId: ds.session.sessionId,
+    cliId,
+    invokerOpenId: args.invokerOpenId,
+  });
+  const card = buildModelPickerCard({
+    cliName: sessionCliDisplayName(ds),
+    activeModel: ds.activeModel,
+    choices: catalog.choices,
+    source: catalog.source,
+    binding: {
+      rootId: args.rootId,
+      sessionId: ds.session.sessionId,
+      cliId,
+      invokerOpenId: args.invokerOpenId,
+      nonce,
+    },
+    locale: loc,
+  });
+  await args.deps.sessionReply(args.rootId, card, 'interactive', ds.larkAppId, args.messageId);
+  return true;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
