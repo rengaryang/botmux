@@ -31,7 +31,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Verify tag still resolves to the checked-out commit
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet
+          test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
       - run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
       - run: pnpm build && pnpm desktop:bundle && pnpm desktop:runtime
       - name: Build unsigned Universal macOS packages
@@ -64,7 +66,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Verify tag still resolves to the checked-out commit
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet
+          test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
       - shell: bash
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
       - run: pnpm build
@@ -106,7 +110,9 @@ jobs:
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
       - name: Verify tag still resolves to the checked-out commit
-        run: test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet
+          test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
       - run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
       - run: pnpm build && pnpm desktop:bundle && pnpm desktop:runtime
       - name: Build Linux packages
