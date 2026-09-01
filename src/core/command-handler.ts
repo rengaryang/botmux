@@ -545,7 +545,18 @@ export async function tryHandleInteractiveModelCommand(args: {
     },
     locale: loc,
   });
-  await args.deps.sessionReply(args.rootId, card, 'interactive', ds.larkAppId, args.messageId);
+  try {
+    await args.deps.sessionReply(args.rootId, card, 'interactive', ds.larkAppId, args.messageId);
+  } catch (err) {
+    logger.warn(`[${ds.session.sessionId.slice(0, 8)}] /model picker card send failed: ${err instanceof Error ? err.message : err}`);
+    await args.deps.sessionReply(
+      args.rootId,
+      '⚠️ 模型选择卡发送失败，未向 CLI 发送任何指令。请稍后重试 `/model`；也可使用 `/model <模型名>` 直接发送。',
+      'text',
+      ds.larkAppId,
+      args.messageId,
+    );
+  }
   return true;
 }
 

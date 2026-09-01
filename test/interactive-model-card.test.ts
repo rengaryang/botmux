@@ -11,6 +11,7 @@ import {
   filterModelChoices,
   MODEL_PICKER_PAGE_SIZE,
 } from '../src/im/lark/model-picker-card.js';
+import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import type { ModelChoiceDetail } from '../src/services/model-catalog.js';
 
 const binding = {
@@ -85,5 +86,34 @@ describe('model picker card', () => {
     expect(serialized).toContain('provider-a/same');
     expect(serialized).toContain('nonce-1');
     expect(serialized).toContain('下一页');
+  });
+
+  it('uses only Card 2.0 callback structures accepted by Lark', () => {
+    const card = JSON.parse(stampBotmuxCallbackMarkers(buildModelPickerCard({
+      cliName: 'Pi',
+      choices,
+      source: 'live',
+      binding: { rootId: 'om_root', sessionId: 'sess-1', cliId: 'pi', invokerOpenId: 'ou_owner', nonce: 'nonce-1' },
+    })));
+    const nodes: any[] = [];
+    const visit = (value: unknown): void => {
+      if (!value || typeof value !== 'object') return;
+      if (Array.isArray(value)) { value.forEach(visit); return; }
+      const node = value as Record<string, unknown>;
+      if (typeof node.tag === 'string') nodes.push(node);
+      Object.values(node).forEach(visit);
+    };
+    visit(card.body);
+
+    expect(nodes.some(node => node.tag === 'action')).toBe(false);
+    for (const node of nodes.filter(node => ['button', 'select_static'].includes(node.tag))) {
+      expect(node.value).toBeUndefined();
+      expect(node.behaviors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'callback', value: expect.objectContaining({ action: expect.any(String) }) }),
+      ]));
+    }
+    for (const button of nodes.filter(node => node.tag === 'button')) {
+      expect(button.behaviors[0].value.__bm_cb).toBe(1);
+    }
   });
 });

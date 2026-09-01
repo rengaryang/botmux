@@ -78,7 +78,7 @@ export function buildModelPickerCard(args: {
         { text: { tag: 'plain_text', content: '全部 Provider' }, value: '__all__' },
         ...providers.map(provider => ({ text: { tag: 'plain_text', content: provider }, value: provider })),
       ],
-      value: { action: 'cli_model_provider', ...common },
+      behaviors: [{ type: 'callback', value: { action: 'cli_model_provider', ...common } }],
     });
   }
 
@@ -95,19 +95,32 @@ export function buildModelPickerCard(args: {
   if (visible.length === 0) {
     elements.push({ tag: 'markdown', content: '没有匹配的模型。请调整搜索词或 Provider。' });
   } else {
-    elements.push({
-      tag: 'action',
-      layout: 'bisected',
-      actions: visible.map(choice => {
-        const selected = args.activeModel === choice.value;
-        return {
-          tag: 'button',
-          type: selected ? 'primary' : 'default',
-          text: { tag: 'plain_text', content: `${selected ? '✓ ' : ''}${choice.label}` },
-          value: { action: 'cli_model_select', model: choice.value, ...common },
-        };
-      }),
-    });
+    // Card 2.0 removed the legacy `action` container. Keep the compact
+    // two-column layout with column_set, but put each button directly inside
+    // a column and carry callback data only through behaviors[].value.
+    for (let index = 0; index < visible.length; index += 2) {
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        columns: visible.slice(index, index + 2).map(choice => {
+          const selected = args.activeModel === choice.value;
+          return {
+            tag: 'column', width: 'weighted', weight: 1,
+            elements: [{
+              tag: 'button',
+              width: 'fill',
+              type: selected ? 'primary_filled' : 'default',
+              text: { tag: 'plain_text', content: `${selected ? '✓ ' : ''}${choice.label}` },
+              behaviors: [{
+                type: 'callback',
+                value: { action: 'cli_model_select', model: choice.value, ...common },
+              }],
+            }],
+          };
+        }),
+      });
+    }
   }
 
   if (totalPages > 1) {
@@ -120,7 +133,10 @@ export function buildModelPickerCard(args: {
           elements: [{
             tag: 'button', type: 'default', disabled: page === 0,
             text: { tag: 'plain_text', content: '← 上一页' },
-            value: { action: 'cli_model_page', ...common, page: String(Math.max(0, page - 1)) },
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'cli_model_page', ...common, page: String(Math.max(0, page - 1)) },
+            }],
           }],
         },
         {
@@ -132,7 +148,10 @@ export function buildModelPickerCard(args: {
           elements: [{
             tag: 'button', type: 'default', disabled: page >= totalPages - 1,
             text: { tag: 'plain_text', content: '下一页 →' },
-            value: { action: 'cli_model_page', ...common, page: String(Math.min(totalPages - 1, page + 1)) },
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'cli_model_page', ...common, page: String(Math.min(totalPages - 1, page + 1)) },
+            }],
           }],
         },
       ],
