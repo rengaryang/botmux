@@ -1,33 +1,33 @@
 export type KmOpsTabId = 'overview' | 'knowledge' | 'memory' | 'quality' | 'configuration' | 'production' | 'audit';
 
 export type KmExpectedMetricsContract = {
-  schemaVersion: 1;
-  path: '/api/km/dashboard-metrics';
+  schemaVersion: 2;
+  path: '/api/km/dashboard-metrics-v2';
   note: string;
   fields: {
-    kpis: 'totalKnowledge, activeMemory, healthPercent, retrievalRuns, auditEvents';
-    distributions: 'layerDistribution[], healthDistribution[], stateDistribution[], categoryDistribution[]';
-    trend: 'time-series points with observations, retrievals, gates';
-    rankings: 'hotSkills[], hotKnowledge[]';
+    assetHealth: 'L0-L4 totals, contract/index/retrievable/linkage rates, lifecycle and freshness';
+    retrievalQuality: 'index queries, entry recalls, markdown reads, effectiveness/fallback/query-feedback rates';
+    kmRuntime: 'the complete backward-compatible SQLite metrics contract v1';
+    attention: 'contract errors, pending ingest, stale/purged, never recalled and orphaned assets';
   };
 };
 
 export const KM_DASHBOARD_EXPECTED_CONTRACT: KmExpectedMetricsContract = {
-  schemaVersion: 1,
-  path: '/api/km/dashboard-metrics',
-  note: 'The dedicated metrics API may replace this fallback. Keep labels, units, and nullability compatible with this view model.',
+  schemaVersion: 2,
+  path: '/api/km/dashboard-metrics-v2',
+  note: 'Workspace asset health and SQLite runtime health remain separate. Unknown evidence-backed ratios are null, never inferred as healthy.',
   fields: {
-    kpis: 'totalKnowledge, activeMemory, healthPercent, retrievalRuns, auditEvents',
-    distributions: 'layerDistribution[], healthDistribution[], stateDistribution[], categoryDistribution[]',
-    trend: 'time-series points with observations, retrievals, gates',
-    rankings: 'hotSkills[], hotKnowledge[]',
+    assetHealth: 'L0-L4 totals, contract/index/retrievable/linkage rates, lifecycle and freshness',
+    retrievalQuality: 'index queries, entry recalls, markdown reads, effectiveness/fallback/query-feedback rates',
+    kmRuntime: 'the complete backward-compatible SQLite metrics contract v1',
+    attention: 'contract errors, pending ingest, stale/purged, never recalled and orphaned assets',
   },
 };
 
 export type KmMetricPoint = {
   key: string;
   label: string;
-  value: number;
+  value: number | null;
   unit?: string;
   helper: string;
   tone: 'blue' | 'ink' | 'cyan' | 'green' | 'slate';
@@ -54,6 +54,19 @@ export type KmRankingItem = {
   title: string;
   value: number;
   meta: string;
+};
+
+export type WorkspaceMetricsV2 = {
+  schemaVersion: 2;
+  generatedAt: string;
+  snapshot: { state: string; hash: string; durationMs: number; roots: Array<{ workspaceId: string; displayRoot: string; state: string; errors: string[] }>; errors: string[] };
+  assetHealth: {
+    totalsByLayer: Record<'L0'|'L1'|'L2'|'L3'|'L4', number>; totalAssets: number; contractValidRate: number|null;
+    indexConsistencyRate: number|null; retrievableRate: number|null; linkageCoverageRate: number|null;
+    lifecycle: Record<string, number>; freshness: Record<string, number>; contractErrors: number; legacyAssets: number;
+  };
+  retrievalQuality: { indexQueries: number; entryRecallEvents: number; neverRecalledAssets: number; markdownReads: number; zeroReadQueries: number|null; zeroReadRate: number|null; effectivenessRate: number|null; fallbackSuccessRate: number|null; queryFeedbackRate: number|null; evidenceState: string };
+  kmRuntime: KmOpsMetricsRaw;
 };
 
 export type KmDashboardModel = {
@@ -265,6 +278,39 @@ function rankMeta(item: { itemKind: string; state?: string; targetLayer?: string
     item.category,
   ].filter(Boolean);
   return parts.length ? parts.join(' · ') : (item.lastSeenAt ? `最后命中 ${item.lastSeenAt.slice(0, 10)}` : 'metrics API');
+}
+
+export function buildKmDashboardModelV2(metrics: WorkspaceMetricsV2): KmDashboardModel {
+  const health = metrics.assetHealth;
+  const retrieval = metrics.retrievalQuality;
+  const layerDistribution = distribution(health.totalsByLayer);
+  const healthDistribution = distribution(health.freshness, HEALTH_LABELS);
+  const stateDistribution = distribution(health.lifecycle, STATE_LABELS);
+  const attention = health.contractErrors + retrieval.neverRecalledAssets;
+  const snapshotOk = metrics.snapshot.state === 'complete';
+  return {
+    generatedAt: metrics.generatedAt,
+    source: 'metrics-api',
+    summary: `分层资产 ${health.totalAssets} 项（${Object.entries(health.totalsByLayer).map(([key,value]) => `${key} ${value}`).join(' / ')}）；KM 运行库另有 ${metrics.kmRuntime.totals.knowledgeTotal} 条自动候选。`,
+    kpis: [
+      { key: 'knowledge', label: '分层知识资产', value: health.totalAssets, unit: '项', helper: `L2 ${health.totalsByLayer.L2} · legacy ${health.legacyAssets}`, tone: 'blue', tooltip: '来自 workspace 文件资产只读扫描，不等于 SQLite candidate。' },
+      { key: 'health', label: 'v3 契约有效率', value: snapshotOk ? health.contractValidRate : null, unit: '%', helper: health.contractErrors ? `含 legacy/异常 ${health.contractErrors} 项` : '契约检查通过', tone: 'cyan', tooltip: '只衡量 v3 L2 条目；snapshot partial/unavailable 时不可计算。' },
+      { key: 'retrieval', label: '可召回率', value: snapshotOk ? health.retrievableRate : null, unit: '%', helper: `STALE/PURGED ${(health.freshness.stale ?? 0) + (health.freshness.purged ?? 0)}`, tone: 'green', tooltip: 'L2 eligible 条目的本地/远端可定位比例。' },
+      { key: 'read', label: 'INDEX→正文读取', value: retrieval.zeroReadRate == null ? null : Math.max(0, 100 - retrieval.zeroReadRate), unit: '%', helper: retrieval.evidenceState === 'cold_start' ? 'cold_start · 等待 read evidence' : `read ${retrieval.markdownReads}`, tone: 'green', tooltip: '没有 query/read 对账证据时为未知。' },
+      { key: 'memory', label: '检索有效率', value: retrieval.effectivenessRate, unit: '%', helper: retrieval.evidenceState === 'cold_start' ? 'cold_start · 等待 use evidence' : `read ${retrieval.markdownReads}`, tone: 'ink', tooltip: '没有 reasoning use evidence 时为未知。' },
+      { key: 'audit', label: '运营待办', value: attention, unit: '项', helper: `未召回 ${retrieval.neverRecalledAssets} · pending ${health.lifecycle['pending-ingest'] ?? 0}`, tone: 'slate', tooltip: '契约异常、legacy 和未召回资产的待办总览。' },
+    ],
+    layerDistribution, healthDistribution, stateDistribution,
+    categoryDistribution: distribution({ '资产契约': health.contractErrors, '待迁移 legacy': health.legacyAssets, '从未召回': retrieval.neverRecalledAssets }),
+    trend: metrics.kmRuntime.trends.last7d.map(point => ({ label: shortDateLabel(point.date), observations: point.knowledgeCreated + point.memoryCreated, retrievals: point.retrievalRuns, gates: point.wouldInject + point.actualInject })),
+    hotSkills: [], hotKnowledge: [],
+    riskBadges: [
+      { label: snapshotOk ? '资产扫描完整' : `资产扫描 ${metrics.snapshot.state}`, tone: snapshotOk ? 'ok' : 'danger', detail: metrics.snapshot.errors.join(', ') || `${metrics.snapshot.roots.length} workspace` },
+      { label: health.legacyAssets ? '存在 legacy 契约' : 'v3 契约统一', tone: health.legacyAssets ? 'warn' : 'ok', detail: `${health.legacyAssets} 条待迁移` },
+      { label: retrieval.evidenceState === 'cold_start' ? '检索证据冷启动' : '检索证据可用', tone: retrieval.evidenceState === 'cold_start' ? 'warn' : 'ok', detail: `INDEX ${retrieval.indexQueries} · recall ${retrieval.entryRecallEvents}` },
+      { label: 'KM 运行健康独立统计', tone: 'ok', detail: `Memory ${metrics.kmRuntime.totals.memoryTotal} · retrieval ${metrics.kmRuntime.totals.retrievalLast30d}` },
+    ],
+  };
 }
 
 export function buildKmDashboardModelFromMetrics(metrics: KmOpsMetricsRaw): KmDashboardModel {

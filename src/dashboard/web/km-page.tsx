@@ -12,8 +12,10 @@ import {
 import {
   buildKmDashboardModel,
   buildKmDashboardModelFromMetrics,
+  buildKmDashboardModelV2,
   KM_DASHBOARD_EXPECTED_CONTRACT,
   type KmOpsMetricsRaw,
+  type WorkspaceMetricsV2,
   type KmOpsTabId,
 } from './km-dashboard-model.js';
 
@@ -28,6 +30,7 @@ type Health = {
 };
 
 type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; title: string; confidence: string; freshness: string };
+type WorkspaceAssetV2 = { assetId: string; workspaceId: string; layer: string; kind: string; title: string; relativePath: string; lifecycle: string; freshness: string; contract: { version: string; valid: boolean; errors: string[]; warnings: string[] }; retrieval: { recallCount: number; lastRecalledAt?: string }; linkage: { relatedCount: number; canonicalKey?: string } };
 type KnowledgeExportJob = {
   jobId: string;
   state: string;
@@ -270,6 +273,8 @@ function KmPage(): React.JSX.Element {
   const [shadowComparisons, setShadowComparisons] = useState<ShadowComparison[]>([]);
   const [shadowReadiness, setShadowReadiness] = useState<ShadowReadiness>();
   const [dashboardMetrics, setDashboardMetrics] = useState<KmOpsMetricsRaw>();
+  const [workspaceMetrics, setWorkspaceMetrics] = useState<WorkspaceMetricsV2>();
+  const [workspaceAssets, setWorkspaceAssets] = useState<WorkspaceAssetV2[]>([]);
   const [goldenForm, setGoldenForm] = useState({ title: '', queryRedacted: '', claimKey: '', claimTextHash: `sha256:${'0'.repeat(64)}` });
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
@@ -299,7 +304,15 @@ function KmPage(): React.JSX.Element {
     try {
       setLoading(true);
       setError('');
-      const [metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [workspaceAssetsResult, workspaceMetricsResult, metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+        getJson<{ items: WorkspaceAssetV2[] }>('/api/km/knowledge-assets-v2').then(
+          result => ({ ok: true as const, result }),
+          error => ({ ok: false as const, error }),
+        ),
+        getJson<WorkspaceMetricsV2>('/api/km/dashboard-metrics-v2?rankingLimit=10').then(
+          metrics => ({ ok: true as const, metrics }),
+          error => ({ ok: false as const, error }),
+        ),
         getJson<KmOpsMetricsRaw>('/api/km/dashboard-metrics?rankingLimit=10').then(
           metrics => ({ ok: true as const, metrics }),
           error => ({ ok: false as const, error }),
@@ -350,6 +363,8 @@ function KmPage(): React.JSX.Element {
       setPolicyDecisions(policyDecisionList.items); setConfigAudit(configAuditList.items); setRetrievalQuality(quality);
       setRetention(retentionStatus);
       setGoldenCases(goldenList.items); setShadowComparisons(comparisonList.items); setShadowReadiness(readiness);
+      setWorkspaceAssets(workspaceAssetsResult.ok ? workspaceAssetsResult.result.items : []);
+      setWorkspaceMetrics(workspaceMetricsResult.ok ? workspaceMetricsResult.metrics : undefined);
       setDashboardMetrics(metricsResult.ok ? metricsResult.metrics : undefined);
       const activeCanary = productionGateList.items.find(plan => plan.actionKind === 'prompt-canary' && plan.state === 'executing');
       const botAppId = String((activeCanary?.target as { botAppId?: unknown } | undefined)?.botAppId ?? canaryForm.botAppId).trim();
@@ -669,7 +684,7 @@ function KmPage(): React.JSX.Element {
 
   const funnel = funnelCounts(events);
   const maxFunnel = Math.max(1, ...Object.values(funnel));
-  const dashboardModel = useMemo(() => dashboardMetrics ? buildKmDashboardModelFromMetrics(dashboardMetrics) : buildKmDashboardModel({
+  const dashboardModel = useMemo(() => workspaceMetrics ? buildKmDashboardModelV2(workspaceMetrics) : dashboardMetrics ? buildKmDashboardModelFromMetrics(dashboardMetrics) : buildKmDashboardModel({
     health,
     knowledge,
     memory,
@@ -682,7 +697,7 @@ function KmPage(): React.JSX.Element {
     backendRuntime,
     centralSink,
     shadowReadiness,
-  }), [dashboardMetrics, health, knowledge, memory, importJobs, retrievalQuality, retention, productionGates, events, retrievals, backendRuntime, centralSink, shadowReadiness]);
+  }), [workspaceMetrics, dashboardMetrics, health, knowledge, memory, importJobs, retrievalQuality, retention, productionGates, events, retrievals, backendRuntime, centralSink, shadowReadiness]);
   const selectTab = (tab: KmOpsTabId) => {
     setActiveTab(tab);
     persistKmTab(tab);
@@ -698,7 +713,19 @@ function KmPage(): React.JSX.Element {
       </TabOnly>
 
       <TabOnly tab="knowledge">
-        <KmSection title="知识审核" description="处理候选知识、导出 staging 和知识到记忆导入。" badge="中风险：写入 staging 或本地 memory 前需确认" risk="medium">
+        <KmSection title="分层知识资产" description="只读聚合自动发现 workspace 的 L0–L4 文件资产；不读取或展示正文。" badge="只读 · Contract v2" risk="low">
+          <div className="feedback-deliveries">
+            {workspaceAssets.slice(0, 100).map(item => <div key={item.assetId}>
+              <code>{item.layer}</code><span>{item.title} · {item.relativePath}</span>
+              <span>{item.contract.version} · recall {item.retrieval.recallCount} · related {item.linkage.relatedCount}</span>
+              <b>{item.lifecycle} / {item.freshness}{item.contract.valid ? '' : ` · ${item.contract.errors.join(', ') || item.contract.warnings.join(', ')}`}</b>
+            </div>)}
+            {workspaceAssets.length === 0 && <KmEmptyState title="暂无 workspace 资产快照" message="后台扫描尚未完成或当前会话未发现知识根目录。" />}
+          </div>
+          <KmInlineHelp>workspace 根目录可从 Bot 默认 workingDir、当前 cwd 和会话 workingDir 自动发现；每个发现根仍执行 realpath、symlink 逃逸、文件大小和数量预算校验。</KmInlineHelp>
+        </KmSection>
+
+        <KmSection title="自动候选审核" description="处理 SQLite KM 自动提取的候选知识、导出 staging 和知识到记忆导入。" badge="中风险：写入 staging 或本地 memory 前需确认" risk="medium">
           <div className="feedback-deliveries">
             {knowledge.map(item => <div key={item.knowledgeId}><code>{item.targetLayer}</code><span>{item.title}</span><span>{item.confidence} · {item.freshness}</span><b>{item.state}{' '}
               {item.state === 'approved' && item.targetLayer !== 'reviewed-only' && item.freshness === 'fresh' && <button onClick={() => void createExportJob(item)}>Stage Export</button>}
@@ -781,6 +808,16 @@ function KmPage(): React.JSX.Element {
       </TabOnly>
 
       <TabOnly tab="quality">
+        {workspaceMetrics && <KmSection title="知识检索证据" description="区分 INDEX 查询、entry recall 与真正影响 reasoning 的 read/use evidence。">
+          <div className="feedback-deliveries">
+            <div><code>INDEX</code><span>索引查询</span><span>当前 recall log</span><b>{workspaceMetrics.retrievalQuality.indexQueries}</b></div>
+            <div><code>recall</code><span>entry recall events</span><span>从未召回 {workspaceMetrics.retrievalQuality.neverRecalledAssets}</span><b>{workspaceMetrics.retrievalQuality.entryRecallEvents}</b></div>
+            <div><code>use</code><span>检索有效率</span><span>{workspaceMetrics.retrievalQuality.evidenceState}</span><b>{workspaceMetrics.retrievalQuality.effectivenessRate == null ? '—' : `${workspaceMetrics.retrievalQuality.effectivenessRate}%`}</b></div>
+            <div><code>link</code><span>related_entries 覆盖</span><span>只读统计</span><b>{workspaceMetrics.assetHealth.linkageCoverageRate == null ? '—' : `${workspaceMetrics.assetHealth.linkageCoverageRate}%`}</b></div>
+          </div>
+          <KmInlineHelp>没有 markdown read/use/fallback/query-feedback 证据时显示 cold_start/—，不会把缺数据误报为 0% 或 100%。</KmInlineHelp>
+        </KmSection>}
+
         <KmSection title="Skill 使用漏斗" description="最近 100 条观测事件的 Skill 分发、调用和完成情况。">
           {Object.entries(funnel).map(([stage, count]) => (
             <div className="feedback-bar" key={stage}>
