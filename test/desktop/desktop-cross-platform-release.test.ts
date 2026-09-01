@@ -62,6 +62,7 @@ describe('cross-platform desktop release', () => {
     expect(workflow).toContain('unsigned preview; Gatekeeper may require manual approval');
     expect(workflow).toContain('unsigned preview; SmartScreen may warn');
     expect(workflow.match(/Verify tag still resolves to the checked-out commit/g)).toHaveLength(3);
+    expect(workflow.match(/git fetch origin "refs\/tags\/\$\{RELEASE_TAG\}:refs\/tags\/\$\{RELEASE_TAG\}" --force --quiet/g)).toHaveLength(3);
     expect(legacyWorkflow).toContain("if: github.repository == 'deepcoldy/botmux' && github.event_name == 'push'");
   });
 });
