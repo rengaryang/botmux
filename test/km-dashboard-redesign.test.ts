@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { buildKmDashboardModel, buildKmDashboardModelFromMetrics, KM_DASHBOARD_EXPECTED_CONTRACT } from '../src/dashboard/web/km-dashboard-model.js';
+import { filterWorkspaceAssets, paginateWorkspaceAssets, WORKSPACE_ASSET_PAGE_SIZE, type WorkspaceAssetV2 } from '../src/dashboard/web/km-page.js';
 
 describe('KM dashboard redesign', () => {
   it('builds the operations overview from the documented fallback contract', () => {
@@ -102,6 +103,16 @@ describe('KM dashboard redesign', () => {
     expect(model.riskBadges.map(item => item.label)).toContain('Metrics API 已接入');
   });
 
+  it('filters and paginates the workspace asset list without hiding its total', () => {
+    const assets = Array.from({ length: 123 }, (_, index): WorkspaceAssetV2 => ({
+      assetId: `asset-${index}`, workspaceId: index < 100 ? 'main' : 'nested', layer: index % 2 ? 'L2' : 'L4', kind: 'test', title: `Asset ${index}`, relativePath: `asset-${index}.md`, lifecycle: 'not-applicable', freshness: 'not-applicable', contract: { version: 'n/a', valid: true, errors: [], warnings: [] }, retrieval: { recallCount: 0 }, linkage: { relatedCount: 0 },
+    }));
+    expect(WORKSPACE_ASSET_PAGE_SIZE).toBe(50);
+    expect(filterWorkspaceAssets(assets, 'nested', 'L2')).toHaveLength(11);
+    expect(paginateWorkspaceAssets(assets, 3)).toMatchObject({ currentPage: 3, pageCount: 3, start: 100, end: 123, total: 123 });
+    expect(paginateWorkspaceAssets(assets, 99).items).toHaveLength(23);
+  });
+
   it('keeps KM navigation, overview, and high-risk controls in separate sections', () => {
     const page = readFileSync(new URL('../src/dashboard/web/km-page.tsx', import.meta.url), 'utf8');
     const components = readFileSync(new URL('../src/dashboard/web/km-dashboard-components.tsx', import.meta.url), 'utf8');
@@ -116,6 +127,9 @@ describe('KM dashboard redesign', () => {
     expect(page).toContain('KM_DASHBOARD_EXPECTED_CONTRACT');
     expect(page).toContain("getJson<KmOpsMetricsRaw>('/api/km/dashboard-metrics?rankingLimit=10')");
     expect(page).toContain('buildKmDashboardModelFromMetrics(dashboardMetrics)');
+    expect(page).toContain('筛选 Workspace');
+    expect(page).toContain('显示 {workspaceAssetView.total');
+    expect(page).toContain('下一页');
     expect(page).toContain('className="danger"');
     expect(css).toContain('.km-kpi-grid');
     expect(css).toContain('@media (prefers-reduced-motion: reduce)');
