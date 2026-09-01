@@ -44,7 +44,8 @@ function unavailableSnapshot(error: string): WorkspaceKnowledgeSnapshotV2 {
     health: { totalsByLayer: { L0: 0, L1: 0, L2: 0, L3: 0, L4: 0 }, totalAssets: 0, contractValidRate: null,
       indexConsistencyRate: null, retrievableRate: null, linkageCoverageRate: null, lifecycle: {}, freshness: {}, contractErrors: 0, legacyAssets: 0 },
     retrievalQuality: { indexQueries: 0, entryRecallEvents: 0, neverRecalledAssets: 0, markdownReads: 0, zeroReadQueries: null,
-      zeroReadRate: null, effectivenessRate: null, fallbackSuccessRate: null, queryFeedbackRate: null, evidenceState: 'cold_start' },
+      zeroReadRate: null, effectivenessRate: null, fallbackSuccessRate: null, queryFeedbackRate: null, evidenceState: 'cold_start', evidenceQueries: 0,
+      useLabels: { direct_apply: 0, context_guided: 0, pitfall_avoided: 0, not_used: 0, misleading: 0 }, invalidEvidenceEvents: 0 },
     attention: { contractErrors: [], pendingIngest: [], staleOrPurged: [], neverRecalled: [], orphaned: [] },
   };
 }
