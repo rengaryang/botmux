@@ -31899,6 +31899,10 @@ a.card-menu-item {
   gap: 12px;
 }
 
+.km-kpi-grid--six {
+  grid-template-columns: repeat(6, minmax(140px, 1fr));
+}
+
 .km-kpi-card,
 .km-chart-panel,
 .km-ranking,

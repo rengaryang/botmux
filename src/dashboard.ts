@@ -95,6 +95,7 @@ import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.j
 import { handleKmObservationApi } from './dashboard/km-observation-api.js';
 import { isKmObservationEnabled } from './services/km/observation-queue.js';
 import { ObservationStore } from './services/km/observation-store.js';
+import { WorkspaceKnowledgeSnapshotCache } from './services/km/workspace-knowledge/snapshot-cache.js';
 import { kmBackendRuntimeStatus } from './services/km/memory-backend-runtime.js';
 import { centralSinkRuntimeStatus, runKmCentralSinkDrill } from './services/km/central-sink-runtime.js';
 import { kmRetentionRuntimeStatus } from './services/km/retention-runtime.js';
@@ -752,6 +753,16 @@ aggregator.on(sessionPresentation.onEvent);
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
+const workspaceKnowledgeCache = new WorkspaceKnowledgeSnapshotCache(() => [
+  process.cwd(),
+  ...loadBotConfigs().map(bot => effectiveDefaultWorkingDir(bot)),
+  ...aggregator.getSessions().map(session => {
+    const workingDir = (session as unknown as { workingDir?: unknown }).workingDir;
+    return typeof workingDir === 'string' ? workingDir : undefined;
+  }),
+]);
+workspaceKnowledgeCache.start();
+
 const debugTerminalManager = createDebugTerminalManager({
   getActiveToken: currentDashboardToken,
   // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
@@ -3584,6 +3595,7 @@ const server = createServer(async (req, res) => {
       centralSinkRuntimeStatus: () => centralSinkRuntimeStatus({ dataDir: config.session.dataDir }),
       centralSinkDrill: input => runKmCentralSinkDrill({ dataDir: config.session.dataDir, ...input }),
       retentionRuntimeStatus: () => kmRetentionRuntimeStatus({ dataDir: config.session.dataDir }),
+      workspaceKnowledgeSnapshot: () => workspaceKnowledgeCache.get(),
     })) return;
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {

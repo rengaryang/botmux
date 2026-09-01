@@ -34,6 +34,7 @@ import {
   buildKmCanaryCloseoutReport,
   renderKmCanaryCloseoutMarkdown,
 } from '../services/km/canary-closeout-report.js';
+import type { WorkspaceKnowledgeSnapshotV2 } from '../services/km/workspace-knowledge/types.js';
 import {
   activateKmCanaryRelease,
   resolveKmCanaryRuntimeAuthorization,
@@ -127,6 +128,7 @@ export interface KmObservationApiDeps {
   retentionRuntimeStatus?(): Promise<KmRetentionRuntimeStatus>;
   centralSinkRuntimeStatus?(): Promise<CentralSinkRuntimeStatus>;
   centralSinkDrill?(input: { sinkId: string; drill: 'status' | 'partial-ack' | 'replay' | 'conflict'; actorId: string; idempotencyKey: string }): Promise<Record<string, unknown>>;
+  workspaceKnowledgeSnapshot?(): WorkspaceKnowledgeSnapshotV2;
 }
 
 class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -148,6 +150,14 @@ function stableCanaryResponseHash(value: unknown): string {
   return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
 }
 
+function pickSnapshotMeta(snapshot: WorkspaceKnowledgeSnapshotV2) {
+  return { state: snapshot.state, hash: snapshot.hash, durationMs: snapshot.durationMs, roots: snapshot.roots, errors: snapshot.errors };
+}
+
+function projectWorkspaceAsset(asset: WorkspaceKnowledgeSnapshotV2['assets'][number]) {
+  return { ...asset, linkage: { relatedCount: asset.linkage.relatedCount, ...(asset.linkage.canonicalKey ? { canonicalKey: asset.linkage.canonicalKey } : {}) } };
+}
+
 function positiveInteger(raw: string | null, fallback: number, max: number): number {
   if (!raw) return fallback;
   const value = Number(raw);
@@ -164,6 +174,10 @@ export async function handleKmObservationApi(
   deps: KmObservationApiDeps,
 ): Promise<boolean> {
   const kmReadPath = url.pathname === '/api/km/health'
+    || url.pathname === '/api/km/knowledge-assets-v2'
+    || url.pathname === '/api/km/knowledge-health-v2'
+    || url.pathname === '/api/km/retrieval-usage-v2'
+    || url.pathname === '/api/km/dashboard-metrics-v2'
     || url.pathname.startsWith('/api/km/observations')
     || url.pathname === '/api/km/knowledge'
     || url.pathname === '/api/km/memory'
@@ -744,6 +758,26 @@ export async function handleKmObservationApi(
       if (!store.dashboardMetrics) throw new Error('km_dashboard_metrics_unavailable');
       jsonRes(res, 200, store.dashboardMetrics({ rankingLimit: positiveInteger(url.searchParams.get('rankingLimit'), 10, 50) }));
       return true;
+    }
+    if (url.pathname === '/api/km/knowledge-assets-v2' || url.pathname === '/api/km/knowledge-health-v2'
+      || url.pathname === '/api/km/retrieval-usage-v2' || url.pathname === '/api/km/dashboard-metrics-v2') {
+      if (!deps.workspaceKnowledgeSnapshot) throw new Error('km_workspace_knowledge_unavailable');
+      const snapshot = deps.workspaceKnowledgeSnapshot();
+      if (url.pathname === '/api/km/knowledge-assets-v2') {
+        const workspaceId = url.searchParams.get('workspaceId');
+        jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot),
+          items: (workspaceId ? snapshot.assets.filter(asset => asset.workspaceId === workspaceId) : snapshot.assets).map(projectWorkspaceAsset) }); return true;
+      }
+      if (url.pathname === '/api/km/knowledge-health-v2') {
+        jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot), health: snapshot.health, attention: snapshot.attention }); return true;
+      }
+      if (url.pathname === '/api/km/retrieval-usage-v2') {
+        jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot), retrievalQuality: snapshot.retrievalQuality }); return true;
+      }
+      if (!store.dashboardMetrics) throw new Error('km_dashboard_metrics_unavailable');
+      jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot),
+        assetHealth: snapshot.health, retrievalQuality: snapshot.retrievalQuality, attention: snapshot.attention,
+        kmRuntime: store.dashboardMetrics({ rankingLimit: positiveInteger(url.searchParams.get('rankingLimit'), 10, 50) }) }); return true;
     }
     if (url.pathname === '/api/km/retention') {
       if (deps.retentionRuntimeStatus) jsonRes(res, 200, await deps.retentionRuntimeStatus());
