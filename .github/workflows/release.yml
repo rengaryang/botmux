@@ -1228,7 +1228,7 @@ jobs:
     # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
     # macOS (fresh artifact, so the 7-day retention is irrelevant) and
     # `refresh-desktop-assets` --clobber-attaches to the existing Release.
-    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    if: github.repository == 'deepcoldy/botmux' && github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
     needs: [desktop, release]
     runs-on: ubuntu-latest
     permissions:
@@ -1262,7 +1262,7 @@ jobs:
           done
 
   refresh-desktop-assets:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.repository == 'deepcoldy/botmux' && github.event_name == 'workflow_dispatch'
     needs: desktop
     runs-on: ubuntu-latest
     permissions:

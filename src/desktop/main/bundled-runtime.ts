@@ -7,6 +7,7 @@ export interface ResolveBundledRuntimeInput {
   repoRoot: string;
   isPackaged: boolean;
   arch: NodeJS.Architecture;
+  platform?: NodeJS.Platform;
   appVersion: string;
   env: NodeJS.ProcessEnv;
   existsSync?: (path: string) => boolean;
@@ -16,7 +17,7 @@ export function resolveBundledRuntimeCandidate(input: ResolveBundledRuntimeInput
   const exists = input.existsSync ?? existsSync;
   const root = input.isPackaged ? join(input.resourcesPath, 'runtime') : input.repoRoot;
   const nodePath = input.isPackaged
-    ? join(input.resourcesPath, 'node', `darwin-${input.arch}`, 'bin', 'node')
+    ? bundledNodePath(input.resourcesPath, input.platform ?? process.platform, input.arch)
     : resolveDevelopmentNode(input.env, exists);
   const cliPath = join(root, 'dist', 'cli.js');
 
@@ -32,6 +33,13 @@ export function resolveBundledRuntimeCandidate(input: ResolveBundledRuntimeInput
     version: input.appVersion,
     runtimeSource: 'bundled',
   };
+}
+
+function bundledNodePath(resourcesPath: string, platform: NodeJS.Platform, arch: NodeJS.Architecture): string {
+  const target = `${platform}-${arch}`;
+  return platform === 'win32'
+    ? join(resourcesPath, 'node', target, 'node.exe')
+    : join(resourcesPath, 'node', target, 'bin', 'node');
 }
 
 function resolveDevelopmentNode(env: NodeJS.ProcessEnv, exists: (path: string) => boolean): string {

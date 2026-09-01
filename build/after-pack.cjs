@@ -12,28 +12,36 @@ const unusedPrivacyUsageKeys = [
 ];
 
 async function afterPack(context) {
-  if (context.electronPlatformName !== 'darwin') return;
-
   const productFilename = context.packager?.appInfo?.productFilename ?? 'Botmux';
-  const resourcesPath = join(context.appOutDir, `${productFilename}.app`, 'Contents', 'Resources');
+  const resourcesPath = resolveResourcesPath(context, productFilename);
+  expandRuntimeModules(resourcesPath);
+  if (context.electronPlatformName === 'darwin') scrubMacPrivacyUsageKeys(context.appOutDir, productFilename);
+}
+
+function resolveResourcesPath(context, productFilename) {
+  if (context.electronPlatformName === 'darwin') {
+    return join(context.appOutDir, `${productFilename}.app`, 'Contents', 'Resources');
+  }
+  return join(context.appOutDir, 'resources');
+}
+
+function expandRuntimeModules(resourcesPath) {
   const stagedModules = join(resourcesPath, 'runtime', 'node_modules.tar.gz');
   const runtimeModules = join(resourcesPath, 'runtime', 'node_modules');
   if (existsSync(stagedModules) && !existsSync(runtimeModules)) {
     execFileSync('tar', ['-xzf', stagedModules, '-C', join(resourcesPath, 'runtime')]);
     unlinkSync(stagedModules);
   }
-  const plistPath = join(context.appOutDir, `${productFilename}.app`, 'Contents', 'Info.plist');
-  if (!existsSync(plistPath)) return;
+}
 
+function scrubMacPrivacyUsageKeys(appOutDir, productFilename) {
+  const plistPath = join(appOutDir, `${productFilename}.app`, 'Contents', 'Info.plist');
+  if (!existsSync(plistPath)) return;
   for (const key of unusedPrivacyUsageKeys) {
-    // Electron's template can include generic privacy descriptions for APIs
-    // Botmux Desktop does not use. Remove them so macOS never presents those
-    // permissions as app requirements.
     try {
       execFileSync('/usr/libexec/PlistBuddy', ['-c', `Delete :${key}`, plistPath], { stdio: 'ignore' });
     } catch {
-      // Missing keys are fine; different Electron versions stamp different
-      // defaults.
+      // Missing keys are fine; different Electron versions stamp different defaults.
     }
   }
 }

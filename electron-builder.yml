@@ -1,6 +1,6 @@
 appId: com.botmux.desktop
 productName: Botmux
-artifactName: ${productName}-${version}-mac-${arch}.${ext}
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 npmRebuild: false
 extraMetadata:
   main: dist/desktop/main.cjs
@@ -44,3 +44,24 @@ mac:
   entitlementsInherit: build/entitlements.mac.plist
 dmg:
   sign: false
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+linux:
+  icon: build/icon.png
+  category: Development
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64, arm64]
+    - target: tar.gz
+      arch: [x64, arm64]

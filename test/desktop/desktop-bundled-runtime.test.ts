@@ -33,6 +33,7 @@ describe('bundled desktop runtime', () => {
       repoRoot: '/repo',
       isPackaged: true,
       arch: 'arm64',
+      platform: 'darwin',
       appVersion: '3.0.0',
       env: {},
       existsSync: () => true,
@@ -46,6 +47,18 @@ describe('bundled desktop runtime', () => {
       version: '3.0.0',
       runtimeSource: 'bundled',
     });
+  });
+
+  it('selects Windows and Linux packaged Node layouts', () => {
+    const existsSync = () => true;
+    expect(resolveBundledRuntimeCandidate({
+      resourcesPath: 'C:\\Program Files\\Botmux\\resources', repoRoot: 'C:\\repo', isPackaged: true,
+      arch: 'x64', platform: 'win32', appVersion: '3.0.0', env: {}, existsSync,
+    }).nodePath).toBe('C:\\Program Files\\Botmux\\resources/node/win32-x64/node.exe');
+    expect(resolveBundledRuntimeCandidate({
+      resourcesPath: '/opt/Botmux/resources', repoRoot: '/repo', isPackaged: true,
+      arch: 'arm64', platform: 'linux', appVersion: '3.0.0', env: {}, existsSync,
+    }).nodePath).toBe('/opt/Botmux/resources/node/linux-arm64/bin/node');
   });
 
   it('uses the package-manager Node for development', () => {

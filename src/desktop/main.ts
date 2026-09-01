@@ -67,6 +67,7 @@ async function bootstrap(): Promise<void> {
     repoRoot: process.cwd(),
     isPackaged: app.isPackaged,
     arch: process.arch,
+    platform: process.platform,
     appVersion,
     env: process.env,
   });
@@ -193,7 +194,7 @@ function resolveDesktopAppVersion(rawVersion: string): string {
 }
 
 function readBundleShortVersion(): string | null {
-  if (!app.isPackaged) return null;
+  if (!app.isPackaged || process.platform !== 'darwin') return null;
   try {
     const plist = readFileSync(join(process.resourcesPath, '..', 'Info.plist'), 'utf-8');
     const match = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
