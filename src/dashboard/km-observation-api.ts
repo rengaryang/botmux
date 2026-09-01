@@ -138,6 +138,10 @@ export interface KmObservationApiDeps {
 
 class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
 const MAX_BODY_BYTES = 128 * 1024;
+type KmIngestRunApiRecord = ReturnType<ObservationStore['listKmIngestRuns']>[number];
+type KmIngestTargetApiRecord = ReturnType<ObservationStore['listKmIngestTargets']>[number];
+type KmIngestRunApiReport = NonNullable<ReturnType<ObservationStore['getKmIngestRunReport']>>;
+
 async function readBody(req: IncomingMessage): Promise<{ body: Record<string, unknown>; raw: string }> {
   const chunks: Buffer[] = []; let bytes = 0;
   for await (const chunk of req) { const value = chunk as Buffer; bytes += value.length; if (bytes > MAX_BODY_BYTES) throw new KmApiError(413, 'request_body_too_large'); chunks.push(value); }
@@ -161,6 +165,124 @@ function pickSnapshotMeta(snapshot: WorkspaceKnowledgeSnapshotV2) {
 
 function projectWorkspaceAsset(asset: WorkspaceKnowledgeSnapshotV2['assets'][number]) {
   return { ...asset, linkage: { relatedCount: asset.linkage.relatedCount, ...(asset.linkage.canonicalKey ? { canonicalKey: asset.linkage.canonicalKey } : {}) } };
+}
+
+function projectKmIngestTarget(target: KmIngestTargetApiRecord) {
+  return {
+    targetId: redactKmApiText(target.targetId),
+    state: target.state,
+    target: {
+      endpointMode: refMode(target.target.endpointRef),
+      dryRunOnly: target.target.dryRunOnly,
+      allowedProviderIds: target.target.allowedProviderIds.map(redactKmApiText),
+      ...(target.target.markIngestedCommand ? { markIngestedCommand: redactKmApiText(target.target.markIngestedCommand) } : {}),
+    },
+    targetHash: target.targetHash,
+    credential: { mode: refMode(target.credentialRef) },
+    createdBy: redactKmApiText(target.createdBy),
+    createdAt: target.createdAt,
+    updatedAt: target.updatedAt,
+  };
+}
+
+function projectKmIngestRun(run: KmIngestRunApiRecord) {
+  return {
+    runId: run.runId,
+    idempotencyKey: redactKmApiText(run.idempotencyKey),
+    state: run.state,
+    targetId: redactKmApiText(run.targetId),
+    plan: {
+      ...run.plan,
+      targetId: redactKmApiText(run.plan.targetId),
+      sourceRunId: redactKmApiText(run.plan.sourceRunId),
+      extractorProviderId: redactKmApiText(run.plan.extractorProviderId),
+      canonicalKeys: run.plan.canonicalKeys.map(redactKmApiText),
+    },
+    planHash: run.planHash,
+    canonicalKeySetHash: run.canonicalKeySetHash,
+    ...(run.externalAck ? { externalAck: projectKmIngestExternalAck(run.externalAck) } : {}),
+    sourceCount: run.sourceCount,
+    eligibleCount: run.eligibleCount,
+    ingestedCount: run.ingestedCount,
+    dedupedCount: run.dedupedCount,
+    skippedCount: run.skippedCount,
+    failedCount: run.failedCount,
+    rollbackCount: run.rollbackCount,
+    markIngestedPlannedCount: run.markIngestedPlannedCount,
+    ...(run.checkpoint ? { checkpoint: redactKmApiText(run.checkpoint) } : {}),
+    createdBy: redactKmApiText(run.createdBy),
+    ...(run.approvedBy ? { approvedBy: redactKmApiText(run.approvedBy) } : {}),
+    ...(run.lastError ? { lastError: redactKmApiText(run.lastError) } : {}),
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    ...(run.startedAt ? { startedAt: run.startedAt } : {}),
+    ...(run.completedAt ? { completedAt: run.completedAt } : {}),
+    ...(run.rolledBackAt ? { rolledBackAt: run.rolledBackAt } : {}),
+  };
+}
+
+function projectKmIngestReport(report: KmIngestRunApiReport) {
+  return {
+    run: projectKmIngestRun(report.run),
+    items: report.items.map(item => ({
+      ingestItemId: item.ingestItemId,
+      runId: item.runId,
+      canonicalKey: redactKmApiText(item.canonicalKey),
+      candidateHash: item.candidateHash,
+      candidate: {
+        targetLayer: item.candidate.targetLayer,
+        category: redactKmApiText(item.candidate.category),
+        claimKey: redactKmApiText(item.candidate.claimKey),
+        confidence: item.candidate.confidence,
+        freshness: item.candidate.freshness,
+        privacyClass: item.candidate.privacyClass,
+        sourceRefCount: item.candidate.sourceRefs.length,
+        ...(item.candidate.providerId ? { providerId: redactKmApiText(item.candidate.providerId) } : {}),
+        ...(item.candidate.sourceRunId ? { sourceRunId: redactKmApiText(item.candidate.sourceRunId) } : {}),
+      },
+      state: item.state,
+      ...(item.reasonCode ? { reasonCode: redactKmApiText(item.reasonCode) } : {}),
+      ...(item.knowledgeId ? { knowledgeId: item.knowledgeId } : {}),
+      ...(item.markIngestedPlan ? { markIngestedPlan: redactKmApiValue(item.markIngestedPlan) } : {}),
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+    })),
+    audit: report.audit.map(item => ({
+      ...item,
+      actorId: redactKmApiText(item.actorId),
+      details: redactKmApiValue(item.details) as Record<string, unknown>,
+    })),
+  };
+}
+
+function projectKmIngestExternalAck(ack: Record<string, unknown>): Record<string, unknown> {
+  return {
+    approved: ack.approved === true,
+    ...(typeof ack.planHash === 'string' ? { planHash: ack.planHash } : {}),
+    ...(typeof ack.approvedBy === 'string' ? { approvedBy: redactKmApiText(ack.approvedBy) } : {}),
+  };
+}
+
+function refMode(ref: string): string {
+  if (ref.startsWith('mock:')) return 'mock';
+  if (ref.startsWith('env:')) return 'env';
+  if (ref.startsWith('file:')) return 'file';
+  return 'unknown';
+}
+
+function redactKmApiValue(value: unknown): unknown {
+  if (typeof value === 'string') return redactKmApiText(value);
+  if (Array.isArray(value)) return value.map(redactKmApiValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => [key, redactKmApiValue(child)]));
+}
+
+function redactKmApiText(value: string): string {
+  return value
+    .replace(/\/(?:Users|home|root|data\d*|tmp|var|private|opt)\/[^\s'",;]+/giu, '[absolute-path-redacted]')
+    .replace(/[A-Z]:(?:\\|\/)[^\s'",;]+/gu, '[absolute-path-redacted]')
+    .replace(/\b((?:AK|SK|API[_-]?KEY|TOKEN|PASSWORD|PASSWD|SECRET)\s*[:=]\s*)['"]?[^\s'",;]+/giu, '$1***')
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/giu, '$1 ***');
 }
 
 function positiveInteger(raw: string | null, fallback: number, max: number): number {
@@ -859,14 +981,14 @@ export async function handleKmObservationApi(
           limit: positiveInteger(url.searchParams.get('limit'), 20, 100),
           ...(targetId ? { targetId } : {}),
           ...(state ? { state: state as any } : {}),
-        }),
+        }).map(projectKmIngestRun),
       }); return true;
     }
     if (url.pathname === '/api/km/ingest/targets') {
       if (!store.listKmIngestTargets) throw new Error('km_ingest_targets_unavailable');
       jsonRes(res, 200, {
         executor: { enabled: false, mode: 'offline', executionApiEnabled: false },
-        items: store.listKmIngestTargets(positiveInteger(url.searchParams.get('limit'), 20, 100)),
+        items: store.listKmIngestTargets(positiveInteger(url.searchParams.get('limit'), 20, 100)).map(projectKmIngestTarget),
       }); return true;
     }
     if (url.pathname === '/api/km/production-gates') {
@@ -961,7 +1083,7 @@ export async function handleKmObservationApi(
       if (!store.getKmIngestRunReport) throw new Error('km_ingest_unavailable');
       const report = store.getKmIngestRunReport(decodeURIComponent(ingestStatus[1]));
       if (!report) throw new Error('km_ingest_run_not_found');
-      jsonRes(res, 200, { executor: { enabled: false, mode: 'offline', executionApiEnabled: false }, ...report }); return true;
+      jsonRes(res, 200, { executor: { enabled: false, mode: 'offline', executionApiEnabled: false }, ...projectKmIngestReport(report) }); return true;
     }
     if (url.pathname === '/api/km/backend-runtime') {
       if (!deps.backendRuntimeStatus) throw new Error('km_backend_runtime_unavailable');
