@@ -2301,7 +2301,11 @@ const STARTUP_CMD_CAP_MS = 4_000;
  *  registers the match before submit) → a separate Enter, or fall back to a
  *  single write + CR. Shared by the `raw_input` IPC handler and
  *  runStartupCommands so both stay in lockstep. */
-async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
+async function sendRawCommandLine(
+  be: NonNullable<typeof backend>,
+  content: string,
+  submission?: { submitCount?: 1 | 2; submitIntervalMs?: number },
+): Promise<void> {
   // PR #597 extracted the CoCo/pty keystroke choreography into the shared
   // writeRawCommandLine helper (unit-tested in raw-command-writer.ts). It
   // reports a rejected text/Enter write as `false` instead of throwing; master's
@@ -2311,7 +2315,10 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   const accepted = await writeRawCommandLine(
     be,
     content,
-    rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+    {
+      ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+      ...submission,
+    },
   );
   if (accepted === false) {
     throw new Error('backend rejected command text or submit key input');
@@ -2342,6 +2349,7 @@ async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
   beforeWrite?: () => void,
+  submission?: { submitCount?: 1 | 2; submitIntervalMs?: number },
 ): Promise<void> {
   const previous = commandLineWriteTail;
   let release!: () => void;
@@ -2351,7 +2359,7 @@ async function sendRawCommandLineWithRecoveryFence(
   try {
     const transaction = await runAmbiguousSubmissionTransaction(
       be,
-      () => sendRawCommandLine(be, content),
+      () => sendRawCommandLine(be, content, submission),
       undefined,
       beforeWrite,
     );
@@ -2605,6 +2613,9 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
         publishSandboxRelayCapability();
+      }, {
+        submitCount: msg.submitCount,
+        submitIntervalMs: msg.submitIntervalMs,
       });
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {

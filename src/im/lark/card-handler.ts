@@ -1551,6 +1551,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const accepted = sendWorkerSessionInput(ds, {
         type: 'raw_input',
         content: command,
+        submitCount: capability.submitCount,
+        ...(capability.submitIntervalMs !== undefined
+          ? { submitIntervalMs: capability.submitIntervalMs }
+          : {}),
         ...(mojoLivePatchForSession(ds) ?? {}),
       });
       if (!accepted) {

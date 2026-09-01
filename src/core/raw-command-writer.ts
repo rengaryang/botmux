@@ -15,6 +15,10 @@ export interface RawCommandWriteOptions {
   pasteLine?: boolean;
   pasteSettleMs?: number;
   submitBeatMs?: number;
+  /** Total submit-key presses. Bounded to 1–2; two is reserved for TUI flows
+   * where the first Enter confirms autocomplete and the second submits. */
+  submitCount?: 1 | 2;
+  submitIntervalMs?: number;
   delay?: (ms: number) => Promise<void>;
 }
 
@@ -31,6 +35,22 @@ export async function writeRawCommandLine(
   const sendText = backend.sendText?.bind(backend);
   const sendSpecialKeys = backend.sendSpecialKeys?.bind(backend);
   const pasteText = backend.pasteText?.bind(backend);
+  const submitCount = opts.submitCount === 2 ? 2 : 1;
+  const submitIntervalMs = opts.submitIntervalMs ?? beatMs;
+  const submitSpecialKeys = async (): Promise<boolean> => {
+    for (let index = 0; index < submitCount; index += 1) {
+      if (sendSpecialKeys!('Enter') === false) return false;
+      if (index + 1 < submitCount) await delay(submitIntervalMs);
+    }
+    return true;
+  };
+  const submitWrites = async (): Promise<boolean> => {
+    for (let index = 0; index < submitCount; index += 1) {
+      if (backend.write('\r') === false) return false;
+      if (index + 1 < submitCount) await delay(submitIntervalMs);
+    }
+    return true;
+  };
 
   if (sendSpecialKeys) {
     if (opts.coco && sendText) {
@@ -41,23 +61,23 @@ export async function writeRawCommandLine(
         await delay(opts.cocoThrottleMs ?? 40);
       }
       await delay(beatMs);
-      return sendSpecialKeys('Enter') !== false;
+      return submitSpecialKeys();
     }
     if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
       if (pasteText(content) === false) return false;
       await delay(opts.pasteSettleMs ?? beatMs);
-      return sendSpecialKeys('Enter') !== false;
+      return submitSpecialKeys();
     }
     if (sendText) {
       if (sendText(content) === false) return false;
       await delay(beatMs);
-      return sendSpecialKeys('Enter') !== false;
+      return submitSpecialKeys();
     }
   }
 
   if (backend.write(content) === false) return false;
   await delay(beatMs);
-  return backend.write('\r') !== false;
+  return submitWrites();
 }
 
 export interface RawCommandDeliveryFinalizer {
