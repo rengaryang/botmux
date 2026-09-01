@@ -31,6 +31,8 @@ describe('cross-platform desktop release', () => {
     }
     expect(runtime).toContain('BOTMUX_DESKTOP_TARGETS');
     expect(runtime).toContain('node.exe');
+    expect(runtime).toContain("run('tar', ['-xf', archive, '-C', extracted], root)");
+    expect(runtime).not.toContain('Expand-Archive');
     expect(runtime).toContain("os: supportedOs");
   });
 
@@ -45,10 +47,14 @@ describe('cross-platform desktop release', () => {
     expect(windows).toContain('electron-builder --win nsis zip --x64');
     expect(linux).toContain('ubuntu-22.04');
     expect(linux).toContain('ubuntu-24.04-arm');
-    expect(linux).toContain('electron-builder --linux AppImage deb tar.gz');
+    expect(linux).toContain('electron-builder --linux AppImage');
+    expect(linux).toContain('electron-builder --linux deb');
+    expect(linux).toContain('electron-builder --linux tar.gz');
   });
 
   it('publishes checksums and attaches all platform artifacts to one release', () => {
+    expect(workflow).toContain('Diagnose Windows runtime on failure');
+    expect(workflow).toContain('Diagnose Linux package output on failure');
     expect(workflow).toContain('SHA256SUMS');
     expect(workflow).toContain('pattern: botmux-desktop-*');
     expect(workflow).toContain('merge-multiple: true');

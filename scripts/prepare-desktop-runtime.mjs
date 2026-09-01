@@ -138,7 +138,9 @@ async function stageNodeRuntimes() {
     const extracted = await mkdtemp(join(tmpdir(), 'botmux-node-'));
     try {
       if (extension === 'zip') {
-        runPowerShell(['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${escapePowerShell(archive)}' -DestinationPath '${escapePowerShell(extracted)}' -Force`]);
+        // GitHub's Windows runners ship bsdtar. Using one archive tool on all
+        // platforms avoids PowerShell policy/quoting differences in CI.
+        run('tar', ['-xf', archive, '-C', extracted], root);
         const source = join(extracted, `node-v${nodeVersion}-${nodePlatform}`);
         const targetDir = join(nodeDir, target);
         await mkdir(targetDir, { recursive: true });
@@ -157,8 +159,6 @@ async function stageNodeRuntimes() {
   }
 }
 
-function escapePowerShell(value) { return value.replaceAll("'", "''"); }
-function runPowerShell(args) { run(process.platform === 'win32' ? 'powershell.exe' : 'pwsh', args, root); }
 function run(command, args, cwd) {
   const result = spawnSync(command, args, { cwd, stdio: 'inherit', shell: false });
   if (result.error) throw result.error;

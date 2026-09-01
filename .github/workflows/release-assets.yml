@@ -74,6 +74,10 @@ jobs:
       - run: pnpm build
       - run: pnpm desktop:bundle
       - run: pnpm desktop:runtime
+      - name: Diagnose Windows runtime on failure
+        if: failure()
+        shell: bash
+        run: find build/desktop-runtime build/desktop-node -maxdepth 5 -type f -print | sort | tail -300
       - name: Build Windows installer and portable zip
         run: pnpm exec electron-builder --win nsis zip --x64 --publish never --config electron-builder.yml
       - shell: bash
@@ -115,9 +119,21 @@ jobs:
           test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
       - run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
       - run: pnpm build && pnpm desktop:bundle && pnpm desktop:runtime
-      - name: Build Linux packages
-        run: pnpm exec electron-builder --linux AppImage deb tar.gz --${{ matrix.arch }} --publish never --config electron-builder.yml
-      - run: test -n "$(find dist -maxdepth 1 -name '*.AppImage' -print -quit)" && test -n "$(find dist -maxdepth 1 -name '*.deb' -print -quit)" && test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+      - name: Build Linux AppImage
+        run: pnpm exec electron-builder --linux AppImage --${{ matrix.arch }} --publish never --config electron-builder.yml
+      - name: Build Linux deb
+        run: pnpm exec electron-builder --linux deb --${{ matrix.arch }} --publish never --config electron-builder.yml
+      - name: Build Linux tarball
+        run: pnpm exec electron-builder --linux tar.gz --${{ matrix.arch }} --publish never --config electron-builder.yml
+      - name: Verify Linux assets
+        run: |
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort
+          test -n "$(find dist -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+      - name: Diagnose Linux package output on failure
+        if: failure()
+        run: find dist build/desktop-runtime build/desktop-node -maxdepth 5 -type f -printf '%p %s bytes\n' | sort | tail -500
       - uses: actions/upload-artifact@v4
         with:
           name: botmux-desktop-linux-${{ matrix.arch }}
