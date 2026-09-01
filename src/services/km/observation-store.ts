@@ -27,7 +27,7 @@ import {
 } from './retention-policy.js';
 import { assertKmProductionGateTransition } from './production-gate.js';
 
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 const BUSY_TIMEOUT_MS = 5_000;
 
 const KNOWLEDGE_STATES = [
@@ -43,11 +43,19 @@ const KNOWLEDGE_TO_MEMORY_IMPORT_JOB_STATES = [
 const KNOWLEDGE_TO_MEMORY_IMPORT_ITEM_STATES = [
   'pending', 'imported', 'deduped', 'conflicted', 'skipped', 'failed',
 ] as const;
+const KM_INGEST_TARGET_STATES = ['disabled', 'ready'] as const;
+const KM_INGEST_RUN_STATES = [
+  'planned', 'approved', 'running', 'partial', 'completed', 'blocked', 'failed', 'rolled_back',
+] as const;
+const KM_INGEST_ITEM_STATES = ['pending', 'ingested', 'deduped', 'skipped', 'failed', 'rolled_back'] as const;
 
 export type KnowledgeState = typeof KNOWLEDGE_STATES[number];
 export type MemoryState = typeof MEMORY_STATES[number];
 export type KnowledgeToMemoryImportJobState = typeof KNOWLEDGE_TO_MEMORY_IMPORT_JOB_STATES[number];
 export type KnowledgeToMemoryImportItemState = typeof KNOWLEDGE_TO_MEMORY_IMPORT_ITEM_STATES[number];
+export type KmIngestTargetState = typeof KM_INGEST_TARGET_STATES[number];
+export type KmIngestRunState = typeof KM_INGEST_RUN_STATES[number];
+export type KmIngestItemState = typeof KM_INGEST_ITEM_STATES[number];
 export type KnowledgeLayer = 'L1' | 'L2' | 'L3' | 'L4' | 'reviewed-only';
 export type MemoryScope = 'user' | 'bot' | 'workspace' | 'project' | 'skill' | 'environment' | 'team';
 export type ImportableMemoryScope = Exclude<MemoryScope, 'user' | 'bot'>;
@@ -389,6 +397,77 @@ const PHASE18_SCHEMA = `
     actor_id TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+`;
+
+const PHASE19_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS km_ingest_targets (
+    target_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK(state IN ('disabled','ready')),
+    target_json TEXT NOT NULL CHECK(json_valid(target_json)),
+    target_hash TEXT NOT NULL,
+    credential_ref TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_ingest_targets_state_updated ON km_ingest_targets(state,updated_at DESC,target_id);
+
+  CREATE TABLE IF NOT EXISTS km_ingest_runs (
+    run_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('planned','approved','running','partial','completed','blocked','failed','rolled_back')),
+    target_id TEXT NOT NULL,
+    plan_json TEXT NOT NULL CHECK(json_valid(plan_json)),
+    plan_hash TEXT NOT NULL,
+    canonical_key_set_hash TEXT NOT NULL,
+    confirmation_token_hash TEXT NOT NULL,
+    external_ack_json TEXT CHECK(external_ack_json IS NULL OR json_valid(external_ack_json)),
+    source_count INTEGER NOT NULL DEFAULT 0,
+    eligible_count INTEGER NOT NULL DEFAULT 0,
+    ingested_count INTEGER NOT NULL DEFAULT 0,
+    deduped_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    rollback_count INTEGER NOT NULL DEFAULT 0,
+    mark_ingested_planned_count INTEGER NOT NULL DEFAULT 0,
+    checkpoint TEXT,
+    created_by TEXT NOT NULL,
+    approved_by TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    rolled_back_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS km_ingest_runs_state_updated ON km_ingest_runs(state,updated_at DESC,run_id DESC);
+  CREATE INDEX IF NOT EXISTS km_ingest_runs_target_updated ON km_ingest_runs(target_id,updated_at DESC,run_id DESC);
+
+  CREATE TABLE IF NOT EXISTS km_ingest_items (
+    ingest_item_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES km_ingest_runs(run_id) ON DELETE CASCADE,
+    canonical_key TEXT NOT NULL,
+    candidate_json TEXT NOT NULL CHECK(json_valid(candidate_json)),
+    candidate_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','ingested','deduped','skipped','failed','rolled_back')),
+    reason_code TEXT,
+    knowledge_id TEXT REFERENCES knowledge_items(knowledge_id) ON DELETE SET NULL,
+    mark_ingested_plan_json TEXT CHECK(mark_ingested_plan_json IS NULL OR json_valid(mark_ingested_plan_json)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id,canonical_key)
+  );
+  CREATE INDEX IF NOT EXISTS km_ingest_items_run_state ON km_ingest_items(run_id,state,ingest_item_id);
+
+  CREATE TABLE IF NOT EXISTS km_ingest_audit (
+    audit_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES km_ingest_runs(run_id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    details_json TEXT NOT NULL CHECK(json_valid(details_json)),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS km_ingest_audit_run_created ON km_ingest_audit(run_id,created_at,audit_id);
 `;
 
 const PHASE11_SCHEMA = `
@@ -822,6 +901,130 @@ export interface KnowledgeToMemoryImportReport {
   audit: Array<{ auditId: string; action: string; actorId: string; details: Record<string, unknown>; createdAt: string }>;
 }
 
+export interface KmIngestTargetConfig {
+  targetId: string;
+  endpointRef: string;
+  credentialRef: string;
+  enabled?: boolean;
+  dryRunOnly?: boolean;
+  allowedProviderIds?: string[];
+  markIngestedCommand?: string;
+}
+
+export interface KmIngestTargetRecord {
+  targetId: string;
+  state: KmIngestTargetState;
+  target: {
+    endpointRef: string;
+    dryRunOnly: boolean;
+    allowedProviderIds: string[];
+    markIngestedCommand?: string;
+  };
+  targetHash: string;
+  credentialRef: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KmIngestCandidateInput extends KnowledgeCandidateInput {
+  canonicalKey?: string;
+  providerId?: string;
+  sourceRunId?: string;
+}
+
+export interface KmIngestItemInput {
+  canonicalKey: string;
+  candidate: KnowledgeCandidateInput & { providerId?: string; sourceRunId?: string };
+  candidateHash: string;
+  state?: KmIngestItemState;
+  reasonCode?: string;
+}
+
+export interface KmIngestRunPlan {
+  schemaVersion: 1;
+  targetId: string;
+  targetHash: string;
+  sourceRunId: string;
+  extractorRunState: string;
+  extractorProviderId: string;
+  mode: 'offline';
+  dryRun: boolean;
+  planCalls: {
+    markIngested: boolean;
+  };
+  canonicalKeys: string[];
+}
+
+export interface KmIngestRunRecord {
+  runId: string;
+  idempotencyKey: string;
+  state: KmIngestRunState;
+  targetId: string;
+  plan: KmIngestRunPlan;
+  planHash: string;
+  canonicalKeySetHash: string;
+  confirmationTokenHash: string;
+  externalAck?: Record<string, unknown>;
+  sourceCount: number;
+  eligibleCount: number;
+  ingestedCount: number;
+  dedupedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  rollbackCount: number;
+  markIngestedPlannedCount: number;
+  checkpoint?: string;
+  createdBy: string;
+  approvedBy?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  rolledBackAt?: string;
+}
+
+export interface KmIngestItemRecord {
+  ingestItemId: string;
+  runId: string;
+  canonicalKey: string;
+  candidate: KnowledgeCandidateInput & { providerId?: string; sourceRunId?: string };
+  candidateHash: string;
+  state: KmIngestItemState;
+  reasonCode?: string;
+  knowledgeId?: string;
+  markIngestedPlan?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KmIngestRunStats {
+  sourceCount: number;
+  eligibleCount: number;
+  ingestedCount: number;
+  dedupedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  rollbackCount: number;
+  markIngestedPlannedCount: number;
+}
+
+export interface KmIngestRunCreateInput {
+  idempotencyKey: string;
+  actorId: string;
+  targetId: string;
+  confirmationTokenHash: string;
+  plan: KmIngestRunPlan;
+  items: KmIngestItemInput[];
+}
+
+export interface KmIngestRunReport {
+  run: KmIngestRunRecord;
+  items: KmIngestItemRecord[];
+  audit: Array<{ auditId: string; action: string; actorId: string; details: Record<string, unknown>; createdAt: string }>;
+}
+
 export interface MemoryUpsertInput {
   memoryId?: string;
   state?: 'proposed' | 'active';
@@ -1239,7 +1442,7 @@ function quarantineId(): string {
   return `q_${randomUUID().replaceAll('-', '')}`;
 }
 
-function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready' | 'kmi' | 'kmii' | 'kmia' | 'pg' | 'pga'): string {
+function kmId(prefix: 'kn' | 'mem' | 'hist' | 'edge' | 'eval' | 'result' | 'evo' | 'approval' | 'gold' | 'cmp' | 'label' | 'ready' | 'kmi' | 'kmii' | 'kmia' | 'pg' | 'pga' | 'kmt' | 'kmir' | 'kmiri' | 'kmira'): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
@@ -1577,6 +1780,46 @@ function normalizeKnowledgeToMemoryImportItems(
   return normalized;
 }
 
+function normalizeKmIngestItems(runId: string, items: KmIngestItemInput[]): Array<KmIngestItemRecord> {
+  const seen = new Set<string>();
+  const now = new Date().toISOString();
+  const normalized: KmIngestItemRecord[] = [];
+  for (const raw of items) {
+    const canonicalKey = requireText(raw.canonicalKey, 'ingest_canonical_key');
+    if (seen.has(canonicalKey)) throw new Error('km_ingest_canonical_key_duplicate');
+    seen.add(canonicalKey);
+    if (!KM_INGEST_ITEM_STATES.includes(raw.state ?? 'pending')) throw new Error('km_ingest_item_state_invalid');
+    if (raw.candidate.sourceRefs.length === 0) throw new Error('km_ingest_candidate_source_refs_required');
+    normalized.push({
+      ingestItemId: `kmiri_${createHash('sha256').update(`${runId}|${canonicalKey}`).digest('hex')}`,
+      runId,
+      canonicalKey,
+      candidate: JSON.parse(canonicalJsonStringify(raw.candidate)) as KmIngestItemRecord['candidate'],
+      candidateHash: requireText(raw.candidateHash, 'ingest_candidate_hash'),
+      state: raw.state ?? 'pending',
+      ...(raw.reasonCode ? { reasonCode: raw.reasonCode } : {}),
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  return normalized;
+}
+
+const KM_INGEST_TRANSITIONS: Readonly<Record<KmIngestRunState, readonly KmIngestRunState[]>> = {
+  planned: ['approved', 'blocked', 'failed'],
+  approved: ['running', 'blocked', 'failed'],
+  running: ['partial', 'completed', 'blocked', 'failed'],
+  partial: ['running', 'rolled_back', 'failed'],
+  completed: ['rolled_back'],
+  blocked: ['approved', 'failed', 'rolled_back'],
+  failed: ['running', 'rolled_back'],
+  rolled_back: [],
+};
+
+function assertKmIngestRunTransition(from: KmIngestRunState, to: KmIngestRunState): void {
+  if (!KM_INGEST_TRANSITIONS[from]?.includes(to)) throw new Error(`km_ingest_invalid_transition:${from}:${to}`);
+}
+
 const KNOWLEDGE_TRANSITIONS: Readonly<Record<KnowledgeState, readonly KnowledgeState[]>> = {
   observed: ['candidate'],
   candidate: ['deduped', 'review_pending', 'rejected'],
@@ -1784,6 +2027,7 @@ export class ObservationStore {
     if (this.schemaVersion() < 16) this.migrateToPhase16();
     if (this.schemaVersion() < 17) this.migrateToPhase17();
     if (this.schemaVersion() < 18) this.migrateToPhase18();
+    if (this.schemaVersion() < 19) this.migrateToPhase19();
     this.validateSchema();
     this.seedBuiltinKmProvidersBestEffort();
     this.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
@@ -3449,6 +3693,213 @@ export class ObservationStore {
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
+  putKmIngestTarget(input: { config: KmIngestTargetConfig; actorId: string }): KmIngestTargetRecord {
+    const actorId = requireText(input.actorId, 'ingest_actor');
+    const targetId = requireText(input.config.targetId, 'ingest_target_id');
+    const endpointRef = requireText(input.config.endpointRef, 'ingest_target_endpoint');
+    if (!endpointRef.startsWith('mock:') && !endpointRef.startsWith('file:/')) throw new Error('km_ingest_target_offline_endpoint_required');
+    const credentialRef = requireText(input.config.credentialRef, 'ingest_target_credential_ref');
+    if (!credentialRef.startsWith('mock:') && !credentialRef.startsWith('file:/') && !credentialRef.startsWith('env:')) throw new Error('km_ingest_target_credential_ref_invalid');
+    const allowedProviderIds = [...new Set((input.config.allowedProviderIds ?? []).map(value => requireText(value, 'ingest_target_provider')))]
+      .sort((a, b) => a.localeCompare(b));
+    const target = {
+      endpointRef,
+      dryRunOnly: input.config.dryRunOnly !== false,
+      allowedProviderIds,
+      ...(input.config.markIngestedCommand?.trim() ? { markIngestedCommand: input.config.markIngestedCommand.trim() } : {}),
+    };
+    const targetHash = sha256(canonicalJsonStringify({ ...target, credentialRef }));
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO km_ingest_targets(target_id,state,target_json,target_hash,credential_ref,created_by,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(target_id) DO UPDATE SET
+      state=excluded.state,target_json=excluded.target_json,target_hash=excluded.target_hash,
+      credential_ref=excluded.credential_ref,updated_at=excluded.updated_at`)
+      .run(targetId, input.config.enabled === true ? 'ready' : 'disabled',
+        canonicalJsonStringify(target), targetHash, credentialRef, actorId, now, now);
+    return this.getKmIngestTarget(targetId)!;
+  }
+
+  getKmIngestTarget(targetId: string): KmIngestTargetRecord | null {
+    const row = this.db.prepare('SELECT * FROM km_ingest_targets WHERE target_id=?').get(targetId) as any;
+    return row ? this.kmIngestTargetFromRow(row) : null;
+  }
+
+  listKmIngestTargets(limit = 50): KmIngestTargetRecord[] {
+    const rows = this.db.prepare('SELECT * FROM km_ingest_targets ORDER BY updated_at DESC,target_id ASC LIMIT ?')
+      .all(Math.max(1, Math.min(limit, 200))) as any[];
+    return rows.map(row => this.kmIngestTargetFromRow(row));
+  }
+
+  createKmIngestRun(input: KmIngestRunCreateInput): KmIngestRunReport {
+    const actorId = requireText(input.actorId, 'ingest_actor');
+    const idempotencyKey = requireText(input.idempotencyKey, 'ingest_idempotency_key');
+    const targetId = requireText(input.targetId, 'ingest_target_id');
+    if (input.plan.schemaVersion !== 1 || input.plan.targetId !== targetId || input.plan.mode !== 'offline' || input.plan.dryRun !== true) {
+      throw new Error('km_ingest_plan_contract_invalid');
+    }
+    if (input.plan.planCalls.markIngested !== false) throw new Error('km_ingest_mark_ingested_requires_external_ack');
+    const planJson = canonicalJsonStringify(input.plan);
+    const planHash = sha256(planJson);
+    const keySetHash = sha256(canonicalJsonStringify(input.plan.canonicalKeys));
+    const existing = this.db.prepare('SELECT * FROM km_ingest_runs WHERE idempotency_key=?').get(idempotencyKey) as any;
+    if (existing) {
+      if (existing.plan_hash !== planHash) throw new Error('km_ingest_idempotency_conflict');
+      return this.getKmIngestRunReport(existing.run_id)!;
+    }
+    const now = new Date().toISOString();
+    const runId = `kmir_${createHash('sha256').update(`${idempotencyKey}|${targetId}|${planHash}`).digest('hex')}`;
+    const normalizedItems = normalizeKmIngestItems(runId, input.items);
+    const itemKeys = normalizedItems.map(item => item.canonicalKey).sort((a, b) => a.localeCompare(b));
+    if (canonicalJsonStringify(itemKeys) !== canonicalJsonStringify(input.plan.canonicalKeys)) throw new Error('km_ingest_canonical_key_set_mismatch');
+    const stats = this.computeKmIngestStats(normalizedItems);
+    this.db.exec('SAVEPOINT km_ingest_plan;');
+    try {
+      this.db.prepare(`INSERT INTO km_ingest_runs(
+        run_id,idempotency_key,state,target_id,plan_json,plan_hash,canonical_key_set_hash,confirmation_token_hash,
+        source_count,eligible_count,ingested_count,deduped_count,skipped_count,failed_count,rollback_count,
+        mark_ingested_planned_count,checkpoint,created_by,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(runId, idempotencyKey, 'planned', targetId,
+        planJson, planHash, keySetHash, requireText(input.confirmationTokenHash, 'ingest_confirmation_hash'),
+        stats.sourceCount, stats.eligibleCount, 0, 0, stats.skippedCount, stats.failedCount, 0,
+        stats.markIngestedPlannedCount, null, actorId, now, now);
+      const insert = this.db.prepare(`INSERT INTO km_ingest_items(
+        ingest_item_id,run_id,canonical_key,candidate_json,candidate_hash,state,reason_code,knowledge_id,mark_ingested_plan_json,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const item of normalizedItems) insert.run(item.ingestItemId, runId, item.canonicalKey,
+        canonicalJsonStringify(item.candidate), item.candidateHash, item.state, item.reasonCode ?? null, null,
+        item.markIngestedPlan ? canonicalJsonStringify(item.markIngestedPlan) : null, now, now);
+      this.insertKmIngestAudit(runId, 'plan.created', actorId, {
+        targetId, planHash, canonicalKeySetHash: keySetHash,
+        sourceCount: stats.sourceCount, eligibleCount: stats.eligibleCount,
+      }, now);
+      this.db.exec('RELEASE km_ingest_plan;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_ingest_plan; RELEASE km_ingest_plan;'); } catch {} throw error; }
+    return this.getKmIngestRunReport(runId)!;
+  }
+
+  transitionKmIngestRun(input: {
+    runId: string; toState: KmIngestRunState; actorId: string; action: string;
+    details?: Record<string, unknown>; expectedPlanHash?: string; externalAck?: Record<string, unknown>; lastError?: string;
+  }): KmIngestRunRecord {
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_ingest_transition;');
+    try {
+      const row = this.db.prepare('SELECT * FROM km_ingest_runs WHERE run_id=?').get(input.runId) as any;
+      if (!row) throw new Error('km_ingest_run_not_found');
+      if (input.expectedPlanHash && input.expectedPlanHash !== row.plan_hash) throw new Error('km_ingest_plan_hash_mismatch');
+      assertKmIngestRunTransition(row.state, input.toState);
+      this.db.prepare(`UPDATE km_ingest_runs SET state=?,external_ack_json=COALESCE(?,external_ack_json),
+        approved_by=CASE WHEN ?='approved' THEN ? ELSE approved_by END,
+        last_error=?,updated_at=?,started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,
+        completed_at=CASE WHEN ? IN ('completed','partial','blocked','failed') THEN ? ELSE completed_at END,
+        rolled_back_at=CASE WHEN ?='rolled_back' THEN ? ELSE rolled_back_at END
+        WHERE run_id=?`)
+        .run(input.toState, input.externalAck ? canonicalJsonStringify(input.externalAck) : null,
+          input.toState, input.actorId, input.lastError ?? null, now,
+          input.toState, now, input.toState, now, input.toState, now, input.runId);
+      this.insertKmIngestAudit(input.runId, input.action, input.actorId, input.details ?? {}, now);
+      this.db.exec('RELEASE km_ingest_transition;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_ingest_transition; RELEASE km_ingest_transition;'); } catch {} throw error; }
+    return this.getKmIngestRun(input.runId)!;
+  }
+
+  runKmIngestOffline(input: { runId: string; actorId: string; maxItems?: number }): KmIngestRunReport {
+    const actorId = requireText(input.actorId, 'ingest_actor');
+    const run = this.getKmIngestRun(input.runId);
+    if (!run) throw new Error('km_ingest_run_not_found');
+    if (!['approved','partial','failed'].includes(run.state)) throw new Error(`km_ingest_execution_requires_approval:${run.state}`);
+    const limit = Math.max(1, Math.min(input.maxItems ?? 50, 100));
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_ingest_run;');
+    try {
+      this.db.prepare(`UPDATE km_ingest_runs SET state='running',started_at=COALESCE(started_at,?),updated_at=?,last_error=NULL WHERE run_id=?`)
+        .run(now, now, input.runId);
+      this.insertKmIngestAudit(input.runId, 'execution.started', actorId, { limit, offline: true }, now);
+      const rows = this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? AND state IN ('pending','failed')
+        ORDER BY ingest_item_id ASC LIMIT ?`).all(input.runId, limit) as any[];
+      for (const row of rows) {
+        try { this.applyKmIngestItem(row, run, actorId, now); }
+        catch (error) { this.markKmIngestItem(String(row.ingest_item_id), 'failed', error instanceof Error ? error.message : String(error), undefined, undefined, now); }
+      }
+      this.refreshKmIngestRun(input.runId, rows.at(-1)?.ingest_item_id ? String(rows.at(-1).ingest_item_id) : run.checkpoint, now);
+      this.insertKmIngestAudit(input.runId, 'execution.finished', actorId, { processed: rows.length, offline: true }, now);
+      this.db.exec('RELEASE km_ingest_run;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_ingest_run; RELEASE km_ingest_run;'); } catch {} throw error; }
+    return this.getKmIngestRunReport(input.runId)!;
+  }
+
+  rollbackKmIngestRun(input: { runId: string; actorId: string; expectedPlanHash?: string; reasonCode: string }): KmIngestRunReport {
+    const actorId = requireText(input.actorId, 'ingest_actor');
+    const run = this.getKmIngestRun(input.runId);
+    if (!run) throw new Error('km_ingest_run_not_found');
+    if (input.expectedPlanHash && input.expectedPlanHash !== run.planHash) throw new Error('km_ingest_plan_hash_mismatch');
+    if (!['partial','completed','failed'].includes(run.state)) throw new Error(`km_ingest_rollback_not_allowed:${run.state}`);
+    const reasonCode = requireText(input.reasonCode, 'ingest_rollback_reason');
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_ingest_rollback;');
+    try {
+      const rows = this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? AND state='ingested' ORDER BY ingest_item_id ASC`)
+        .all(input.runId) as any[];
+      for (const row of rows) {
+        if (row.knowledge_id) {
+          const knowledge = this.db.prepare('SELECT state FROM knowledge_items WHERE knowledge_id=?').get(row.knowledge_id) as { state: string } | undefined;
+          if (knowledge && knowledge.state === 'candidate') {
+            this.db.prepare('UPDATE knowledge_items SET state=?,updated_at=? WHERE knowledge_id=?').run('rejected', now, row.knowledge_id);
+            this.db.prepare(`INSERT INTO knowledge_state_history(history_id,knowledge_id,from_state,to_state,reason_code,actor_id,evidence_event_id,created_at)
+              VALUES(?,?,?,?,?,?,?,?)`).run(kmId('hist'), row.knowledge_id, 'candidate', 'rejected', `km_ingest_rollback:${reasonCode}`, actorId, null, now);
+          }
+        }
+        this.markKmIngestItem(String(row.ingest_item_id), 'rolled_back', reasonCode, row.knowledge_id ? String(row.knowledge_id) : undefined, undefined, now);
+      }
+      this.refreshKmIngestRun(input.runId, run.checkpoint, now, 'rolled_back');
+      this.insertKmIngestAudit(input.runId, 'rollback.finished', actorId, { reasonCode, rolledBack: rows.length }, now);
+      this.db.exec('RELEASE km_ingest_rollback;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_ingest_rollback; RELEASE km_ingest_rollback;'); } catch {} throw error; }
+    return this.getKmIngestRunReport(input.runId)!;
+  }
+
+  getKmIngestRun(runId: string): KmIngestRunRecord | null {
+    const row = this.db.prepare('SELECT * FROM km_ingest_runs WHERE run_id=?').get(runId) as any;
+    return row ? this.kmIngestRunFromRow(row) : null;
+  }
+
+  listKmIngestRuns(input: { limit?: number; targetId?: string; state?: KmIngestRunState } = {}): KmIngestRunRecord[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (input.targetId) { where.push('target_id=?'); args.push(input.targetId); }
+    if (input.state) { where.push('state=?'); args.push(input.state); }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const rows = this.db.prepare(`SELECT * FROM km_ingest_runs ${clause} ORDER BY updated_at DESC,run_id DESC LIMIT ?`)
+      .all(...args, limit) as any[];
+    return rows.map(row => this.kmIngestRunFromRow(row));
+  }
+
+  listKmIngestItems(input: { runId: string; limit?: number; state?: KmIngestItemState }): KmIngestItemRecord[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const rows = input.state
+      ? this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? AND state=? ORDER BY ingest_item_id ASC LIMIT ?`).all(input.runId, input.state, limit) as any[]
+      : this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? ORDER BY ingest_item_id ASC LIMIT ?`).all(input.runId, limit) as any[];
+    return rows.map(row => this.kmIngestItemFromRow(row));
+  }
+
+  getKmIngestRunReport(runId: string): KmIngestRunReport | null {
+    const run = this.getKmIngestRun(runId);
+    if (!run) return null;
+    const auditRows = this.db.prepare(`SELECT * FROM km_ingest_audit WHERE run_id=? ORDER BY created_at ASC,audit_id ASC`).all(runId) as any[];
+    return {
+      run,
+      items: this.listKmIngestItems({ runId, limit: 500 }),
+      audit: auditRows.map(row => ({
+        auditId: row.audit_id,
+        action: row.action,
+        actorId: row.actor_id,
+        details: parseJsonRecord(row.details_json),
+        createdAt: row.created_at,
+      })),
+    };
+  }
+
   createProductionGatePlan(input: KmProductionGatePlanInsertInput): KmProductionGatePlanRecord {
     const now = input.now ?? new Date().toISOString();
     this.db.exec('SAVEPOINT km_production_gate_create;');
@@ -3727,6 +4178,15 @@ export class ObservationStore {
         ...(row.output_hash ? { outputHash: row.output_hash } : {}), createdAt: row.created_at, updatedAt: row.updated_at }));
   }
 
+  getDistillationJob(jobId: string): Record<string, unknown> | null {
+    const row = this.db.prepare(`SELECT job_id,source_event_id,bot_app_id,profile_id,profile_revision,state,attempts,next_attempt_at,last_error,output_hash,created_at,updated_at
+      FROM distillation_jobs WHERE job_id=?`).get(jobId) as any;
+    return row ? { jobId: row.job_id, sourceEventId: row.source_event_id, botAppId: row.bot_app_id,
+      profileId: row.profile_id, profileRevision: row.profile_revision, state: row.state, attempts: row.attempts,
+      nextAttemptAt: row.next_attempt_at, ...(row.last_error ? { lastError: row.last_error } : {}),
+      ...(row.output_hash ? { outputHash: row.output_hash } : {}), createdAt: row.created_at, updatedAt: row.updated_at } : null;
+  }
+
   listRetrievalAudits(limit: number): Array<Record<string, unknown>> {
     return (this.db.prepare(`SELECT retrieval_run_id,bot_app_id,session_id,turn_id,mode,candidate_count,eligible_count,latency_ms,warnings_json,created_at,
         direct_hit_count,normalized_hit_count,no_hit_count,filtered_scope_count,filtered_privacy_count,filtered_state_count
@@ -3850,7 +4310,8 @@ export class ObservationStore {
     const auditEventsTotal = count(`SELECT COUNT(*) count FROM observation_events`)
       + count(`SELECT COUNT(*) count FROM km_config_audit`)
       + count(`SELECT COUNT(*) count FROM km_import_audit`)
-      + count(`SELECT COUNT(*) count FROM km_production_gate_audit`);
+      + count(`SELECT COUNT(*) count FROM km_production_gate_audit`)
+      + count(`SELECT COUNT(*) count FROM km_ingest_audit`);
 
     const recallRows = this.db.prepare(`
       SELECT r.item_id,r.item_kind,COUNT(*) count,MAX(q.created_at) last_seen_at,
@@ -4331,6 +4792,176 @@ export class ObservationStore {
     };
   }
 
+  private kmIngestTargetFromRow(row: any): KmIngestTargetRecord {
+    return {
+      targetId: row.target_id,
+      state: row.state,
+      target: parseJsonRecord(row.target_json) as KmIngestTargetRecord['target'],
+      targetHash: row.target_hash,
+      credentialRef: row.credential_ref,
+      createdBy: row.created_by,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private kmIngestRunFromRow(row: any): KmIngestRunRecord {
+    return {
+      runId: row.run_id,
+      idempotencyKey: row.idempotency_key,
+      state: row.state,
+      targetId: row.target_id,
+      plan: parseJsonRecord(row.plan_json) as unknown as KmIngestRunPlan,
+      planHash: row.plan_hash,
+      canonicalKeySetHash: row.canonical_key_set_hash,
+      confirmationTokenHash: row.confirmation_token_hash,
+      ...(row.external_ack_json ? { externalAck: parseJsonRecord(row.external_ack_json) } : {}),
+      sourceCount: Number(row.source_count),
+      eligibleCount: Number(row.eligible_count),
+      ingestedCount: Number(row.ingested_count),
+      dedupedCount: Number(row.deduped_count),
+      skippedCount: Number(row.skipped_count),
+      failedCount: Number(row.failed_count),
+      rollbackCount: Number(row.rollback_count),
+      markIngestedPlannedCount: Number(row.mark_ingested_planned_count),
+      ...(row.checkpoint ? { checkpoint: row.checkpoint } : {}),
+      createdBy: row.created_by,
+      ...(row.approved_by ? { approvedBy: row.approved_by } : {}),
+      ...(row.last_error ? { lastError: row.last_error } : {}),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      ...(row.started_at ? { startedAt: row.started_at } : {}),
+      ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+      ...(row.rolled_back_at ? { rolledBackAt: row.rolled_back_at } : {}),
+    };
+  }
+
+  private kmIngestItemFromRow(row: any): KmIngestItemRecord {
+    return {
+      ingestItemId: row.ingest_item_id,
+      runId: row.run_id,
+      canonicalKey: row.canonical_key,
+      candidate: parseJsonRecord(row.candidate_json) as unknown as KmIngestItemRecord['candidate'],
+      candidateHash: row.candidate_hash,
+      state: row.state,
+      ...(row.reason_code ? { reasonCode: row.reason_code } : {}),
+      ...(row.knowledge_id ? { knowledgeId: row.knowledge_id } : {}),
+      ...(row.mark_ingested_plan_json ? { markIngestedPlan: parseJsonRecord(row.mark_ingested_plan_json) } : {}),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private computeKmIngestStats(items: Array<Pick<KmIngestItemRecord, 'state' | 'markIngestedPlan'>>): KmIngestRunStats {
+    return {
+      sourceCount: items.length,
+      eligibleCount: items.filter(item => item.state === 'pending').length,
+      ingestedCount: items.filter(item => item.state === 'ingested').length,
+      dedupedCount: items.filter(item => item.state === 'deduped').length,
+      skippedCount: items.filter(item => item.state === 'skipped').length,
+      failedCount: items.filter(item => item.state === 'failed').length,
+      rollbackCount: items.filter(item => item.state === 'rolled_back').length,
+      markIngestedPlannedCount: items.filter(item => item.markIngestedPlan).length,
+    };
+  }
+
+  private insertKmIngestAudit(runId: string, action: string, actorId: string, details: Record<string, unknown>, now: string): void {
+    this.db.prepare(`INSERT INTO km_ingest_audit(audit_id,run_id,action,actor_id,details_json,created_at)
+      VALUES(?,?,?,?,?,?)`).run(kmId('kmira'), runId, action, actorId, canonicalJsonStringify(details), now);
+  }
+
+  private applyKmIngestItem(row: any, run: KmIngestRunRecord, actorId: string, now: string): void {
+    const item = this.kmIngestItemFromRow(row);
+    if (item.state !== 'pending' && item.state !== 'failed') return;
+    const candidate = item.candidate;
+    const markIngestedPlan = run.externalAck ? {
+      command: 'mark-ingested',
+      dryRun: true,
+      runId: run.runId,
+      targetId: run.targetId,
+      canonicalKey: item.canonicalKey,
+      planHash: run.planHash,
+      externalAckHash: sha256(canonicalJsonStringify(run.externalAck)),
+      sideEffectsExecuted: false,
+    } : undefined;
+    if (candidate.confidence === 'inferred') {
+      this.markKmIngestItem(item.ingestItemId, 'skipped', 'inferred_not_ingested', undefined, undefined, now);
+      return;
+    }
+    if (candidate.privacyClass === 'sensitive' || candidate.privacyClass === 'secret-reference-only') {
+      this.markKmIngestItem(item.ingestItemId, 'skipped', 'privacy_not_ingested', undefined, undefined, now);
+      return;
+    }
+    const existing = this.db.prepare('SELECT * FROM knowledge_items WHERE target_layer=? AND claim_key=? AND claim_text=?')
+      .get(candidate.targetLayer, candidate.claimKey, candidate.claimText) as any;
+    if (existing) {
+      this.markKmIngestItem(item.ingestItemId, 'deduped', 'identical_knowledge_exists', existing.knowledge_id, markIngestedPlan, now);
+      this.insertTraceEdgeInTransaction({ fromType: 'km-ingest-candidate', fromId: item.canonicalKey, toType: 'knowledge', toId: existing.knowledge_id, edgeType: 'superseded' }, now);
+      return;
+    }
+    const knowledgeId = candidate.knowledgeId ?? `kn_${createHash('sha256').update(`${item.canonicalKey}|${item.candidateHash}`).digest('hex')}`;
+    this.db.prepare(`
+      INSERT INTO knowledge_items(
+        knowledge_id,state,target_layer,category,title,claim_key,claim_text,confidence,
+        freshness,privacy_class,source_refs_json,review_after,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      knowledgeId, 'candidate', candidate.targetLayer, requireText(candidate.category, 'knowledge_category'),
+      requireText(candidate.title, 'knowledge_title'), requireText(candidate.claimKey, 'knowledge_claim_key'),
+      requireText(candidate.claimText, 'knowledge_claim_text'), candidate.confidence, candidate.freshness ?? 'unknown',
+      candidate.privacyClass, JSON.stringify(candidate.sourceRefs), candidate.reviewAfter ?? null, now, now,
+    );
+    this.db.prepare(`
+      INSERT INTO knowledge_state_history(history_id,knowledge_id,from_state,to_state,reason_code,actor_id,evidence_event_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?)
+    `).run(kmId('hist'), knowledgeId, null, 'candidate', 'km_ingest_candidate_created', actorId, candidate.evidenceEventId ?? null, now);
+    this.markKmIngestItem(item.ingestItemId, 'ingested', 'knowledge_candidate_created', knowledgeId, markIngestedPlan, now);
+    this.insertTraceEdgeInTransaction({ fromType: 'km-ingest-candidate', fromId: item.canonicalKey, toType: 'knowledge', toId: knowledgeId, edgeType: 'produced' }, now);
+  }
+
+  private markKmIngestItem(
+    ingestItemId: string,
+    state: KmIngestItemState,
+    reasonCode: string,
+    knowledgeId: string | undefined,
+    markIngestedPlan: Record<string, unknown> | undefined,
+    now: string,
+  ): void {
+    this.db.prepare(`UPDATE km_ingest_items SET state=?,reason_code=?,knowledge_id=COALESCE(?,knowledge_id),
+      mark_ingested_plan_json=COALESCE(?,mark_ingested_plan_json),updated_at=? WHERE ingest_item_id=?`)
+      .run(state, reasonCode, knowledgeId ?? null, markIngestedPlan ? canonicalJsonStringify(markIngestedPlan) : null, now, ingestItemId);
+  }
+
+  private refreshKmIngestRun(
+    runId: string,
+    checkpoint: string | undefined,
+    now: string,
+    forcedState?: KmIngestRunState,
+  ): void {
+    const row = this.db.prepare(`SELECT
+      COUNT(*) source_count,
+      SUM(CASE WHEN state IN ('pending','ingested','deduped') THEN 1 ELSE 0 END) eligible_count,
+      SUM(CASE WHEN state='ingested' THEN 1 ELSE 0 END) ingested_count,
+      SUM(CASE WHEN state='deduped' THEN 1 ELSE 0 END) deduped_count,
+      SUM(CASE WHEN state='skipped' THEN 1 ELSE 0 END) skipped_count,
+      SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END) failed_count,
+      SUM(CASE WHEN state='rolled_back' THEN 1 ELSE 0 END) rollback_count,
+      SUM(CASE WHEN mark_ingested_plan_json IS NOT NULL THEN 1 ELSE 0 END) mark_ingested_planned_count,
+      SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END) pending_count
+      FROM km_ingest_items WHERE run_id=?`).get(runId) as any;
+    const pending = Number(row.pending_count ?? 0);
+    const failed = Number(row.failed_count ?? 0);
+    const finalState: KmIngestRunState = forcedState ?? (pending > 0 || failed > 0 ? 'partial' : 'completed');
+    this.db.prepare(`UPDATE km_ingest_runs SET state=?,checkpoint=?,source_count=?,eligible_count=?,ingested_count=?,
+      deduped_count=?,skipped_count=?,failed_count=?,rollback_count=?,mark_ingested_planned_count=?,updated_at=?,
+      completed_at=CASE WHEN ? IN ('completed','partial','blocked','failed') THEN ? ELSE completed_at END,
+      rolled_back_at=CASE WHEN ?='rolled_back' THEN ? ELSE rolled_back_at END WHERE run_id=?`)
+      .run(finalState, checkpoint ?? null, Number(row.source_count ?? 0), Number(row.eligible_count ?? 0),
+        Number(row.ingested_count ?? 0), Number(row.deduped_count ?? 0), Number(row.skipped_count ?? 0),
+        failed, Number(row.rollback_count ?? 0), Number(row.mark_ingested_planned_count ?? 0), now,
+        finalState, now, finalState, now, runId);
+  }
+
   private insertProductionGateAudit(
     planId: string,
     action: string,
@@ -4775,6 +5406,16 @@ export class ObservationStore {
     } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
   }
 
+  private migrateToPhase19(): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (this.schemaVersion() >= 19) { this.db.exec('COMMIT;'); return; }
+      this.db.exec(PHASE19_SCHEMA);
+      this.db.exec('PRAGMA user_version=19;');
+      this.db.exec('COMMIT;');
+    } catch (error) { try { this.db.exec('ROLLBACK;'); } catch {} throw error; }
+  }
+
   private migrateToPhase11(): void {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -4919,6 +5560,10 @@ export class ObservationStore {
       'km_production_gate_plans',
       'km_production_gate_audit',
       'km_production_gate_kill_state',
+      'km_ingest_targets',
+      'km_ingest_runs',
+      'km_ingest_items',
+      'km_ingest_audit',
     ];
     for (const table of required) {
       const row = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table) as { name: string } | undefined;

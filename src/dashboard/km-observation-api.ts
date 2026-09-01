@@ -110,6 +110,9 @@ export interface KmObservationApiStore {
   createKnowledgeToMemoryImportPreview?(input: Parameters<ObservationStore['createKnowledgeToMemoryImportPreview']>[0]): ReturnType<ObservationStore['createKnowledgeToMemoryImportPreview']>;
   submitKnowledgeToMemoryImportReview?(input: Parameters<ObservationStore['submitKnowledgeToMemoryImportReview']>[0]): ReturnType<ObservationStore['submitKnowledgeToMemoryImportReview']>;
   runKnowledgeToMemoryImport?(input: Parameters<ObservationStore['runKnowledgeToMemoryImport']>[0]): ReturnType<ObservationStore['runKnowledgeToMemoryImport']>;
+  listKmIngestTargets?(limit?: number): ReturnType<ObservationStore['listKmIngestTargets']>;
+  listKmIngestRuns?(input?: Parameters<ObservationStore['listKmIngestRuns']>[0]): ReturnType<ObservationStore['listKmIngestRuns']>;
+  getKmIngestRunReport?(runId: string): ReturnType<ObservationStore['getKmIngestRunReport']>;
   createProductionGatePlan?(input: Parameters<ObservationStore['createProductionGatePlan']>[0]): ReturnType<ObservationStore['createProductionGatePlan']>;
   getProductionGatePlan?(planId: string): ReturnType<ObservationStore['getProductionGatePlan']>;
   listProductionGatePlans?(input?: Parameters<ObservationStore['listProductionGatePlans']>[0]): ReturnType<ObservationStore['listProductionGatePlans']>;
@@ -208,6 +211,10 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/imports'
     || /^\/api\/km\/imports\/[^/]+$/.test(url.pathname)
     || /^\/api\/km\/imports\/[^/]+\/execute$/.test(url.pathname)
+    || url.pathname === '/api/km/ingest'
+    || url.pathname === '/api/km/ingest/targets'
+    || /^\/api\/km\/ingest\/[^/]+$/.test(url.pathname)
+    || /^\/api\/km\/ingest\/[^/]+\/(approve|execute|rollback)$/.test(url.pathname)
     || url.pathname === '/api/km/production-gates'
     || url.pathname === '/api/km/production-gates/kill-switch'
     || /^\/api\/km\/production-gates\/[^/]+$/.test(url.pathname)
@@ -842,6 +849,26 @@ export async function handleKmObservationApi(
       if (!store.listKnowledgeToMemoryImportJobs) throw new Error('km_import_unavailable');
       jsonRes(res, 200, { items: store.listKnowledgeToMemoryImportJobs(positiveInteger(url.searchParams.get('limit'), 20, 100)) }); return true;
     }
+    if (url.pathname === '/api/km/ingest') {
+      if (!store.listKmIngestRuns) throw new Error('km_ingest_unavailable');
+      const targetId = url.searchParams.get('targetId') ?? undefined;
+      const state = url.searchParams.get('state') ?? undefined;
+      jsonRes(res, 200, {
+        executor: { enabled: false, mode: 'offline', executionApiEnabled: false },
+        items: store.listKmIngestRuns({
+          limit: positiveInteger(url.searchParams.get('limit'), 20, 100),
+          ...(targetId ? { targetId } : {}),
+          ...(state ? { state: state as any } : {}),
+        }),
+      }); return true;
+    }
+    if (url.pathname === '/api/km/ingest/targets') {
+      if (!store.listKmIngestTargets) throw new Error('km_ingest_targets_unavailable');
+      jsonRes(res, 200, {
+        executor: { enabled: false, mode: 'offline', executionApiEnabled: false },
+        items: store.listKmIngestTargets(positiveInteger(url.searchParams.get('limit'), 20, 100)),
+      }); return true;
+    }
     if (url.pathname === '/api/km/production-gates') {
       if (!store.listProductionGatePlans || !store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');
       const actionKind = url.searchParams.get('actionKind') ?? undefined;
@@ -928,6 +955,13 @@ export async function handleKmObservationApi(
       const report = store.getKnowledgeToMemoryImportReport(decodeURIComponent(importStatus[1]));
       if (!report) throw new Error('km_import_job_not_found');
       jsonRes(res, 200, report); return true;
+    }
+    const ingestStatus = url.pathname.match(/^\/api\/km\/ingest\/([^/]+)$/);
+    if (ingestStatus) {
+      if (!store.getKmIngestRunReport) throw new Error('km_ingest_unavailable');
+      const report = store.getKmIngestRunReport(decodeURIComponent(ingestStatus[1]));
+      if (!report) throw new Error('km_ingest_run_not_found');
+      jsonRes(res, 200, { executor: { enabled: false, mode: 'offline', executionApiEnabled: false }, ...report }); return true;
     }
     if (url.pathname === '/api/km/backend-runtime') {
       if (!deps.backendRuntimeStatus) throw new Error('km_backend_runtime_unavailable');
