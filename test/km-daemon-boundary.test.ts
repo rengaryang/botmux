@@ -31,14 +31,19 @@ describe('KM live prompt-memory daemon boundary', () => {
 
   it('composes before ordinary prompt builders and after command early returns', () => {
     const helper = daemonSource.indexOf('const composePromptMemoryAtBoundary');
-    const call = daemonSource.indexOf('await composePromptMemoryAtBoundary(ds)');
-    const firstFollowUp = daemonSource.indexOf('buildFollowUpCliInput(promptContent', call);
-    const firstOpening = daemonSource.indexOf('buildNewTopicCliInput(', call);
+    const existingCall = daemonSource.indexOf('await composePromptMemoryAtBoundary(ds)');
+    const newSessionCall = daemonSource.indexOf('await composePromptMemoryAtBoundary(newDs)');
+    const firstFollowUp = daemonSource.indexOf('buildFollowUpCliInput(promptContent', existingCall);
+    const firstOpening = daemonSource.indexOf('buildNewTopicCliInput(', existingCall);
+    const registrationCheck = daemonSource.indexOf('if (!registration.accepted)');
+    const newSessionPromptPersist = daemonSource.indexOf('newDs.pendingPrompt = promptContent', newSessionCall);
     const commandBoundary = daemonSource.indexOf('// Intercept daemon commands');
     expect(helper).toBeGreaterThan(0);
-    expect(call).toBeGreaterThan(helper);
-    expect(call).toBeGreaterThan(commandBoundary);
-    expect(firstFollowUp).toBeGreaterThan(call);
-    expect(firstOpening).toBeGreaterThan(call);
+    expect(existingCall).toBeGreaterThan(helper);
+    expect(existingCall).toBeGreaterThan(commandBoundary);
+    expect(firstFollowUp).toBeGreaterThan(existingCall);
+    expect(firstOpening).toBeGreaterThan(existingCall);
+    expect(newSessionCall).toBeGreaterThan(registrationCheck);
+    expect(newSessionPromptPersist).toBeGreaterThan(newSessionCall);
   });
 });

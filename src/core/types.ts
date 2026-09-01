@@ -129,6 +129,14 @@ export interface DaemonSession {
   /** Per-session snapshot of the final-answer feedback policy. New config takes
    * effect on the next new/restarted session, matching sandbox send-cred state. */
   feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
+  /** Hash-only KM retrieval context for recent turns, used to correlate final
+   * answer feedback back to the retrieval run without storing user query text. */
+  kmRetrievalTurns?: Record<string, {
+    queryHash: string;
+    retrievalRunId?: string;
+    workingDir?: string;
+    recordedAt: number;
+  }>;
   /** Explicit per-trigger model override (trigger API `options.model`, codex
    *  family only). Outranks the bot's configured model at spawn; everything
    *  else resolves the model from the LIVE bot config on every spawn (see

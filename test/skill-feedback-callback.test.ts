@@ -141,4 +141,29 @@ describe('feedback callback state machine', () => {
     expect(duplicate).toEqual(first);
     store.close();
   });
+
+  it('exposes accepted feedback to best-effort retrieval evidence callbacks', async () => {
+    const { store, delivery } = await setup();
+    const seen: any[] = [];
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', {
+      store,
+      onFeedbackRecorded: input => seen.push(input),
+    });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].delivery.deliveryId).toBe(delivery.deliveryId);
+    expect(seen[0].feedback).toMatchObject({ result: 'conclusive_usable', semantic: 'positive' });
+    store.close();
+  });
+
+  it('keeps feedback card updates working when telemetry callbacks fail', async () => {
+    const { store } = await setup();
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', {
+      store,
+      onFeedbackRecorded: () => { throw new Error('telemetry down'); },
+    });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(JSON.stringify(result.card.data)).toContain('已选择：**结论可用**');
+    store.close();
+  });
 });

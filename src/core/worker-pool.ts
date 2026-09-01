@@ -12837,6 +12837,9 @@ async function persistFinalOutputFeedback(
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+    const kmRetrieval = ds.kmRetrievalTurns?.[msg.turnId];
+    const kmRetrievalWorkingDir = kmRetrieval?.workingDir ?? ds.session.workingDir ?? ds.workingDir;
+    const feedbackTeamId = resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId });
     const result = feedbackStore.recordTurnDeliveryWithCompletion({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
@@ -12860,7 +12863,16 @@ async function persistFinalOutputFeedback(
       baseCard,
       requesterSubjectId,
       webhookDestinations,
-      context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
+      context: {
+        ...(feedbackTeamId ? { teamId: feedbackTeamId } : {}),
+        ...(kmRetrieval ? {
+          kmRetrieval: {
+            queryHash: kmRetrieval.queryHash,
+            ...(kmRetrieval.retrievalRunId ? { retrievalRunId: kmRetrieval.retrievalRunId } : {}),
+            ...(kmRetrievalWorkingDir ? { workingDir: kmRetrievalWorkingDir } : {}),
+          },
+        } : {}),
+      },
     });
     if (result.completion) {
       try {

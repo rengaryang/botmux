@@ -14739,7 +14739,7 @@ switch (command) {
       if (!flags.includes('--execute')) { console.error('retrieval-evidence is append-only and requires explicit --execute'); process.exitCode = 2; break; }
       if (!workingDir || !queryHash) { console.error('retrieval-evidence requires --working-dir and --query-hash'); process.exitCode = 2; break; }
       const eventType = eventName.replaceAll('-', '_');
-      const common = { workingDir: resolve(workingDir), queryHash, ...(value('--observed-at') ? { observedAt: value('--observed-at') } : {}) };
+      const common = { workingDir: resolve(workingDir), queryHash, source: 'cli' as const, ...(value('--observed-at') ? { observedAt: value('--observed-at') } : {}) };
       const { recordWorkspaceRetrievalEvidence } = await import('./services/km/workspace-knowledge/retrieval-evidence.js');
       let input: any;
       if (eventType === 'index_query') input = { ...common, eventType, ...(value('--entry-count') !== undefined ? { entryCount: Number(value('--entry-count')) } : {}) };

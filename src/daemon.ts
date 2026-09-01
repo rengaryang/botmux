@@ -86,7 +86,8 @@ import { getSkillFeedbackStore, type TurnCompletionEventPayload } from './servic
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { observationFromTurnCompletion } from './services/km/observation-producers.js';
 import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
-import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
+import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, resolveBoundedTranscriptWindow, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
+import { retrievalQueryHash } from './services/km/prompt-memory.js';
 import { isKmBackendWorkerEnabled, kmBackendWorkerIntervalMs, kmBackendWorkerStartupDelayMs, runKmBackendWorkerOnce } from './services/km/memory-backend-runtime.js';
 import { isKmCentralSinkEnabled, kmCentralSinkIntervalMs, kmCentralSinkStartupDelayMs, runKmCentralSinkOnce } from './services/km/central-sink-runtime.js';
 import { isKmRetentionShadowEnabled, kmRetentionShadowIntervalMs, kmRetentionShadowStartupDelayMs, runKmRetentionShadowOnce } from './services/km/retention-runtime.js';
@@ -157,13 +158,46 @@ function handleDurableTurnCompletionForKm(
     onResult: result => {
       if (result.status === 'quarantined') return;
       const botConfig = getBot(ds.larkAppId).config;
+      const cwd = ds.session.workingDir ?? ds.workingDir;
+      try {
+        const window = resolveBoundedTranscriptWindow({
+          event: observation,
+          cliId: ds.session.cliId ?? botConfig.cliId,
+          cliSessionId: ds.session.cliSessionId,
+          cwd,
+          larkAppId: ds.larkAppId,
+          maxBytes: 262_144,
+        });
+        const kmRetrieval = ds.kmRetrievalTurns?.[payload.turnId];
+        if (window.segments.length > 0 && kmRetrieval?.queryHash) {
+          void import('./services/km/workspace-knowledge/transcript-evidence.js')
+            .then(({ recordTranscriptWorkspaceRetrievalEvidence }) => recordTranscriptWorkspaceRetrievalEvidence({
+              workingDir: cwd,
+              queryHash: kmRetrieval.queryHash,
+              transcriptText: window.segments.map(segment => segment.text).join('\n'),
+              botAppId: ds.larkAppId,
+              sessionId: ds.session.sessionId,
+              turnId: payload.turnId,
+              ...(kmRetrieval.retrievalRunId ? { retrievalRunId: kmRetrieval.retrievalRunId } : {}),
+              userId: payload.requesterSubjectId,
+              source: 'transcript_observation',
+              observedAt: payload.time,
+            }))
+            .then(evidence => {
+              if (evidence.warnings.length) logger.debug(`[km-transcript-evidence:${source}] ${evidence.warnings.join(',')}`);
+            })
+            .catch(error => logger.debug(`[km-transcript-evidence:${source}] ${error instanceof Error ? error.message : String(error)}`));
+        }
+      } catch (error) {
+        logger.debug(`[km-transcript-evidence:${source}] ${error instanceof Error ? error.message : String(error)}`);
+      }
       void enqueueAutomaticDistillation({
         dataDir: config.session.dataDir,
         event: observation,
         cliId: ds.session.cliId ?? botConfig.cliId,
         model: ds.session.model ?? botConfig.model,
         cliSessionId: ds.session.cliSessionId,
-        cwd: ds.session.workingDir ?? ds.workingDir,
+        cwd,
       })
         .then(() => runOneDistillationJob({
           dataDir: config.session.dataDir,
@@ -19668,7 +19702,28 @@ async function handleThreadReplyAdmitted(
     ?? initialCodexAppMessageContext;
   const codexAppApplicationContext = initialCodexAppApplicationContext;
 
+  const rememberKmRetrievalTurn = (session: DaemonSession, patch?: { retrievalRunId?: string }): string => {
+    const queryHash = retrievalQueryHash({ text: parsed.content, botAppId: larkAppId, userId: senderOpenIdForPrefix });
+    session.kmRetrievalTurns ??= {};
+    const now = Date.now();
+    for (const [turnId, entry] of Object.entries(session.kmRetrievalTurns)) {
+      if (now - entry.recordedAt > 6 * 60 * 60_000) delete session.kmRetrievalTurns[turnId];
+    }
+    session.kmRetrievalTurns[parsed.messageId] = {
+      queryHash,
+      ...(patch?.retrievalRunId ? { retrievalRunId: patch.retrievalRunId } : {}),
+      ...((session.session.workingDir ?? session.workingDir) ? { workingDir: session.session.workingDir ?? session.workingDir } : {}),
+      recordedAt: now,
+    };
+    if (Object.keys(session.kmRetrievalTurns).length > 200) {
+      const oldest = Object.entries(session.kmRetrievalTurns).sort((a, b) => a[1].recordedAt - b[1].recordedAt)[0]?.[0];
+      if (oldest) delete session.kmRetrievalTurns[oldest];
+    }
+    return queryHash;
+  };
+
   const composePromptMemoryAtBoundary = async (session: DaemonSession): Promise<void> => {
+    const fallbackQueryHash = rememberKmRetrievalTurn(session);
     try {
       const result = await composePromptMemoryForTurn({
         dataDir: config.session.dataDir,
@@ -19678,7 +19733,17 @@ async function handleThreadReplyAdmitted(
         userId: senderOpenIdForPrefix,
         queryText: parsed.content,
         promptContent,
+        workingDir: session.session.workingDir ?? session.workingDir,
       });
+      if (result.queryHash) {
+        rememberKmRetrievalTurn(session, { ...(result.retrievalRunId ? { retrievalRunId: result.retrievalRunId } : {}) });
+      } else if (!session.kmRetrievalTurns?.[parsed.messageId]) {
+        session.kmRetrievalTurns ??= {};
+        session.kmRetrievalTurns[parsed.messageId] = { queryHash: fallbackQueryHash, recordedAt: Date.now() };
+      }
+      if (result.workspaceEvidenceWarnings?.length) {
+        logger.debug(`[km-retrieval-evidence] ${result.workspaceEvidenceWarnings.join(',')}`);
+      }
       if (result.injected) {
         promptContent = result.promptContent;
         logger.info(`[${tag(session)}] KM live prompt-memory injected for turn ${parsed.messageId.substring(0, 12)}`);
@@ -20198,6 +20263,8 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
+    await composePromptMemoryAtBoundary(newDs);
+    newDs.pendingPrompt = promptContent;
     if (newDs.pendingRepo) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',

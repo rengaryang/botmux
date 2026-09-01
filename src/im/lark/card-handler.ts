@@ -1361,6 +1361,34 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return undefined;
         }
       },
+      onFeedbackRecorded: async ({ delivery, feedback }) => {
+        const km = delivery.context && typeof delivery.context === 'object'
+          ? (delivery.context as Record<string, any>).kmRetrieval
+          : undefined;
+        const queryHash = typeof km?.queryHash === 'string' ? km.queryHash : undefined;
+        const workingDir = typeof km?.workingDir === 'string' ? km.workingDir : undefined;
+        if (!queryHash || !workingDir || !feedback?.semantic) return;
+        const mapped = feedback.semantic === 'positive' ? 'helpful'
+          : feedback.semantic === 'negative' ? 'not_helpful'
+            : undefined;
+        if (!mapped) return;
+        try {
+          const { recordAutomaticWorkspaceRetrievalEvidence } = await import('../../services/km/workspace-knowledge/retrieval-evidence.js');
+          const result = recordAutomaticWorkspaceRetrievalEvidence({
+            workingDir,
+            queryHash,
+            ...(delivery.botAppId ? { botAppId: delivery.botAppId } : {}),
+            ...(delivery.sessionId ? { sessionId: delivery.sessionId } : {}),
+            ...(delivery.turnId ? { turnId: delivery.turnId } : {}),
+            ...(typeof km?.retrievalRunId === 'string' ? { retrievalRunId: km.retrievalRunId } : {}),
+            source: 'feedback_card',
+            feedback: mapped,
+          });
+          if (result.warnings.length) logger.debug(`[km-retrieval-feedback] ${result.warnings.join(',')}`);
+        } catch (error) {
+          logger.debug(`[km-retrieval-feedback] ${error instanceof Error ? error.message : String(error)}`);
+        }
+      },
     });
   }
 

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -107,6 +107,51 @@ describe('KM runtime orchestrator', () => {
     expect(db.prepare('select disposition from prompt_injection_snapshots').get()).toEqual(expect.objectContaining({ disposition: 'would_inject' })); db.close();
   });
 
+  it('automatically emits hash-only workspace evidence for index, read, and fallback boundaries in shadow', async () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, 'l2-knowledge/items'), { recursive: true });
+    writeFileSync(join(dir, 'l2-knowledge/items/one.md'), '# One');
+    writeFileSync(join(dir, 'l2-knowledge/INDEX.json'), JSON.stringify({ entries: [{ id: 'l2_entry_1', file: 'items/one.md' }] }));
+    let store = await ObservationStore.open(dir);
+    store.upsertMemory({ state: 'active', scope: 'user', subject: 'u1', claimKey: 'language',
+      claimText: 'Prefer Chinese response', confidence: 'observed', privacyClass: 'internal',
+      sourceRefs: [{ kind: 'km-import', sourceRef: { kind: 'markdown_file', relativePath: 'l2-knowledge/items/one.md' } }] });
+    store.close();
+
+    await runRetrievalShadow({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't1', userId: 'u1',
+      queryText: 'Chinese response', workingDir: dir, env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true' } as any });
+    const firstRows = readFileSync(join(dir, 'l2-knowledge/.recall_log.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(firstRows.map(row => row.event_type)).toEqual(['index_query', 'entry_read']);
+    expect(firstRows.every(row => /^sha256:[a-f0-9]{64}$/.test(row.query_hash))).toBe(true);
+    expect(JSON.stringify(firstRows)).not.toContain('Chinese response');
+    expect(firstRows.find(row => row.event_type === 'entry_read')).toMatchObject({
+      entry_id: 'l2_entry_1',
+      source: 'runtime_retrieval',
+      bot_app_id: 'bot',
+      session_id: 's1',
+      turn_id: 't1',
+    });
+
+    await runRetrievalShadow({ dataDir: dir, botAppId: 'bot', sessionId: 's2', turnId: 't2', userId: 'u1',
+      queryText: 'no matching term', workingDir: dir, env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true' } as any });
+    const rows = readFileSync(join(dir, 'l2-knowledge/.recall_log.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.map(row => row.event_type)).toEqual(['index_query', 'entry_read', 'index_query', 'fallback']);
+    expect(rows.find(row => row.event_type === 'fallback')).toMatchObject({ outcome: 'no_hit' });
+  });
+
+  it('keeps retrieval audit alive when workspace evidence cannot be written', async () => {
+    const dir = tempDir();
+    await runRetrievalShadow({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't1', userId: 'u1',
+      queryText: 'Chinese', workingDir: join(dir, 'missing-workspace'), env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true' } as any });
+    const store = await ObservationStore.open(dir);
+    expect(store.listRetrievalAudits(1)).toEqual([expect.objectContaining({
+      botAppId: 'bot',
+      sessionId: 's1',
+      candidateCount: 0,
+    })]);
+    store.close();
+  });
+
   it('keeps federated retrieval behind its own disabled gate', async () => {
     const dir = tempDir();
     const provider: MemoryBackendProvider = {
@@ -162,7 +207,8 @@ describe('KM runtime orchestrator', () => {
 
     const blocked = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't1', userId: 'u1',
       queryText: 'Chinese', promptContent: 'hello', env: { BOTMUX_KM_RETRIEVAL_SHADOW_ENABLED: 'true' } as any });
-    expect(blocked).toEqual({ promptContent: 'hello', injected: false, reason: 'live_gate_disabled' });
+    expect(blocked).toMatchObject({ promptContent: 'hello', injected: false, reason: 'live_gate_disabled' });
+    expect(blocked.queryHash).toMatch(/^sha256:[a-f0-9]{64}$/);
 
     let reopened = await ObservationStore.open(dir);
     expect(reopened.listInjectionSnapshots(1)).toEqual([expect.objectContaining({
@@ -232,6 +278,29 @@ describe('KM runtime orchestrator', () => {
       } as any });
     expect(result.injected).toBe(true);
     expect(result.promptContent).toContain('Use concise bullets');
+  });
+
+  it('records entry_used only after live prompt memory is actually injected', async () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, 'l2-knowledge/items'), { recursive: true });
+    writeFileSync(join(dir, 'l2-knowledge/items/one.md'), '# One');
+    writeFileSync(join(dir, 'l2-knowledge/INDEX.json'), JSON.stringify({ entries: [{ id: 'l2_entry_1', file: 'items/one.md' }] }));
+    const store = await ObservationStore.open(dir);
+    store.upsertMemory({ state: 'active', scope: 'bot', subject: 'bot', claimKey: 'style', claimText: 'Use concise bullets', confidence: 'observed',
+      privacyClass: 'internal', sourceRefs: [{ kind: 'km-import', sourceRef: { kind: 'markdown_file', relativePath: 'l2-knowledge/items/one.md' } }] });
+    store.putPipelineProfile({ ...defaultShadowProfile('bot'), profileId: 'active-live-workspace', revision: 1, injectionMode: 'active' }, 'shadow');
+    await approvePromptCanary(store);
+    store.close();
+    const result = await composePromptMemoryForTurn({ dataDir: dir, botAppId: 'bot', sessionId: 's1', turnId: 't-live',
+      queryText: 'bullets', promptContent: 'hello', workingDir: dir, env: {
+        BOTMUX_KM_LIVE_INJECTION_ENABLED: 'true',
+        BOTMUX_KM_EFFECTIVE_MODE_AUTHORIZED: 'true',
+        BOTMUX_KM_CANARY_BOT_APP_IDS: 'bot',
+      } as any });
+    expect(result.injected).toBe(true);
+    const rows = readFileSync(join(dir, 'l2-knowledge/.recall_log.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.map(row => row.event_type)).toEqual(['index_query', 'entry_read', 'entry_used']);
+    expect(rows.find(row => row.event_type === 'entry_used')).toMatchObject({ entry_id: 'l2_entry_1', use_label: 'direct_apply' });
   });
 
   it('does not call federated providers from the live prompt boundary', async () => {
