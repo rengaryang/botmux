@@ -65,7 +65,7 @@ export type WorkspaceMetricsV2 = {
     indexConsistencyRate: number|null; retrievableRate: number|null; linkageCoverageRate: number|null;
     lifecycle: Record<string, number>; freshness: Record<string, number>; contractErrors: number; legacyAssets: number;
   };
-  retrievalQuality: { indexQueries: number; entryRecallEvents: number; neverRecalledAssets: number; markdownReads: number; zeroReadQueries: number|null; zeroReadRate: number|null; effectivenessRate: number|null; fallbackSuccessRate: number|null; queryFeedbackRate: number|null; evidenceState: string };
+  retrievalQuality: { indexQueries: number; entryRecallEvents: number; neverRecalledAssets: number; markdownReads: number; zeroReadQueries: number|null; zeroReadRate: number|null; effectivenessRate: number|null; fallbackSuccessRate: number|null; queryFeedbackRate: number|null; evidenceState: string; evidenceQueries: number; useLabels: Record<string, number>; invalidEvidenceEvents: number };
   kmRuntime: KmOpsMetricsRaw;
 };
 

@@ -40,6 +40,21 @@ describe('workspace knowledge adapter v2', () => {
     expect(result.assets.find(item => item.assetId.endsWith('L2:id:l2k-1'))).toMatchObject({ freshness: 'fresh', retrieval: { recallCount: 1 } });
   });
 
+  it('aggregates privacy-safe query/read/use/fallback/feedback evidence without exposing query text', () => {
+    const root = fixture(); writeFileSync(join(root, 'AGENTS.md'), '# Rules'); mkdirSync(join(root, 'l2-knowledge/items'), { recursive: true });
+    writeFileSync(join(root, 'l2-knowledge/items/one.md'), '# One'); writeFileSync(join(root, 'l2-knowledge/INDEX.json'), JSON.stringify({ entries: [{ id: 'one', path: 'items/one.md', title: 'One' }] }));
+    const q1 = `sha256:${'a'.repeat(64)}`; const q2 = `sha256:${'b'.repeat(64)}`;
+    const rows = [
+      { event_type: 'index_query', query_hash: q1, query_text: 'must not surface' }, { event_type: 'entry_read', query_hash: q1, entry_id: 'one' }, { event_type: 'entry_used', query_hash: q1, entry_id: 'one', use_label: 'direct_apply' },
+      { event_type: 'fallback', query_hash: q1, outcome: 'success' }, { event_type: 'query_feedback', query_hash: q1, feedback: 'helpful' }, { event_type: 'index_query', query_hash: q2 },
+      { event_type: 'entry_used', query_hash: 'raw query', entry_id: 'one', use_label: 'direct_apply' },
+    ];
+    writeFileSync(join(root, 'l2-knowledge/.recall_log.jsonl'), rows.map(row => JSON.stringify(row)).join('\n'));
+    const result = scanWorkspaceKnowledge({ roots: [root] });
+    expect(result.retrievalQuality).toMatchObject({ indexQueries: 2, markdownReads: 1, zeroReadQueries: 1, zeroReadRate: 50, effectivenessRate: 100, fallbackSuccessRate: 100, queryFeedbackRate: 50, evidenceState: 'partial', evidenceQueries: 2, invalidEvidenceEvents: 1, useLabels: { direct_apply: 1 } });
+    expect(JSON.stringify(result.retrievalQuality)).not.toContain('must not surface');
+  });
+
   it('does not follow a symlink outside the discovered root', () => {
     const root = fixture(); const outside = fixture(); writeFileSync(join(root, 'AGENTS.md'), '# Rules'); writeFileSync(join(outside, 'secret.md'), '# Secret');
     mkdirSync(join(root, 'docs'), { recursive: true }); symlinkSync(outside, join(root, 'docs/wiki'));

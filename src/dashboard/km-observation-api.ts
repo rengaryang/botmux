@@ -772,7 +772,9 @@ export async function handleKmObservationApi(
         jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot), health: snapshot.health, attention: snapshot.attention }); return true;
       }
       if (url.pathname === '/api/km/retrieval-usage-v2') {
-        jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot), retrievalQuality: snapshot.retrievalQuality }); return true;
+        jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot), privacy: {
+          queryTextStored: false, reasoningStored: false, acceptedQueryIdentifier: 'sha256', acceptedUseLabels: ['direct_apply', 'context_guided', 'pitfall_avoided', 'not_used', 'misleading'],
+        }, retrievalQuality: snapshot.retrievalQuality }); return true;
       }
       if (!store.dashboardMetrics) throw new Error('km_dashboard_metrics_unavailable');
       jsonRes(res, 200, { schemaVersion: 2, generatedAt: snapshot.generatedAt, snapshot: pickSnapshotMeta(snapshot),

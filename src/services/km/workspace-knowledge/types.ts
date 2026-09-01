@@ -48,7 +48,10 @@ export interface WorkspaceKnowledgeSnapshotV2 {
     effectivenessRate: number | null;
     fallbackSuccessRate: number | null;
     queryFeedbackRate: number | null;
-    evidenceState: 'available' | 'cold_start';
+    evidenceState: 'available' | 'cold_start' | 'partial';
+    evidenceQueries: number;
+    useLabels: Record<'direct_apply' | 'context_guided' | 'pitfall_avoided' | 'not_used' | 'misleading', number>;
+    invalidEvidenceEvents: number;
   };
   attention: {
     contractErrors: KnowledgeAssetV2[];
