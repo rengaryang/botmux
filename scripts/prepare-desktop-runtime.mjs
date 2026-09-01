@@ -138,9 +138,10 @@ async function stageNodeRuntimes() {
     const extracted = await mkdtemp(join(tmpdir(), 'botmux-node-'));
     try {
       if (extension === 'zip') {
-        // GitHub's Windows runners ship bsdtar. Using one archive tool on all
-        // platforms avoids PowerShell policy/quoting differences in CI.
-        run('tar', ['-xf', archive, '-C', extracted], root);
+        // Node's Windows archive is a real ZIP. GitHub runners provide unzip
+        // through Git for Windows; unlike tar.exe this is stable on both the
+        // Windows runner and local Linux validation.
+        run('unzip', ['-q', archive, '-d', extracted], root);
         const source = join(extracted, `node-v${nodeVersion}-${nodePlatform}`);
         const targetDir = join(nodeDir, target);
         await mkdir(targetDir, { recursive: true });

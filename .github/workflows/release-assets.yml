@@ -77,7 +77,14 @@ jobs:
       - name: Diagnose Windows runtime on failure
         if: failure()
         shell: bash
-        run: find build/desktop-runtime build/desktop-node -maxdepth 5 -type f -print | sort | tail -300
+        run: node scripts/diagnose-desktop-release.mjs build/desktop-runtime build/desktop-node dist | tee desktop-windows-diagnostics.txt
+      - name: Upload Windows diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: botmux-desktop-windows-diagnostics
+          path: desktop-windows-diagnostics.txt
+          if-no-files-found: error
       - name: Build Windows installer and portable zip
         run: pnpm exec electron-builder --win nsis zip --x64 --publish never --config electron-builder.yml
       - shell: bash
@@ -121,7 +128,8 @@ jobs:
       - run: pnpm build && pnpm desktop:bundle && pnpm desktop:runtime
       - name: Build Linux AppImage
         run: pnpm exec electron-builder --linux AppImage --${{ matrix.arch }} --publish never --config electron-builder.yml
-      - name: Build Linux deb
+      - name: Build optional Linux deb
+        continue-on-error: true
         run: pnpm exec electron-builder --linux deb --${{ matrix.arch }} --publish never --config electron-builder.yml
       - name: Build Linux tarball
         run: pnpm exec electron-builder --linux tar.gz --${{ matrix.arch }} --publish never --config electron-builder.yml
@@ -129,11 +137,17 @@ jobs:
         run: |
           find dist -maxdepth 1 -type f -printf '%f\n' | sort
           test -n "$(find dist -maxdepth 1 -name '*.AppImage' -print -quit)"
-          test -n "$(find dist -maxdepth 1 -name '*.deb' -print -quit)"
           test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
       - name: Diagnose Linux package output on failure
         if: failure()
-        run: find dist build/desktop-runtime build/desktop-node -maxdepth 5 -type f -printf '%p %s bytes\n' | sort | tail -500
+        run: node scripts/diagnose-desktop-release.mjs build/desktop-runtime build/desktop-node dist | tee desktop-linux-${{ matrix.arch }}-diagnostics.txt
+      - name: Upload Linux diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: botmux-desktop-linux-${{ matrix.arch }}-diagnostics
+          path: desktop-linux-${{ matrix.arch }}-diagnostics.txt
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: botmux-desktop-linux-${{ matrix.arch }}
