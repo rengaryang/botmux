@@ -39,6 +39,7 @@ export function scanWorkspaceKnowledge(input: ScanWorkspaceKnowledgeInput): Work
   const errors: string[] = [];
   const roots: WorkspaceKnowledgeSnapshotV2['roots'] = [];
   let visited = 0;
+  let budgetExhausted = false;
 
   for (const configuredRoot of [...new Set(input.roots.map(root => resolve(root)))]) {
     const rootErrors: string[] = [];
@@ -46,13 +47,13 @@ export function scanWorkspaceKnowledge(input: ScanWorkspaceKnowledgeInput): Work
     try { root = realpathSync(configuredRoot); } catch { errors.push('workspace_root_unavailable'); continue; }
     const workspaceId = workspaceIdFor(root);
     const add = (asset: KnowledgeAssetV2) => {
-      if (visited >= maxFiles) { rootErrors.push('scan_file_budget_exceeded'); return; }
-      visited += 1; assets.push(asset);
+      if (visited >= maxFiles) { budgetExhausted = true; if (!rootErrors.includes('scan_file_budget_exceeded')) rootErrors.push('scan_file_budget_exceeded'); return false; }
+      visited += 1; assets.push(asset); return true;
     };
     scanSimpleLayer(root, workspaceId, 'L0', 'policy', ['AGENTS.md'], add, maxBytes, rootErrors);
-    scanMarkdownDirectory(root, workspaceId, 'L1', 'wiki', 'docs/wiki', add, maxBytes, rootErrors);
-    scanL2(root, workspaceId, add, maxBytes, now, rootErrors);
-    scanSkills(root, workspaceId, add, maxBytes, rootErrors);
+    if (!budgetExhausted) scanMarkdownDirectory(root, workspaceId, 'L1', 'wiki', 'docs/wiki', add, maxBytes, rootErrors);
+    if (!budgetExhausted) scanL2(root, workspaceId, add, maxBytes, now, rootErrors);
+    if (!budgetExhausted) scanSkills(root, workspaceId, add, maxBytes, rootErrors);
     roots.push({ workspaceId, displayRoot: basename(root), state: rootErrors.length ? 'partial' : 'complete', errors: [...new Set(rootErrors)] });
     errors.push(...rootErrors.map(error => `${workspaceId}:${error}`));
   }
@@ -117,7 +118,8 @@ function baseAsset(root: string, workspaceId: string, layer: KnowledgeAssetLayer
   };
 }
 
-function scanSimpleLayer(root: string, workspaceId: string, layer: KnowledgeAssetLayer, kind: KnowledgeAssetV2['kind'], paths: string[], add: (asset: KnowledgeAssetV2) => void, maxBytes: number, errors: string[]): void {
+type AddAsset = (asset: KnowledgeAssetV2) => boolean;
+function scanSimpleLayer(root: string, workspaceId: string, layer: KnowledgeAssetLayer, kind: KnowledgeAssetV2['kind'], paths: string[], add: AddAsset, maxBytes: number, errors: string[]): void {
   for (const rel of paths) {
     const path = safeFile(root, join(root, rel), maxBytes);
     if (!path) continue;
@@ -125,39 +127,41 @@ function scanSimpleLayer(root: string, workspaceId: string, layer: KnowledgeAsse
   }
 }
 
-function scanMarkdownDirectory(root: string, workspaceId: string, layer: KnowledgeAssetLayer, kind: KnowledgeAssetV2['kind'], relDir: string, add: (asset: KnowledgeAssetV2) => void, maxBytes: number, errors: string[]): void {
+function scanMarkdownDirectory(root: string, workspaceId: string, layer: KnowledgeAssetLayer, kind: KnowledgeAssetV2['kind'], relDir: string, add: AddAsset, maxBytes: number, errors: string[]): void {
   const dir = join(root, relDir);
   walkMarkdown(root, dir, path => {
     const safe = safeFile(root, path, maxBytes); if (!safe) return;
-    try { add(baseAsset(root, workspaceId, layer, kind, safe, readFileSync(safe, 'utf8'))); } catch { errors.push(`${layer.toLowerCase()}_read_failed`); }
+    try { return add(baseAsset(root, workspaceId, layer, kind, safe, readFileSync(safe, 'utf8'))); } catch { errors.push(`${layer.toLowerCase()}_read_failed`); }
+    return true;
   });
 }
 
-function scanSkills(root: string, workspaceId: string, add: (asset: KnowledgeAssetV2) => void, maxBytes: number, errors: string[]): void {
+function scanSkills(root: string, workspaceId: string, add: AddAsset, maxBytes: number, errors: string[]): void {
   const skills = join(root, '.agents', 'skills');
   if (!existsSync(skills)) return;
   for (const entry of safeEntries(skills)) {
     const skillRoot = join(skills, entry);
     const skill = safeFile(root, join(skillRoot, 'SKILL.md'), maxBytes);
     if (skill) {
-      try { const asset = baseAsset(root, workspaceId, 'L3', 'skill', skill, readFileSync(skill, 'utf8')); asset.assetId = `${workspaceId}:L3:skill:${entry}`; add(asset); }
+      try { const asset = baseAsset(root, workspaceId, 'L3', 'skill', skill, readFileSync(skill, 'utf8')); asset.assetId = `${workspaceId}:L3:skill:${entry}`; if (!add(asset)) return; }
       catch { errors.push('l3_read_failed'); }
     }
     scanReferenceDirectory(root, workspaceId, relative(root, join(skillRoot, 'references')), add, maxBytes, errors);
   }
 }
 
-function scanReferenceDirectory(root: string, workspaceId: string, relDir: string, add: (asset: KnowledgeAssetV2) => void, maxBytes: number, errors: string[]): void {
+function scanReferenceDirectory(root: string, workspaceId: string, relDir: string, add: AddAsset, maxBytes: number, errors: string[]): void {
   const allowed = new Set(['.md', '.json', '.yaml', '.yml', '.txt', '.sh', '.py']);
   walkFiles(root, join(root, relDir), path => {
     if (![...allowed].some(extension => path.toLowerCase().endsWith(extension))) return;
     const safe = safeFile(root, path, maxBytes); if (!safe) return;
-    try { add(baseAsset(root, workspaceId, 'L4', 'reference', safe, readFileSync(safe, 'utf8'))); }
+    try { return add(baseAsset(root, workspaceId, 'L4', 'reference', safe, readFileSync(safe, 'utf8'))); }
     catch { errors.push('l4_read_failed'); }
+    return true;
   });
 }
 
-function scanL2(root: string, workspaceId: string, add: (asset: KnowledgeAssetV2) => void, maxBytes: number, now: number, errors: string[]): void {
+function scanL2(root: string, workspaceId: string, add: AddAsset, maxBytes: number, now: number, errors: string[]): void {
   const indexPath = safeFile(root, join(root, 'l2-knowledge', 'INDEX.json'), maxBytes);
   if (!indexPath) return;
   let index: Json;
@@ -191,7 +195,7 @@ function scanL2(root: string, workspaceId: string, add: (asset: KnowledgeAssetV2
     const lifecycle = lifecycleFor(legacy ? 'legacy' : (frontmatter.status ?? raw.status));
     const freshness = freshnessFor(lifecycle, frontmatter.ingested_at ?? raw.ingested_at, now);
     const recall = recalls.get(id);
-    add({
+    if (!add({
       assetId: `${workspaceId}:L2:id:${id}`, workspaceId, layer: 'L2', kind: 'l2-entry',
       title: String(frontmatter.title ?? raw.title ?? titleFor(rel, text)), relativePath: `l2-knowledge/${rel}`,
       lifecycle, freshness,
@@ -202,7 +206,7 @@ function scanL2(root: string, workspaceId: string, add: (asset: KnowledgeAssetV2
         ...(frontmatter.source ?? raw.source ? { source: String(frontmatter.source ?? raw.source) } : {}),
         ...(frontmatter.ingest_run_id ?? raw.ingest_run_id ? { ingestRunId: String(frontmatter.ingest_run_id ?? raw.ingest_run_id) } : {}) },
       ...(path ? { updatedAt: new Date(statSync(path).mtimeMs).toISOString() } : {}),
-    });
+    })) return;
   }
 }
 
@@ -269,6 +273,6 @@ function health(assets: KnowledgeAssetV2[]): WorkspaceKnowledgeSnapshotV2['healt
   const rate = (part: number, total: number) => total ? Math.round(part / total * 1000) / 10 : null;
   return { totalsByLayer: layers, totalAssets: assets.length, contractValidRate: rate(v3.filter(asset => asset.contract.valid).length, v3.length), indexConsistencyRate: rate(l2.filter(asset => !asset.contract.errors.some(error => error.includes('drift') || error.includes('missing'))).length, l2.length), retrievableRate: rate(eligible.filter(asset => asset.freshness !== 'purged' || Boolean(asset.linkage.canonicalKey)).length, eligible.length), linkageCoverageRate: rate(l2.filter(asset => asset.linkage.relatedCount > 0).length, l2.length), lifecycle, freshness, contractErrors: assets.filter(asset => !asset.contract.valid).length, legacyAssets: assets.filter(asset => asset.contract.version === 'legacy').length };
 }
-function walkMarkdown(root: string, dir: string, visit: (path: string) => void): void { walkFiles(root, dir, path => { if (path.endsWith('.md')) visit(path); }); }
-function walkFiles(root: string, dir: string, visit: (path: string) => void): void { try { const real = realpathSync(dir); if (real !== root && !real.startsWith(`${root}${sep}`)) return; for (const entry of readdirSync(real, { withFileTypes: true })) { if (entry.name === '.git' || entry.name === 'node_modules') continue; const path = join(real, entry.name); if (entry.isDirectory()) walkFiles(root, path, visit); else if (entry.isFile()) visit(path); } } catch {} }
+function walkMarkdown(root: string, dir: string, visit: (path: string) => boolean | void): void { walkFiles(root, dir, path => path.endsWith('.md') ? visit(path) : true); }
+function walkFiles(root: string, dir: string, visit: (path: string) => boolean | void): boolean { try { const real = realpathSync(dir); if (real !== root && !real.startsWith(`${root}${sep}`)) return true; for (const entry of readdirSync(real, { withFileTypes: true })) { if (entry.name === '.git' || entry.name === 'node_modules') continue; const path = join(real, entry.name); if (entry.isDirectory()) { if (!walkFiles(root, path, visit)) return false; } else if (entry.isFile() && visit(path) === false) return false; } } catch {} return true; }
 function safeEntries(dir: string): string[] { try { return readdirSync(dir).filter(entry => { try { return lstatSync(join(dir, entry)).isDirectory(); } catch { return false; } }); } catch { return []; } }

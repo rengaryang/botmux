@@ -4,18 +4,25 @@ import type { WorkspaceKnowledgeSnapshotV2 } from './types.js';
 export class WorkspaceKnowledgeSnapshotCache {
   private snapshot?: WorkspaceKnowledgeSnapshotV2;
   private timer?: NodeJS.Timeout;
+  private initial?: NodeJS.Immediate;
 
   constructor(private readonly candidates: () => Array<string | undefined | null>, private readonly intervalMs = 300_000) {}
 
   start(): void {
     // Never put filesystem discovery on the Dashboard startup critical path.
-    const initial = setImmediate(() => this.refresh());
-    initial.unref?.();
+    this.stop();
+    this.initial = setImmediate(() => { this.initial = undefined; this.refresh(); });
+    this.initial.unref?.();
     this.timer = setInterval(() => this.refresh(), this.intervalMs);
     this.timer.unref?.();
   }
 
-  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
+  stop(): void {
+    if (this.initial) clearImmediate(this.initial);
+    if (this.timer) clearInterval(this.timer);
+    this.initial = undefined;
+    this.timer = undefined;
+  }
 
   get(): WorkspaceKnowledgeSnapshotV2 {
     return this.snapshot ?? unavailableSnapshot('workspace_scan_not_started');

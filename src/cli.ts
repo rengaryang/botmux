@@ -14720,14 +14720,36 @@ switch (command) {
   case 'km': {
     // `botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]`
     // `botmux km ops-readiness [--output <file>] [--now <ISO>] [--data-dir <dir>] [--keep-data-dir]`
+    // `botmux km retrieval-evidence <event> --working-dir <dir> --query-hash sha256:... [event fields]`
     // Read-only backfill of historical turn.completed events into the KM
     // observation store. Dry-run (default: no, requires --execute to write).
     const kmArgs = process.argv.slice(3);
     const kmSub = kmArgs[0] ?? 'help';
-    if (kmSub !== 'backfill' && kmSub !== 'ops-readiness') {
+    if (kmSub !== 'backfill' && kmSub !== 'ops-readiness' && kmSub !== 'retrieval-evidence') {
       console.error('用法: botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]');
       console.error('      botmux km ops-readiness [--output <file>] [--now <ISO>] [--data-dir <dir>] [--keep-data-dir]');
+      console.error('      botmux km retrieval-evidence <index-query|entry-read|entry-used|fallback|query-feedback> --working-dir <dir> --query-hash sha256:...');
       process.exitCode = 2;
+      break;
+    }
+    if (kmSub === 'retrieval-evidence') {
+      const flags = kmArgs.slice(2); const eventName = kmArgs[1] ?? '';
+      const value = (name: string): string | undefined => { const index = flags.indexOf(name); return index >= 0 ? flags[index + 1] : undefined; };
+      const workingDir = value('--working-dir'); const queryHash = value('--query-hash');
+      if (!flags.includes('--execute')) { console.error('retrieval-evidence is append-only and requires explicit --execute'); process.exitCode = 2; break; }
+      if (!workingDir || !queryHash) { console.error('retrieval-evidence requires --working-dir and --query-hash'); process.exitCode = 2; break; }
+      const eventType = eventName.replaceAll('-', '_');
+      const common = { workingDir: resolve(workingDir), queryHash, ...(value('--observed-at') ? { observedAt: value('--observed-at') } : {}) };
+      const { recordWorkspaceRetrievalEvidence } = await import('./services/km/workspace-knowledge/retrieval-evidence.js');
+      let input: any;
+      if (eventType === 'index_query') input = { ...common, eventType, ...(value('--entry-count') !== undefined ? { entryCount: Number(value('--entry-count')) } : {}) };
+      else if (eventType === 'entry_read') input = { ...common, eventType, entryId: value('--entry-id') ?? '' };
+      else if (eventType === 'entry_used') input = { ...common, eventType, entryId: value('--entry-id') ?? '', useLabel: value('--use-label') ?? '' };
+      else if (eventType === 'fallback') input = { ...common, eventType, outcome: value('--outcome') ?? '' };
+      else if (eventType === 'query_feedback') input = { ...common, eventType, feedback: value('--feedback') ?? '' };
+      else { console.error('unknown retrieval evidence event'); process.exitCode = 2; break; }
+      try { console.log(JSON.stringify({ ok: true, ...recordWorkspaceRetrievalEvidence(input) })); }
+      catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2; }
       break;
     }
     if (kmSub === 'ops-readiness') {
