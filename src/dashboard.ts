@@ -8670,6 +8670,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 
 // Graceful shutdown
 function shutdown(): void {
+  workspaceKnowledgeCache.stop();
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const off of subs.values()) off();
