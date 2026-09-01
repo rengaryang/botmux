@@ -69,7 +69,7 @@ export function scanWorkspaceKnowledge(input: ScanWorkspaceKnowledgeInput): Work
     roots,
     assets,
     health: health(assets),
-    retrievalQuality: retrievalQuality(assets, input.roots),
+    retrievalQuality: retrievalQuality(assets, input.roots, maxBytes),
     attention: {
       contractErrors: assets.filter(asset => !asset.contract.valid).slice(0, 50),
       pendingIngest: assets.filter(asset => asset.lifecycle === 'pending-ingest').slice(0, 50),
@@ -226,16 +226,42 @@ function freshnessFor(lifecycle: AssetLifecycle, ingestedAt: unknown, now: numbe
   const parsed = Date.parse(String(ingestedAt ?? '')); return Number.isFinite(parsed) ? (now - parsed >= 7 * 86_400_000 ? 'stale' : 'fresh') : 'unknown';
 }
 function readRecallLog(root: string, maxBytes: number): Map<string, { count: number; last: string }> {
-  const path = safeFile(root, join(root, 'l2-knowledge', '.recall_log.jsonl'), maxBytes); const result = new Map<string, { count: number; last: string }>();
-  if (!path) return result;
-  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) try { const row = JSON.parse(line); if (!row.entry_id) continue; const old = result.get(row.entry_id); result.set(row.entry_id, { count: (old?.count ?? 0) + 1, last: String(row.recalled_at ?? old?.last ?? '') }); } catch { /* tolerant */ }
+  const result = new Map<string, { count: number; last: string }>();
+  for (const row of readRecallRows(root, maxBytes)) {
+    if (typeof row.entry_id !== 'string' || !row.entry_id) continue;
+    if (row.event_type && row.event_type !== 'entry_recalled') continue;
+    const old = result.get(row.entry_id); result.set(row.entry_id, { count: (old?.count ?? 0) + 1, last: String(row.recalled_at ?? row.observed_at ?? old?.last ?? '') });
+  }
   return result;
 }
-function retrievalQuality(assets: KnowledgeAssetV2[], roots: string[]): WorkspaceKnowledgeSnapshotV2['retrievalQuality'] {
-  let indexQueries = 0; for (const root of roots) { const path = join(root, 'l2-knowledge', '.recall_log.jsonl'); try { for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) try { if (JSON.parse(line).event_type === 'index_query') indexQueries += 1; } catch {} } catch {} }
-  const l2 = assets.filter(asset => asset.layer === 'L2'); const entryRecallEvents = l2.reduce((sum, asset) => sum + asset.retrieval.recallCount, 0);
-  return { indexQueries, entryRecallEvents, neverRecalledAssets: l2.filter(asset => !asset.retrieval.recallCount).length, markdownReads: 0, zeroReadQueries: null, zeroReadRate: null, effectivenessRate: null, fallbackSuccessRate: null, queryFeedbackRate: null, evidenceState: 'cold_start' };
+function readRecallRows(root: string, maxBytes: number): Json[] {
+  const path = safeFile(root, join(root, 'l2-knowledge', '.recall_log.jsonl'), maxBytes); if (!path) return [];
+  const rows: Json[] = []; for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) try { const row = JSON.parse(line); if (row && typeof row === 'object') rows.push(row); } catch { /* tolerant */ }
+  return rows;
 }
+const USE_LABELS = ['direct_apply', 'context_guided', 'pitfall_avoided', 'not_used', 'misleading'] as const;
+function retrievalQuality(assets: KnowledgeAssetV2[], roots: string[], maxBytes = DEFAULT_MAX_BYTES): WorkspaceKnowledgeSnapshotV2['retrievalQuality'] {
+  let indexQueries = 0; let markdownReads = 0; let invalidEvidenceEvents = 0; const queryIds = new Set<string>(); const indexQueryIds = new Set<string>(); const readQueryIds = new Set<string>(); const feedbackQueryIds = new Set<string>(); const fallbackAttempts = new Set<string>(); const fallbackSuccesses = new Set<string>();
+  const useLabels: Record<(typeof USE_LABELS)[number], number> = { direct_apply: 0, context_guided: 0, pitfall_avoided: 0, not_used: 0, misleading: 0 };
+  for (const root of roots) for (const row of readRecallRows(root, maxBytes)) {
+    const eventType = String(row.event_type ?? (row.entry_id ? 'entry_recalled' : ''));
+    if (eventType === 'index_query') { indexQueries += 1; if (validEvidenceHash(row.query_hash)) { queryIds.add(row.query_hash); indexQueryIds.add(row.query_hash); } else if (row.query_hash != null) invalidEvidenceEvents += 1; continue; }
+    if (eventType === 'entry_read') { if (!validEvidenceHash(row.query_hash) || typeof row.entry_id !== 'string') { invalidEvidenceEvents += 1; continue; } markdownReads += 1; readQueryIds.add(row.query_hash); queryIds.add(row.query_hash); continue; }
+    if (eventType === 'entry_used') { const label = String(row.use_label); if (!validEvidenceHash(row.query_hash) || !USE_LABELS.includes(label as any)) { invalidEvidenceEvents += 1; continue; } useLabels[label as keyof typeof useLabels] += 1; queryIds.add(row.query_hash); continue; }
+    if (eventType === 'fallback') { if (!validEvidenceHash(row.query_hash) || !['success', 'no_hit', 'error'].includes(String(row.outcome))) { invalidEvidenceEvents += 1; continue; } fallbackAttempts.add(row.query_hash); if (row.outcome === 'success') fallbackSuccesses.add(row.query_hash); queryIds.add(row.query_hash); continue; }
+    if (eventType === 'query_feedback') { if (!validEvidenceHash(row.query_hash) || !['helpful', 'not_helpful'].includes(String(row.feedback))) { invalidEvidenceEvents += 1; continue; } feedbackQueryIds.add(row.query_hash); queryIds.add(row.query_hash); }
+  }
+  const l2 = assets.filter(asset => asset.layer === 'L2'); const entryRecallEvents = l2.reduce((sum, asset) => sum + asset.retrieval.recallCount, 0);
+  const effectiveUses = useLabels.direct_apply + useLabels.context_guided + useLabels.pitfall_avoided; const totalUses = effectiveUses + useLabels.not_used + useLabels.misleading;
+  const rate = (part: number, total: number) => total ? Math.round(part / total * 1000) / 10 : null;
+  const evidenceState = queryIds.size === 0 && markdownReads === 0 && totalUses === 0 && fallbackAttempts.size === 0 && feedbackQueryIds.size === 0 ? 'cold_start' : invalidEvidenceEvents ? 'partial' : 'available';
+  return { indexQueries, entryRecallEvents, neverRecalledAssets: l2.filter(asset => !asset.retrieval.recallCount).length, markdownReads,
+    zeroReadQueries: indexQueryIds.size ? [...indexQueryIds].filter(hash => !readQueryIds.has(hash)).length : null,
+    zeroReadRate: indexQueryIds.size ? rate([...indexQueryIds].filter(hash => !readQueryIds.has(hash)).length, indexQueryIds.size) : null,
+    effectivenessRate: rate(effectiveUses, totalUses), fallbackSuccessRate: rate(fallbackSuccesses.size, fallbackAttempts.size), queryFeedbackRate: rate(feedbackQueryIds.size, queryIds.size), evidenceState,
+    evidenceQueries: queryIds.size, useLabels, invalidEvidenceEvents };
+}
+function validEvidenceHash(value: unknown): value is string { return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/i.test(value); }
 function health(assets: KnowledgeAssetV2[]): WorkspaceKnowledgeSnapshotV2['health'] {
   const layers = { L0: 0, L1: 0, L2: 0, L3: 0, L4: 0 }; const lifecycle: Record<string, number> = {}; const freshness: Record<string, number> = {};
   for (const asset of assets) { layers[asset.layer] += 1; lifecycle[asset.lifecycle] = (lifecycle[asset.lifecycle] ?? 0) + 1; freshness[asset.freshness] = (freshness[asset.freshness] ?? 0) + 1; }
