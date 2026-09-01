@@ -32280,6 +32280,46 @@ a.card-menu-item {
 }
 
 .km-section-head p,
+.km-asset-toolbar,
+.km-asset-pagination {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.km-asset-toolbar label {
+  display: grid;
+  gap: 4px;
+  color: var(--km-muted);
+  font-size: 12px;
+}
+
+.km-asset-toolbar select {
+  min-width: 180px;
+}
+
+.km-asset-count {
+  margin-left: auto;
+  color: var(--km-muted);
+  font-size: 12px;
+}
+
+.km-asset-pagination {
+  justify-content: flex-end;
+  align-items: center;
+  margin-top: 12px;
+  margin-bottom: 0;
+  color: var(--km-muted);
+  font-size: 12px;
+}
+
+.km-asset-pagination button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .km-inline-help {
   margin: 6px 0 0;
   color: var(--muted);
