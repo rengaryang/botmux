@@ -55,6 +55,15 @@ describe('workspace knowledge adapter v2', () => {
     expect(JSON.stringify(result.retrievalQuality)).not.toContain('must not surface');
   });
 
+  it('stops traversal at the global file budget and reports a partial snapshot', () => {
+    const root = fixture(); writeFileSync(join(root, 'AGENTS.md'), '# Rules'); mkdirSync(join(root, 'docs/wiki/nested'), { recursive: true });
+    for (let index = 0; index < 20; index += 1) writeFileSync(join(root, 'docs/wiki/nested', `${String(index).padStart(2, '0')}.md`), `# ${index}`);
+    const result = scanWorkspaceKnowledge({ roots: [root], maxFiles: 3 });
+    expect(result.assets).toHaveLength(3);
+    expect(result.state).toBe('partial');
+    expect(result.errors.some(error => error.endsWith(':scan_file_budget_exceeded'))).toBe(true);
+  });
+
   it('does not follow a symlink outside the discovered root', () => {
     const root = fixture(); const outside = fixture(); writeFileSync(join(root, 'AGENTS.md'), '# Rules'); writeFileSync(join(outside, 'secret.md'), '# Secret');
     mkdirSync(join(root, 'docs'), { recursive: true }); symlinkSync(outside, join(root, 'docs/wiki'));
