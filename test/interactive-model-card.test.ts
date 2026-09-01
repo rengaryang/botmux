@@ -34,11 +34,22 @@ describe('interactive CLI command capability', () => {
     const capability = interactiveModelCapability('pi');
     expect(capability.sessionMode).toBe('raw_input');
     expect(capability.requiresIdle).toBe(true);
+    expect(capability.submitCount).toBe(2);
+    expect(capability.submitIntervalMs).toBe(300);
     expect(capability.buildInvocation('provider-a/same')).toBe('/model provider-a/same');
   });
 
-  it.each(['codex-app', 'mira', 'mir', 'dsh'])('fails closed for structured runner %s', cliId => {
-    expect(interactiveModelCapability(cliId).sessionMode).toBe('unsupported');
+  it.each(['codex-app', 'mira', 'mir', 'dsh', 'riff', 'mojo'])('fails closed for non-terminal runner %s', cliId => {
+    const capability = interactiveModelCapability(cliId);
+    expect(capability.sessionMode).toBe('unsupported');
+    expect(capability.submitCount).toBe(1);
+  });
+
+  it.each(['pi', 'codex', 'claude-code', 'traex', 'coco', 'opencode', 'gemini', 'kimi', 'grok', 'dsh-tui'])
+  ('uses bounded autocomplete-confirm + submit for terminal CLI %s', cliId => {
+    const capability = interactiveModelCapability(cliId);
+    expect(capability.sessionMode).toBe('raw_input');
+    expect(capability.submitCount).toBe(2);
   });
 
   it('rejects values that could inject a second terminal command', () => {

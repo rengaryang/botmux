@@ -342,7 +342,10 @@ describe('/model interactive picker callback', () => {
     const result = await handleCardAction(modelEvent(nonce, 'bytedance-hybrid/glm-5.3'), deps, APP_ID);
 
     expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, {
-      type: 'raw_input', content: '/model bytedance-hybrid/glm-5.3',
+      type: 'raw_input',
+      content: '/model bytedance-hybrid/glm-5.3',
+      submitCount: 2,
+      submitIntervalMs: 300,
     });
     expect(rememberLastCliInput).toHaveBeenCalledWith(
       ds,
