@@ -367,6 +367,10 @@ describe('KM ingest executor', () => {
     expect(targets.statusCode).toBe(200);
     expect(JSON.parse(targets.body).executor).toEqual({ enabled: false, mode: 'offline', executionApiEnabled: false });
     expect(JSON.parse(targets.body).items[0].targetId).toBe('mock-target');
+    expect(JSON.parse(targets.body).items[0].credential).toEqual({ mode: 'mock' });
+    expect(JSON.stringify(JSON.parse(targets.body))).not.toContain('credentialRef');
+    expect(JSON.stringify(JSON.parse(targets.body))).not.toContain('mock:token');
+    expect(JSON.stringify(JSON.parse(targets.body))).not.toContain('mock://km-ingest');
     const runs = makeRes();
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, runs, new URL('http://localhost/api/km/ingest'), deps);
     expect(runs.statusCode).toBe(200);
@@ -375,6 +379,18 @@ describe('KM ingest executor', () => {
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, status, new URL(`http://localhost/api/km/ingest/${planned.run.runId}`), deps);
     expect(status.statusCode).toBe(200);
     expect(JSON.parse(status.body).items[0].canonicalKey).toBe('api');
+    expect(JSON.parse(status.body).items[0].candidate).toEqual(expect.objectContaining({
+      targetLayer: 'L2',
+      category: 'runbook',
+      claimKey: 'ingest.retry',
+      confidence: 'observed',
+      privacyClass: 'internal',
+      sourceRefCount: 1,
+    }));
+    expect(JSON.stringify(JSON.parse(status.body))).not.toContain('claimText');
+    expect(JSON.stringify(JSON.parse(status.body))).not.toContain('Resume a partial ingest run');
+    expect(JSON.stringify(JSON.parse(status.body))).not.toContain('sourceRefs');
+    expect(JSON.stringify(JSON.parse(status.body))).not.toContain('Retry failed importer');
     const executeRoute = makeRes();
     await handleKmObservationApi({ method: 'POST', headers: {}, async *[Symbol.asyncIterator]() { yield Buffer.from('{}'); } } as any,
       executeRoute, new URL(`http://localhost/api/km/ingest/${planned.run.runId}/execute`), deps);
