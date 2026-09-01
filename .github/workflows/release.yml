@@ -13,7 +13,9 @@ on:
 
 jobs:
   desktop:
-    if: github.actor == 'deepcoldy' && github.triggering_actor == 'deepcoldy'
+    # This legacy job publishes the upstream signed macOS bundle. Forks and
+    # cross-platform unsigned packages are handled by release-assets.yml.
+    if: github.repository == 'deepcoldy/botmux' && github.actor == 'deepcoldy' && github.triggering_actor == 'deepcoldy'
     runs-on: macos-14
     environment: macos-signing
     permissions:
@@ -119,12 +121,14 @@ jobs:
           retention-days: 7
 
   release:
+    # npm Trusted Publishing is configured only for the upstream repository.
+    # Forks create their prerelease and desktop assets in release-assets.yml.
+    if: github.repository == 'deepcoldy/botmux' && github.event_name == 'push'
     # npm-first: no longer `needs: desktop`. npm publish + GitHub Release run
     # immediately on the tag push, WITHOUT waiting for the manually-gated
     # (macos-signing environment) macOS build. The signed desktop assets are
     # attached asynchronously afterwards by `attach-desktop-assets`. This keeps
     # `npm i -g botmux` unblocked when macOS signing is slow / awaiting approval.
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -422,7 +426,7 @@ jobs:
     # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
     # macOS (fresh artifact, so the 7-day retention is irrelevant) and
     # `refresh-desktop-assets` --clobber-attaches to the existing Release.
-    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    if: github.repository == 'deepcoldy/botmux' && github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
     needs: [desktop, release]
     runs-on: ubuntu-latest
     permissions:
@@ -456,7 +460,7 @@ jobs:
           done
 
   refresh-desktop-assets:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.repository == 'deepcoldy/botmux' && github.event_name == 'workflow_dispatch'
     needs: desktop
     runs-on: ubuntu-latest
     permissions:

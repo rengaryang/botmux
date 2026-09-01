@@ -10,6 +10,7 @@ describe('bundled desktop runtime', () => {
       repoRoot: '/repo',
       isPackaged: true,
       arch: 'arm64',
+      platform: 'darwin',
       appVersion: '3.0.0',
       env: {},
       existsSync: () => true,
@@ -23,6 +24,18 @@ describe('bundled desktop runtime', () => {
       version: '3.0.0',
       runtimeSource: 'bundled',
     });
+  });
+
+  it('selects Windows and Linux packaged Node layouts', () => {
+    const existsSync = () => true;
+    expect(resolveBundledRuntimeCandidate({
+      resourcesPath: 'C:\\Program Files\\Botmux\\resources', repoRoot: 'C:\\repo', isPackaged: true,
+      arch: 'x64', platform: 'win32', appVersion: '3.0.0', env: {}, existsSync,
+    }).nodePath).toBe('C:\\Program Files\\Botmux\\resources/node/win32-x64/node.exe');
+    expect(resolveBundledRuntimeCandidate({
+      resourcesPath: '/opt/Botmux/resources', repoRoot: '/repo', isPackaged: true,
+      arch: 'arm64', platform: 'linux', appVersion: '3.0.0', env: {}, existsSync,
+    }).nodePath).toBe('/opt/Botmux/resources/node/linux-arm64/bin/node');
   });
 
   it('uses the package-manager Node for development', () => {
@@ -45,12 +58,15 @@ describe('bundled desktop runtime', () => {
     expect(config).toContain("x64ArchFiles: 'Contents/Resources/{node/**,runtime/node_modules/.pnpm/**}'");
   });
 
-  it('stages both native canvas architectures using pnpm workspace settings', () => {
+  it('stages platform-native canvas and Node runtimes using pnpm workspace settings', () => {
     const script = readFileSync(resolve(import.meta.dirname, '../../scripts/prepare-desktop-runtime.mjs'), 'utf8');
 
     expect(script).toContain("join(runtimeDir, 'pnpm-workspace.yaml')");
-    expect(script).toContain("supportedArchitectures: { os: ['darwin'], cpu: ['arm64', 'x64'] }");
-    expect(script).toContain("for (const arch of ['arm64', 'x64'])");
-    expect(script).toContain('Bundled runtime is missing @napi-rs/canvas-darwin-${arch}');
+    expect(script).toContain('BOTMUX_DESKTOP_TARGETS');
+    expect(script).toContain("'darwin-arm64', 'darwin-x64', 'linux-x64', 'linux-arm64', 'win32-x64'");
+    expect(script).toContain('supportedArchitectures: { os: supportedOs, cpu: supportedCpu }');
+    expect(script).toContain('Bundled runtime is missing @napi-rs/canvas-${packageOs}-${arch}');
+    expect(script).toContain("run('pnpm', ['rebuild', 'node-pty'], runtimeDir)");
+    expect(script).toContain('Bundled runtime is missing native PTY asset');
   });
 });

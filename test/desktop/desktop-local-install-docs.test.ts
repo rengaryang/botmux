@@ -62,6 +62,7 @@ describe('desktop local source installer docs', () => {
     expect(hook).toContain('NSScreenCaptureUsageDescription');
     expect(hook).toContain('/usr/libexec/PlistBuddy');
     expect(hook).toContain("execFileSync('tar', ['-xzf', stagedModules");
+    expect(hook).toContain("join(context.appOutDir, 'resources')");
     expect(hook).not.toContain('osascript');
   });
 });

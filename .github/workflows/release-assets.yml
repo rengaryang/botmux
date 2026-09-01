@@ -1,0 +1,187 @@
+name: Cross-platform Desktop Release Assets
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and refresh
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  desktop-macos:
+    # Fork preview: unsigned until repository-specific Apple signing secrets are configured.
+    runs-on: macos-14
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      BOTMUX_DESKTOP_TARGETS: darwin-arm64,darwin-x64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+      - uses: actions/setup-node@v6
+        with: { node-version: 22 }
+      - run: npm install -g pnpm@9.5.0
+      - run: pnpm install --frozen-lockfile
+      - name: Verify tag still resolves to the checked-out commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
+      - run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+      - run: pnpm build && pnpm desktop:bundle && pnpm desktop:runtime
+      - name: Build unsigned Universal macOS packages
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --mac dmg zip --universal --publish never --config electron-builder.yml
+      - name: Verify macOS assets
+        run: test -n "$(find dist -maxdepth 1 -name '*.dmg' -print -quit)" && test -n "$(find dist -maxdepth 1 -name '*.zip' -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botmux-desktop-macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+  desktop-windows:
+    runs-on: windows-2022
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      BOTMUX_DESKTOP_TARGETS: win32-x64
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+      - uses: actions/setup-node@v6
+        with: { node-version: 22 }
+      - run: npm install -g pnpm@9.5.0
+      - run: pnpm install --frozen-lockfile
+      - name: Verify tag still resolves to the checked-out commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
+      - shell: bash
+        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+      - run: pnpm build
+      - run: pnpm desktop:bundle
+      - run: pnpm desktop:runtime
+      - name: Build Windows installer and portable zip
+        run: pnpm exec electron-builder --win nsis zip --x64 --publish never --config electron-builder.yml
+      - shell: bash
+        run: test -n "$(find dist -maxdepth 1 -name '*.exe' -print -quit)" && test -n "$(find dist -maxdepth 1 -name '*.zip' -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botmux-desktop-windows-x64
+          path: |
+            dist/*.exe
+            dist/*.zip
+          if-no-files-found: error
+
+  desktop-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: x64
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: linux-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      BOTMUX_DESKTOP_TARGETS: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+      - uses: actions/setup-node@v6
+        with: { node-version: 22 }
+      - run: npm install -g pnpm@9.5.0
+      - run: pnpm install --frozen-lockfile
+      - name: Verify tag still resolves to the checked-out commit
+        run: test "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/${RELEASE_TAG}^{commit})"
+      - run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+      - run: pnpm build && pnpm desktop:bundle && pnpm desktop:runtime
+      - name: Build Linux packages
+        run: pnpm exec electron-builder --linux AppImage deb tar.gz --${{ matrix.arch }} --publish never --config electron-builder.yml
+      - run: test -n "$(find dist -maxdepth 1 -name '*.AppImage' -print -quit)" && test -n "$(find dist -maxdepth 1 -name '*.deb' -print -quit)" && test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botmux-desktop-linux-${{ matrix.arch }}
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-desktop-release:
+    if: always() && github.event_name == 'push'
+    needs: [desktop-macos, desktop-windows, desktop-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all package builds
+        env:
+          MAC_RESULT: ${{ needs.desktop-macos.result }}
+          WINDOWS_RESULT: ${{ needs.desktop-windows.result }}
+          LINUX_RESULT: ${{ needs.desktop-linux.result }}
+        run: test "$MAC_RESULT" = success && test "$WINDOWS_RESULT" = success && test "$LINUX_RESULT" = success
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: botmux-desktop-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        working-directory: release-assets
+        run: find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS
+      - name: Create GitHub Release
+        if: github.repository != 'deepcoldy/botmux'
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Cross-platform desktop preview for `${{ github.ref_name }}`.
+
+            - macOS: Universal `.dmg` / `.zip` (unsigned preview; Gatekeeper may require manual approval)
+            - Windows: x64 NSIS `.exe` / portable `.zip` (unsigned preview; SmartScreen may warn)
+            - Linux: x64 + arm64 `.AppImage` / `.deb` / `.tar.gz`
+            - Verify every download against `SHA256SUMS`.
+          files: release-assets/*
+      - name: Attach assets to upstream-created release
+        if: github.repository == 'deepcoldy/botmux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  refresh-desktop-release:
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: [desktop-macos, desktop-windows, desktop-linux]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Require all package builds
+        env:
+          MAC_RESULT: ${{ needs.desktop-macos.result }}
+          WINDOWS_RESULT: ${{ needs.desktop-windows.result }}
+          LINUX_RESULT: ${{ needs.desktop-linux.result }}
+        run: test "$MAC_RESULT" = success && test "$WINDOWS_RESULT" = success && test "$LINUX_RESULT" = success
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: botmux-desktop-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        working-directory: release-assets
+        run: find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS
+      - name: Replace release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
