@@ -22,6 +22,7 @@ import type { MemoryBackendProvider } from './memory-backend-spi.js';
 import { resolveRetrievalScopeSubjects, visibleScopes } from './retrieval-quality.js';
 import type { MemoryScope, RetrievalQualityCounters } from './observation-store.js';
 import { resolveKmCanaryRuntimeAuthorization } from './canary-release.js';
+import { recordAutomaticWorkspaceRetrievalEvidence } from './workspace-knowledge/retrieval-evidence.js';
 
 function envOn(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
   return ['1', 'true', 'yes'].includes(env[name]?.trim().toLowerCase() ?? '');
@@ -171,7 +172,7 @@ export async function drainDistillationJobs(input: { dataDir: string; cliId?: st
 
 export async function runRetrievalShadow(input: {
   dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string;
-  projectId?: string; skillName?: string; environmentId?: string; teamId?: string; workspaceId?: string;
+  projectId?: string; skillName?: string; environmentId?: string; teamId?: string; workspaceId?: string; workingDir?: string;
   providers?: MemoryBackendProvider[]; env?: NodeJS.ProcessEnv; providerTimeoutMs?: number;
 }): Promise<void> {
   if (!isKmRetrievalShadowEnabled(input.env)) return;
@@ -207,8 +208,9 @@ export async function runRetrievalShadow(input: {
     const plan = planPromptMemory(candidates, { botAppId: input.botAppId, userId: input.userId, mode: 'shadow',
       projectId: input.projectId, skillName: input.skillName, environmentId: input.environmentId, teamId: input.teamId,
       workspaceId: input.workspaceId, promptTokenBudget: profile?.budgets.promptTokens ?? 1_800 });
+    const queryHash = retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId });
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
-      queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: 'shadow',
+      queryHash, mode: 'shadow',
       candidateCount: candidates.length, eligibleCount: plan.eligible.length, latencyMs: Date.now() - started,
       metrics: local.metrics,
       warnings: [...(profile && profile.injectionMode !== 'shadow' ? [`configured_mode_${profile.injectionMode}_forced_shadow`] : []), ...warnings],
@@ -217,14 +219,28 @@ export async function runRetrievalShadow(input: {
     store.recordPromptInjectionSnapshot({ retrievalRunId: runId, botAppId: input.botAppId, mode: 'shadow', disposition: plan.disposition,
       requestedMode: plan.requestedMode, effectiveMode: plan.effectiveMode,
       itemIds: plan.selectedItemIds, prompt: plan.prompt, reason: plan.reason });
+    const evidence = recordAutomaticWorkspaceRetrievalEvidence({
+      workingDir: input.workingDir,
+      queryHash,
+      botAppId: input.botAppId,
+      sessionId: input.sessionId,
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      retrievalRunId: runId,
+      source: 'runtime_retrieval',
+      candidates,
+      selectedItemIds: [],
+      fallbackOutcome: candidates.length === 0 ? 'no_hit' : undefined,
+      useLabel: 'context_guided',
+    });
+    warnings.push(...evidence.warnings);
   } finally { store.close(); }
 }
 
 export async function composePromptMemoryForTurn(input: {
   dataDir: string; botAppId: string; sessionId: string; turnId?: string; userId?: string; queryText: string; promptContent: string;
-  projectId?: string; skillName?: string; environmentId?: string; teamId?: string; workspaceId?: string;
+  projectId?: string; skillName?: string; environmentId?: string; teamId?: string; workspaceId?: string; workingDir?: string;
   env?: NodeJS.ProcessEnv; providers?: MemoryBackendProvider[]; providerTimeoutMs?: number;
-}): Promise<{ promptContent: string; injected: boolean; reason?: string }> {
+}): Promise<{ promptContent: string; injected: boolean; reason?: string; queryHash?: string; retrievalRunId?: string; workspaceEvidenceWarnings?: string[] }> {
   const env = input.env ?? process.env;
   if (!isKmRetrievalShadowEnabled(env) && !isKmLiveInjectionEnabled(env)) {
     return { promptContent: input.promptContent, injected: false, reason: 'retrieval_gate_disabled' };
@@ -273,8 +289,9 @@ export async function composePromptMemoryForTurn(input: {
       canaryBotIds: canaryAuthorization.active || legacyLiveAuthorized ? [input.botAppId] : [],
       promptTokenBudget: profile?.budgets.promptTokens ?? 1_800,
     });
+    const queryHash = retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId });
     const runId = store.recordRetrievalAudit({ botAppId: input.botAppId, sessionId: input.sessionId, turnId: input.turnId,
-      queryHash: retrievalQueryHash({ text: input.queryText, botAppId: input.botAppId, userId: input.userId }), mode: composed.plan.effectiveMode,
+      queryHash, mode: composed.plan.effectiveMode,
       candidateCount: candidates.length, eligibleCount: composed.plan.eligible.length, latencyMs: Date.now() - started,
       metrics: local.metrics,
       warnings,
@@ -283,6 +300,26 @@ export async function composePromptMemoryForTurn(input: {
     store.recordPromptInjectionSnapshot({ retrievalRunId: runId, botAppId: input.botAppId, mode: composed.plan.effectiveMode,
       requestedMode: composed.plan.requestedMode, effectiveMode: composed.plan.effectiveMode, disposition: composed.plan.disposition,
       itemIds: composed.plan.selectedItemIds, prompt: composed.plan.prompt, reason: composed.plan.reason });
-    return { promptContent: composed.content, injected: composed.mutated, reason: composed.plan.reason };
+    const evidence = recordAutomaticWorkspaceRetrievalEvidence({
+      workingDir: input.workingDir,
+      queryHash,
+      botAppId: input.botAppId,
+      sessionId: input.sessionId,
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      retrievalRunId: runId,
+      source: 'prompt_memory',
+      candidates,
+      selectedItemIds: composed.mutated ? composed.plan.selectedItemIds : [],
+      fallbackOutcome: candidates.length === 0 ? 'no_hit' : undefined,
+      useLabel: composed.mutated ? 'direct_apply' : 'context_guided',
+    });
+    return {
+      promptContent: composed.content,
+      injected: composed.mutated,
+      reason: composed.plan.reason,
+      queryHash,
+      retrievalRunId: runId,
+      ...(evidence.warnings.length ? { workspaceEvidenceWarnings: evidence.warnings } : {}),
+    };
   } finally { store.close(); }
 }

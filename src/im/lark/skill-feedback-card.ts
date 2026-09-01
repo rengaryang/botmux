@@ -2,10 +2,11 @@ import { createHash } from 'node:crypto';
 import type { CardActionData } from './card-handler.js';
 import { resolveCardOperatorUnionId } from './card-handler.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
-import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
+import type { SkillFeedbackStore, TurnDeliveryRecord } from '../../services/skill-feedback-store.js';
 import { buildOncallGroupColumn } from './oncall-group.js';
 
 export interface FeedbackCardState { feedbackId?: string; result?: string; reasonKey?: string; comment?: string }
+export interface RecordedFeedbackState extends FeedbackCardState { semantic?: 'positive' | 'progress' | 'negative' }
 
 function versionedValue(state: FeedbackCardState, value: Record<string, unknown>): Record<string, unknown> {
   return state.feedbackId ? { ...value, expected_feedback_id: state.feedbackId } : value;
@@ -79,10 +80,14 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
 }
 
 function callbackKey(input: Record<string, unknown>): string { return createHash('sha256').update(JSON.stringify(input)).digest('hex'); }
+function normalizedSemantic(value: unknown): RecordedFeedbackState['semantic'] {
+  return value === 'positive' || value === 'progress' || value === 'negative' ? value : undefined;
+}
 
 export async function handleSkillFeedbackCardAction(data: CardActionData, larkAppId: string, deps: {
   store: SkillFeedbackStore;
   loadBaseCard?: (platformMessageId: string) => Promise<Record<string, unknown> | undefined>;
+  onFeedbackRecorded?: (input: { delivery: TurnDeliveryRecord; feedback: RecordedFeedbackState }) => void | Promise<void>;
 }): Promise<any> {
   const platformMessageId = data.context?.open_message_id;
   const verifiedOperator = await resolveCardOperatorUnionId(data, larkAppId);
@@ -178,6 +183,8 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
     }
     throw error;
   }
+  try { await deps.onFeedbackRecorded?.({ delivery, feedback: { ...recorded.feedback, semantic: normalizedSemantic(recorded.feedback.semantic) } }); }
+  catch { /* Feedback telemetry is best-effort and must not break card updates. */ }
   const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
   const toast = recorded.status === 'stale'
     ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }

@@ -233,7 +233,7 @@ function readRecallLog(root: string, maxBytes: number): Map<string, { count: num
   const result = new Map<string, { count: number; last: string }>();
   for (const row of readRecallRows(root, maxBytes)) {
     if (typeof row.entry_id !== 'string' || !row.entry_id) continue;
-    if (row.event_type && row.event_type !== 'entry_recalled') continue;
+    if (row.event_type && row.event_type !== 'entry_recalled' && row.event_type !== 'entry_read') continue;
     const old = result.get(row.entry_id); result.set(row.entry_id, { count: (old?.count ?? 0) + 1, last: String(row.recalled_at ?? row.observed_at ?? old?.last ?? '') });
   }
   return result;

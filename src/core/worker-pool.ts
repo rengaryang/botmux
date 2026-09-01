@@ -16675,6 +16675,9 @@ async function persistFinalOutputDelivery(
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
     if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
+    const kmRetrieval = ds.kmRetrievalTurns?.[msg.turnId];
+    const kmRetrievalWorkingDir = kmRetrieval?.workingDir ?? ds.session.workingDir ?? ds.workingDir;
+    const feedbackTeamId = resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId });
     const result = feedbackStore.recordTurnDeliveryWithCompletion({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
@@ -16699,7 +16702,16 @@ async function persistFinalOutputDelivery(
       // turn.completed webhooks are a completion concern, not a feedback one:
       // they must keep firing with the feedback card turned off.
       webhookDestinations,
-      context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
+      context: {
+        ...(feedbackTeamId ? { teamId: feedbackTeamId } : {}),
+        ...(kmRetrieval ? {
+          kmRetrieval: {
+            queryHash: kmRetrieval.queryHash,
+            ...(kmRetrieval.retrievalRunId ? { retrievalRunId: kmRetrieval.retrievalRunId } : {}),
+            ...(kmRetrievalWorkingDir ? { workingDir: kmRetrievalWorkingDir } : {}),
+          },
+        } : {}),
+      },
     });
     if (result.completion) {
       try {
