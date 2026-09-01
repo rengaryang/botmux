@@ -3596,6 +3596,7 @@ const server = createServer(async (req, res) => {
       centralSinkDrill: input => runKmCentralSinkDrill({ dataDir: config.session.dataDir, ...input }),
       retentionRuntimeStatus: () => kmRetentionRuntimeStatus({ dataDir: config.session.dataDir }),
       workspaceKnowledgeSnapshot: () => workspaceKnowledgeCache.get(),
+      kmReviewQueueSnapshot: () => workspaceKnowledgeCache.getReviewQueue(),
     })) return;
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {

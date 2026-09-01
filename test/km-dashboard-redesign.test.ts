@@ -118,14 +118,18 @@ describe('KM dashboard redesign', () => {
     const components = readFileSync(new URL('../src/dashboard/web/km-dashboard-components.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
-    for (const label of ['总览', '知识', '记忆', '质量', '配置', '生产闸门', '审计']) {
+    for (const label of ['总览', '知识', 'Review Queue', '记忆', '质量', '配置', '生产闸门', '审计']) {
       expect(components).toContain(label);
     }
     expect(page).toContain('<TabOnly tab="overview">');
+    expect(page).toContain('<TabOnly tab="review">');
     expect(page).toContain('<TabOnly tab="production">');
     expect(page.indexOf('<KmOverview model={dashboardModel} />')).toBeLessThan(page.indexOf('<TabOnly tab="production">'));
     expect(page).toContain('KM_DASHBOARD_EXPECTED_CONTRACT');
     expect(page).toContain("getJson<KmOpsMetricsRaw>('/api/km/dashboard-metrics?rankingLimit=10')");
+    expect(page).toContain("getJson<KmReviewQueueV2>('/api/km/review-queue-v2')");
+    expect(page).toContain('Dashboard KM Review Queue');
+    expect(page).toContain('decision` 只来自独立 manifest / registry 元数据');
     expect(page).toContain('buildKmDashboardModelFromMetrics(dashboardMetrics)');
     expect(page).toContain('筛选 Workspace');
     expect(page).toContain('显示 {workspaceAssetView.total');

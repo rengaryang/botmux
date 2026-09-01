@@ -31840,7 +31840,7 @@ a.card-menu-item {
 
 .km-tabs {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   gap: 8px;
   margin: 0 0 16px;
   padding: 6px;
@@ -32318,6 +32318,135 @@ a.card-menu-item {
 .km-asset-pagination button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.km-review-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.km-review-summary span,
+.km-review-source {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.km-review-summary small,
+.km-review-source small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.km-review-summary strong,
+.km-review-source b {
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 15px;
+}
+
+.km-review-source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.km-review-source code,
+.km-review-table code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.km-review-source span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.km-review-table {
+  display: grid;
+  overflow-x: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+
+.km-review-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.9fr) minmax(120px, 0.8fr) minmax(116px, 0.75fr) minmax(220px, 1.5fr) minmax(190px, 1.2fr) minmax(150px, 0.95fr) minmax(150px, 0.95fr);
+  gap: 12px;
+  min-width: 1080px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  align-items: center;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.km-review-row:last-child {
+  border-bottom: 0;
+}
+
+.km-review-row--head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: color-mix(in srgb, var(--surface-muted) 86%, var(--surface));
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 780;
+  text-transform: uppercase;
+}
+
+.km-review-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.km-review-row strong {
+  display: block;
+  color: var(--fg);
+}
+
+.km-review-row small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.km-review-decision {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 4px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  font-weight: 760;
+}
+
+.km-review-decision--approved {
+  border-color: color-mix(in srgb, var(--success) 38%, var(--border-soft));
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.km-review-decision--pending {
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--border-soft));
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.km-review-decision--blocked {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border-soft));
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .km-inline-help {

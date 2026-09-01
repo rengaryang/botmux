@@ -10,6 +10,7 @@ export type KmOpsTab = {
 export const KM_OPS_TABS: KmOpsTab[] = [
   { id: 'overview', label: '总览', description: '先看规模、健康、趋势和热度。' },
   { id: 'knowledge', label: '知识', description: '审核知识候选、导入与导出 staging。' },
+  { id: 'review', label: 'Review Queue', description: '只读审批队列与证据状态。' },
   { id: 'memory', label: '记忆', description: '查看 memory item、策略命中和外部后端。' },
   { id: 'quality', label: '质量', description: 'Golden set、Shadow 对比、Eval 与召回质量。' },
   { id: 'configuration', label: '配置', description: 'Pipeline profile、provider 与 central sink。' },
