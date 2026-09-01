@@ -30,7 +30,18 @@ type Health = {
 };
 
 type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; title: string; confidence: string; freshness: string };
-type WorkspaceAssetV2 = { assetId: string; workspaceId: string; layer: string; kind: string; title: string; relativePath: string; lifecycle: string; freshness: string; contract: { version: string; valid: boolean; errors: string[]; warnings: string[] }; retrieval: { recallCount: number; lastRecalledAt?: string }; linkage: { relatedCount: number; canonicalKey?: string } };
+export type WorkspaceAssetV2 = { assetId: string; workspaceId: string; layer: string; kind: string; title: string; relativePath: string; lifecycle: string; freshness: string; contract: { version: string; valid: boolean; errors: string[]; warnings: string[] }; retrieval: { recallCount: number; lastRecalledAt?: string }; linkage: { relatedCount: number; canonicalKey?: string } };
+
+export const WORKSPACE_ASSET_PAGE_SIZE = 50;
+export function filterWorkspaceAssets(items: WorkspaceAssetV2[], workspaceId: string, layer: string): WorkspaceAssetV2[] {
+  return items.filter(item => (!workspaceId || item.workspaceId === workspaceId) && (!layer || item.layer === layer));
+}
+export function paginateWorkspaceAssets(items: WorkspaceAssetV2[], page: number, pageSize = WORKSPACE_ASSET_PAGE_SIZE) {
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const currentPage = Math.min(Math.max(1, page), pageCount);
+  const start = (currentPage - 1) * pageSize;
+  return { items: items.slice(start, start + pageSize), currentPage, pageCount, start, end: Math.min(start + pageSize, items.length), total: items.length };
+}
 type KnowledgeExportJob = {
   jobId: string;
   state: string;
@@ -275,6 +286,9 @@ function KmPage(): React.JSX.Element {
   const [dashboardMetrics, setDashboardMetrics] = useState<KmOpsMetricsRaw>();
   const [workspaceMetrics, setWorkspaceMetrics] = useState<WorkspaceMetricsV2>();
   const [workspaceAssets, setWorkspaceAssets] = useState<WorkspaceAssetV2[]>([]);
+  const [workspaceAssetWorkspace, setWorkspaceAssetWorkspace] = useState('');
+  const [workspaceAssetLayer, setWorkspaceAssetLayer] = useState('');
+  const [workspaceAssetPage, setWorkspaceAssetPage] = useState(1);
   const [goldenForm, setGoldenForm] = useState({ title: '', queryRedacted: '', claimKey: '', claimTextHash: `sha256:${'0'.repeat(64)}` });
   const [profileForm, setProfileForm] = useState({ botAppId: '', profileId: '', revision: 1, injectionMode: 'shadow' as const,
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
@@ -705,6 +719,11 @@ function KmPage(): React.JSX.Element {
   const TabOnly = ({ tab, children }: { tab: KmOpsTab['id']; children: React.ReactNode }) => (
     activeTab === tab ? <>{children}</> : null
   );
+  const workspaceAssetWorkspaces = useMemo(() => [...new Set(workspaceAssets.map(item => item.workspaceId))].sort(), [workspaceAssets]);
+  const workspaceAssetLayers = useMemo(() => [...new Set(workspaceAssets.map(item => item.layer))].sort(), [workspaceAssets]);
+  const filteredWorkspaceAssets = useMemo(() => filterWorkspaceAssets(workspaceAssets, workspaceAssetWorkspace, workspaceAssetLayer), [workspaceAssets, workspaceAssetWorkspace, workspaceAssetLayer]);
+  const workspaceAssetView = useMemo(() => paginateWorkspaceAssets(filteredWorkspaceAssets, workspaceAssetPage), [filteredWorkspaceAssets, workspaceAssetPage]);
+  useEffect(() => { if (workspaceAssetPage !== workspaceAssetView.currentPage) setWorkspaceAssetPage(workspaceAssetView.currentPage); }, [workspaceAssetPage, workspaceAssetView.currentPage]);
 
   return (
     <KmPageFrame activeTab={activeTab} onTabChange={selectTab} model={dashboardModel} loading={loading} error={error} notice={notice}>
@@ -714,14 +733,24 @@ function KmPage(): React.JSX.Element {
 
       <TabOnly tab="knowledge">
         <KmSection title="分层知识资产" description="只读聚合自动发现 workspace 的 L0–L4 文件资产；不读取或展示正文。" badge="只读 · Contract v2" risk="low">
+          <div className="km-asset-toolbar" aria-label="知识资产筛选">
+            <label>Workspace<select aria-label="筛选 Workspace" value={workspaceAssetWorkspace} onChange={event => { setWorkspaceAssetWorkspace(event.target.value); setWorkspaceAssetPage(1); }}><option value="">全部（{workspaceAssetWorkspaces.length}）</option>{workspaceAssetWorkspaces.map(workspaceId => <option key={workspaceId} value={workspaceId}>{workspaceId}</option>)}</select></label>
+            <label>层级<select aria-label="筛选知识层级" value={workspaceAssetLayer} onChange={event => { setWorkspaceAssetLayer(event.target.value); setWorkspaceAssetPage(1); }}><option value="">全部层级</option>{workspaceAssetLayers.map(layer => <option key={layer} value={layer}>{layer}</option>)}</select></label>
+            <span className="km-asset-count">显示 {workspaceAssetView.total ? `${workspaceAssetView.start + 1}–${workspaceAssetView.end}` : '0'} / {workspaceAssetView.total}（总资产 {workspaceAssets.length}）</span>
+          </div>
           <div className="feedback-deliveries">
-            {workspaceAssets.slice(0, 100).map(item => <div key={item.assetId}>
+            {workspaceAssetView.items.map(item => <div key={item.assetId}>
               <code>{item.layer}</code><span>{item.title} · {item.relativePath}</span>
               <span>{item.contract.version} · recall {item.retrieval.recallCount} · related {item.linkage.relatedCount}</span>
               <b>{item.lifecycle} / {item.freshness}{item.contract.valid ? '' : ` · ${item.contract.errors.join(', ') || item.contract.warnings.join(', ')}`}</b>
             </div>)}
-            {workspaceAssets.length === 0 && <KmEmptyState title="暂无 workspace 资产快照" message="后台扫描尚未完成或当前会话未发现知识根目录。" />}
+            {workspaceAssetView.total === 0 && <KmEmptyState title={workspaceAssets.length ? '没有匹配的知识资产' : '暂无 workspace 资产快照'} message={workspaceAssets.length ? '请调整 Workspace 或层级筛选条件。' : '后台扫描尚未完成或当前会话未发现知识根目录。'} />}
           </div>
+          <nav className="km-asset-pagination" aria-label="知识资产分页">
+            <button type="button" disabled={workspaceAssetView.currentPage <= 1} onClick={() => setWorkspaceAssetPage(page => Math.max(1, page - 1))}>上一页</button>
+            <span>第 {workspaceAssetView.currentPage} / {workspaceAssetView.pageCount} 页 · 每页 {WORKSPACE_ASSET_PAGE_SIZE} 项</span>
+            <button type="button" disabled={workspaceAssetView.currentPage >= workspaceAssetView.pageCount} onClick={() => setWorkspaceAssetPage(page => Math.min(workspaceAssetView.pageCount, page + 1))}>下一页</button>
+          </nav>
           <KmInlineHelp>workspace 根目录可从 Bot 默认 workingDir、当前 cwd 和会话 workingDir 自动发现；每个发现根仍执行 realpath、symlink 逃逸、文件大小和数量预算校验。</KmInlineHelp>
         </KmSection>
 
