@@ -31,6 +31,26 @@ type Health = {
 
 type KnowledgeItem = { knowledgeId: string; state: string; targetLayer: string; title: string; confidence: string; freshness: string };
 export type WorkspaceAssetV2 = { assetId: string; workspaceId: string; layer: string; kind: string; title: string; relativePath: string; lifecycle: string; freshness: string; contract: { version: string; valid: boolean; errors: string[]; warnings: string[] }; retrieval: { recallCount: number; lastRecalledAt?: string }; linkage: { relatedCount: number; canonicalKey?: string } };
+export type KmReviewQueueV2 = {
+  schemaVersion: 2;
+  generatedAt: string;
+  state: 'available' | 'partial' | 'unavailable';
+  sources: Array<{ workspaceId: string; kind: string; state: 'available' | 'unavailable'; relativePath: string | null; checksum: string | null; error?: string }>;
+  summary: { total: number; unavailableManifests: number; byBatch: Record<string, number>; byRoute: Record<string, number>; byDecision: Record<string, number> };
+  items: Array<{
+    itemId: string;
+    title: string;
+    batch: string | null;
+    route: string | null;
+    decision: string | null;
+    blockers: string[];
+    planHash: string | null;
+    auditTime: string | null;
+    sourceRef: string | null;
+    manifest: { state: 'available' | 'unavailable'; kind: string | null; relativePath: string | null; checksum: string | null };
+  }>;
+  errors: string[];
+};
 
 export const WORKSPACE_ASSET_PAGE_SIZE = 50;
 export function filterWorkspaceAssets(items: WorkspaceAssetV2[], workspaceId: string, layer: string): WorkspaceAssetV2[] {
@@ -207,7 +227,7 @@ const KM_TAB_STORAGE_KEY = 'botmux.km.activeTab';
 function readKmTab(): KmOpsTabId {
   try {
     const value = window.localStorage.getItem(KM_TAB_STORAGE_KEY);
-    return value === 'knowledge' || value === 'memory' || value === 'quality' || value === 'configuration' || value === 'production' || value === 'audit'
+    return value === 'knowledge' || value === 'review' || value === 'memory' || value === 'quality' || value === 'configuration' || value === 'production' || value === 'audit'
       ? value
       : 'overview';
   } catch {
@@ -286,6 +306,7 @@ function KmPage(): React.JSX.Element {
   const [dashboardMetrics, setDashboardMetrics] = useState<KmOpsMetricsRaw>();
   const [workspaceMetrics, setWorkspaceMetrics] = useState<WorkspaceMetricsV2>();
   const [workspaceAssets, setWorkspaceAssets] = useState<WorkspaceAssetV2[]>([]);
+  const [reviewQueue, setReviewQueue] = useState<KmReviewQueueV2>();
   const [workspaceAssetWorkspace, setWorkspaceAssetWorkspace] = useState('');
   const [workspaceAssetLayer, setWorkspaceAssetLayer] = useState('');
   const [workspaceAssetPage, setWorkspaceAssetPage] = useState(1);
@@ -318,13 +339,17 @@ function KmPage(): React.JSX.Element {
     try {
       setLoading(true);
       setError('');
-      const [workspaceAssetsResult, workspaceMetricsResult, metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [workspaceAssetsResult, workspaceMetricsResult, reviewQueueResult, metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<{ items: WorkspaceAssetV2[] }>('/api/km/knowledge-assets-v2').then(
           result => ({ ok: true as const, result }),
           error => ({ ok: false as const, error }),
         ),
         getJson<WorkspaceMetricsV2>('/api/km/dashboard-metrics-v2?rankingLimit=10').then(
           metrics => ({ ok: true as const, metrics }),
+          error => ({ ok: false as const, error }),
+        ),
+        getJson<KmReviewQueueV2>('/api/km/review-queue-v2').then(
+          queue => ({ ok: true as const, queue }),
           error => ({ ok: false as const, error }),
         ),
         getJson<KmOpsMetricsRaw>('/api/km/dashboard-metrics?rankingLimit=10').then(
@@ -379,6 +404,7 @@ function KmPage(): React.JSX.Element {
       setGoldenCases(goldenList.items); setShadowComparisons(comparisonList.items); setShadowReadiness(readiness);
       setWorkspaceAssets(workspaceAssetsResult.ok ? workspaceAssetsResult.result.items : []);
       setWorkspaceMetrics(workspaceMetricsResult.ok ? workspaceMetricsResult.metrics : undefined);
+      setReviewQueue(reviewQueueResult.ok ? reviewQueueResult.queue : undefined);
       setDashboardMetrics(metricsResult.ok ? metricsResult.metrics : undefined);
       const activeCanary = productionGateList.items.find(plan => plan.actionKind === 'prompt-canary' && plan.state === 'executing');
       const botAppId = String((activeCanary?.target as { botAppId?: unknown } | undefined)?.botAppId ?? canaryForm.botAppId).trim();
@@ -813,6 +839,52 @@ function KmPage(): React.JSX.Element {
         </KmSection>
       </TabOnly>
 
+      <TabOnly tab="review">
+        <KmSection title="Dashboard KM Review Queue" description="审批决策来自独立只读 manifest / registry；缺证据时显示 unavailable 或 null。" badge="只读 · v2" risk="low">
+          <div className="km-review-summary" aria-label="Review queue summary">
+            <span><small>State</small><strong>{reviewQueue?.state ?? 'unavailable'}</strong></span>
+            <span><small>Total</small><strong>{reviewQueue?.summary.total ?? 0}</strong></span>
+            <span><small>Missing Manifest</small><strong>{reviewQueue?.summary.unavailableManifests ?? 0}</strong></span>
+            <span><small>Updated</small><strong>{reviewQueue?.generatedAt ? new Date(reviewQueue.generatedAt).toLocaleString() : '—'}</strong></span>
+          </div>
+          <div className="km-review-source-grid" aria-label="Review queue sources">
+            {(reviewQueue?.sources ?? []).map(source => (
+              <div key={`${source.workspaceId}:${source.relativePath ?? source.kind}`} className="km-review-source">
+                <code>{source.kind}</code>
+                <span>{source.relativePath ?? 'unavailable'}</span>
+                <b>{source.state}</b>
+                <small>{source.checksum ?? source.error ?? 'null'}</small>
+              </div>
+            ))}
+            {reviewQueue && reviewQueue.sources.length === 0 ? <KmEmptyState title="暂无独立 registry" message="未发现 review-queue-v2 或 session-distill INDEX 元数据。" /> : null}
+          </div>
+          <div className="km-review-table" role="table" aria-label="KM review queue">
+            <div role="row" className="km-review-row km-review-row--head">
+              <span role="columnheader">Batch</span>
+              <span role="columnheader">Route</span>
+              <span role="columnheader">Decision</span>
+              <span role="columnheader">Item</span>
+              <span role="columnheader">Blockers</span>
+              <span role="columnheader">Plan Hash</span>
+              <span role="columnheader">Audit Time</span>
+            </div>
+            {(reviewQueue?.items ?? []).map(item => (
+              <div role="row" className="km-review-row" key={`${item.sourceRef ?? 'source'}:${item.itemId}`}>
+                <span role="cell"><code>{item.batch ?? 'unavailable'}</code></span>
+                <span role="cell">{item.route ?? 'null'}</span>
+                <span role="cell"><b className={`km-review-decision km-review-decision--${decisionTone(item.decision)}`}>{item.decision ?? 'null'}</b></span>
+                <span role="cell"><strong>{item.title}</strong><small>{item.itemId} · {item.sourceRef ?? 'null'} · manifest {item.manifest.state}</small></span>
+                <span role="cell">{item.blockers.length ? item.blockers.join(', ') : 'none'}</span>
+                <span role="cell"><code>{shortHash(item.planHash)}</code></span>
+                <span role="cell">{item.auditTime ? new Date(item.auditTime).toLocaleString() : 'null'}</span>
+              </div>
+            ))}
+          </div>
+          {(reviewQueue?.items.length ?? 0) === 0 ? <KmEmptyState title="Review queue 不可用" message="没有可展示的只读 registry/manifest 条目。" /> : null}
+          <KmInlineHelp>此面板不读取 Markdown 正文，不返回敏感值或绝对路径；`decision` 只来自独立 manifest / registry 元数据，缺失时保持 null。</KmInlineHelp>
+        </KmSection>
+      </TabOnly>
+
       <TabOnly tab="memory">
         <KmSection title="Memory Review" description="按状态处理记忆条目，策略决策用于解释为什么被接纳或拦截。" badge="中风险：状态切换需确认" risk="medium">
           <div className="feedback-deliveries">
@@ -1121,6 +1193,19 @@ function KmPage(): React.JSX.Element {
       </TabOnly>
     </KmPageFrame>
   );
+}
+
+function decisionTone(decision: string | null): 'approved' | 'pending' | 'blocked' | 'neutral' {
+  if (!decision) return 'neutral';
+  if (decision.includes('approved') || decision.includes('human-confirmed') || decision.includes('staged') || decision.includes('applied')) return 'approved';
+  if (decision.includes('reject') || decision.includes('block') || decision.includes('conflict') || decision.includes('fail')) return 'blocked';
+  if (decision.includes('pending') || decision.includes('review') || decision.includes('ready')) return 'pending';
+  return 'neutral';
+}
+
+function shortHash(value: string | null): string {
+  if (!value) return 'null';
+  return value.length > 20 ? `${value.slice(0, 17)}...` : value;
 }
 
 export function renderKmPage(root: HTMLElement): PageDisposer {

@@ -1,8 +1,10 @@
 import { discoverWorkspaceKnowledgeRoots, scanWorkspaceKnowledge } from './scanner.js';
 import type { WorkspaceKnowledgeSnapshotV2 } from './types.js';
+import { scanKmReviewQueue, unavailableKmReviewQueue, type KmReviewQueueV2 } from './review-queue.js';
 
 export class WorkspaceKnowledgeSnapshotCache {
   private snapshot?: WorkspaceKnowledgeSnapshotV2;
+  private reviewQueue?: KmReviewQueueV2;
   private timer?: NodeJS.Timeout;
   private initial?: NodeJS.Immediate;
 
@@ -28,17 +30,24 @@ export class WorkspaceKnowledgeSnapshotCache {
     return this.snapshot ?? unavailableSnapshot('workspace_scan_not_started');
   }
 
+  getReviewQueue(): KmReviewQueueV2 {
+    return this.reviewQueue ?? unavailableKmReviewQueue('workspace_scan_not_started');
+  }
+
   refresh(): WorkspaceKnowledgeSnapshotV2 {
     try {
       const roots = discoverWorkspaceKnowledgeRoots(this.candidates());
       const next = scanWorkspaceKnowledge({ roots });
+      this.reviewQueue = scanKmReviewQueue({ roots });
       this.snapshot = next;
       return next;
     } catch (error) {
       if (this.snapshot) {
         this.snapshot = { ...this.snapshot, state: 'stale', errors: [...this.snapshot.errors, `scan_failed:${safeError(error)}`] };
+        this.reviewQueue = { ...this.getReviewQueue(), state: 'partial', errors: [...this.getReviewQueue().errors, `scan_failed:${safeError(error)}`] };
         return this.snapshot;
       }
+      this.reviewQueue = unavailableKmReviewQueue(`scan_failed:${safeError(error)}`);
       return this.snapshot = unavailableSnapshot(`scan_failed:${safeError(error)}`);
     }
   }

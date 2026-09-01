@@ -35,6 +35,7 @@ import {
   renderKmCanaryCloseoutMarkdown,
 } from '../services/km/canary-closeout-report.js';
 import type { WorkspaceKnowledgeSnapshotV2 } from '../services/km/workspace-knowledge/types.js';
+import type { KmReviewQueueV2 } from '../services/km/workspace-knowledge/review-queue.js';
 import {
   activateKmCanaryRelease,
   resolveKmCanaryRuntimeAuthorization,
@@ -129,6 +130,7 @@ export interface KmObservationApiDeps {
   centralSinkRuntimeStatus?(): Promise<CentralSinkRuntimeStatus>;
   centralSinkDrill?(input: { sinkId: string; drill: 'status' | 'partial-ack' | 'replay' | 'conflict'; actorId: string; idempotencyKey: string }): Promise<Record<string, unknown>>;
   workspaceKnowledgeSnapshot?(): WorkspaceKnowledgeSnapshotV2;
+  kmReviewQueueSnapshot?(): KmReviewQueueV2;
 }
 
 class KmApiError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -178,6 +180,7 @@ export async function handleKmObservationApi(
     || url.pathname === '/api/km/knowledge-health-v2'
     || url.pathname === '/api/km/retrieval-usage-v2'
     || url.pathname === '/api/km/dashboard-metrics-v2'
+    || url.pathname === '/api/km/review-queue-v2'
     || url.pathname.startsWith('/api/km/observations')
     || url.pathname === '/api/km/knowledge'
     || url.pathname === '/api/km/memory'
@@ -235,6 +238,12 @@ export async function handleKmObservationApi(
   if (!kmReadPath) return false;
   if (!deps.enabled) {
     jsonRes(res, 404, { error: 'km_observation_disabled' });
+    return true;
+  }
+  if (url.pathname === '/api/km/review-queue-v2') {
+    if (req.method !== 'GET') { jsonRes(res, 405, { error: 'method_not_allowed' }); return true; }
+    if (!deps.kmReviewQueueSnapshot) { jsonRes(res, 422, { error: 'km_review_queue_unavailable' }); return true; }
+    jsonRes(res, 200, deps.kmReviewQueueSnapshot());
     return true;
   }
   let store: KmObservationApiStore | undefined;

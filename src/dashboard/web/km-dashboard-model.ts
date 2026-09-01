@@ -1,4 +1,4 @@
-export type KmOpsTabId = 'overview' | 'knowledge' | 'memory' | 'quality' | 'configuration' | 'production' | 'audit';
+export type KmOpsTabId = 'overview' | 'knowledge' | 'review' | 'memory' | 'quality' | 'configuration' | 'production' | 'audit';
 
 export type KmExpectedMetricsContract = {
   schemaVersion: 2;
