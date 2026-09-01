@@ -35,7 +35,7 @@ describe('KM dashboard redesign', () => {
       shadowReadiness: { ready: false, reasonCodes: ['min_reviewed_cases'] },
     });
 
-    expect(KM_DASHBOARD_EXPECTED_CONTRACT.path).toBe('/api/km/dashboard-metrics');
+    expect(KM_DASHBOARD_EXPECTED_CONTRACT.path).toBe('/api/km/dashboard-metrics-v2');
     expect(model.kpis).toHaveLength(5);
     expect(model.kpis.map(item => item.label)).toEqual([
       '知识总量',

@@ -815,6 +815,38 @@ describe('KM observation dashboard API', () => {
     expect(executeKmMutation).not.toHaveBeenCalled();
   });
 
+  it('serves workspace knowledge contract v2 without exposing asset bodies', async () => {
+    const snapshot: any = {
+      schemaVersion: 2, generatedAt: '2026-09-01T00:00:00.000Z', state: 'complete', hash: 'sha256:test', durationMs: 3,
+      roots: [{ workspaceId: 'ws', displayRoot: 'repo', state: 'complete', errors: [] }], errors: [],
+      assets: [{ assetId: 'ws:L2:id:l2k-1', workspaceId: 'ws', layer: 'L2', kind: 'l2-entry', title: 'SOP', relativePath: 'l2-knowledge/x.md', lifecycle: 'pending-ingest', freshness: 'fresh', contract: { version: 'v3', valid: true, errors: [], warnings: [] }, retrieval: { recallCount: 0 }, linkage: { relatedCount: 0 } }],
+      health: { totalsByLayer: { L0: 1, L1: 0, L2: 1, L3: 0, L4: 0 }, totalAssets: 2, contractValidRate: 100, indexConsistencyRate: 100, retrievableRate: 100, linkageCoverageRate: 0, lifecycle: { 'pending-ingest': 1 }, freshness: { fresh: 1 }, contractErrors: 0, legacyAssets: 0 },
+      retrievalQuality: { indexQueries: 0, entryRecallEvents: 0, neverRecalledAssets: 1, markdownReads: 0, zeroReadQueries: null, zeroReadRate: null, effectivenessRate: null, fallbackSuccessRate: null, queryFeedbackRate: null, evidenceState: 'cold_start' },
+      attention: { contractErrors: [], pendingIngest: [], staleOrPurged: [], neverRecalled: [], orphaned: [] },
+    };
+    const close = vi.fn(); const result = response();
+    await handleKmObservationApi({ method: 'GET' } as any, result.res, new URL('http://localhost/api/km/dashboard-metrics-v2'), {
+      enabled: true, workspaceKnowledgeSnapshot: () => snapshot,
+      openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close,
+        dashboardMetrics: vi.fn(() => ({ schemaVersion: 1, source: 'sqlite', totals: { knowledgeTotal: 1 } })) }),
+    });
+    expect(result.bodies[0]).toMatchObject({ schemaVersion: 2, assetHealth: { totalAssets: 2 }, retrievalQuality: { effectivenessRate: null }, kmRuntime: { schemaVersion: 1 } });
+    expect(JSON.stringify(result.bodies[0])).not.toContain('claimText');
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('redacts source metadata from the workspace asset list API', async () => {
+    const result = response(); const close = vi.fn();
+    const asset: any = { assetId: 'ws:L2:id:x', workspaceId: 'ws', layer: 'L2', kind: 'l2-entry', title: 'x', relativePath: 'l2/x.md', lifecycle: 'pending-ingest', freshness: 'fresh', contract: { version: 'v3', valid: true, errors: [], warnings: [] }, retrieval: { recallCount: 0 }, linkage: { relatedCount: 0, source: '/secret/source', ingestRunId: 'private-run' } };
+    await handleKmObservationApi({ method: 'GET' } as any, result.res, new URL('http://localhost/api/km/knowledge-assets-v2'), {
+      enabled: true, workspaceKnowledgeSnapshot: () => ({ schemaVersion: 2, generatedAt: '', state: 'complete', hash: '', durationMs: 0, roots: [], errors: [], assets: [asset], health: {} as any, retrievalQuality: {} as any, attention: {} as any }),
+      openStore: async () => ({ schemaVersion: vi.fn(), pragmas: vi.fn(), counts: vi.fn(), list: vi.fn(), get: vi.fn(), close }),
+    });
+    expect(result.bodies[0]).toMatchObject({ items: [{ linkage: { relatedCount: 0 } }] });
+    expect(JSON.stringify(result.bodies[0])).not.toContain('secret/source');
+    expect(JSON.stringify(result.bodies[0])).not.toContain('private-run');
+  });
+
   it('returns one event and rejects unsupported methods', async () => {
     const get = vi.fn(() => ({ eventId: 'evt-1', payload: { status: 'completed' } }));
     const first = response();

@@ -49,7 +49,7 @@ export function KmPageFrame(props: {
         <div className="km-hero-meta" aria-label="看板元信息">
           <span>UPDATED</span>
           <b>{formatDateTime(props.model.generatedAt)}</b>
-          <small>{props.model.source === 'metrics-api' ? 'metrics api' : 'metrics fallback'} · contract v1</small>
+          <small>{props.model.source === 'metrics-api' ? 'metrics api' : 'metrics fallback'} · workspace contract v2</small>
         </div>
       </header>
 
@@ -97,7 +97,7 @@ export function KmPageFrame(props: {
 export function KmOverview({ model }: { model: KmDashboardModel }): React.JSX.Element {
   return (
     <div className="km-overview">
-      <section className="km-kpi-grid" aria-label="关键指标">
+      <section className="km-kpi-grid km-kpi-grid--six" aria-label="关键指标">
         {model.kpis.map(kpi => <KmKpiCard key={kpi.key} kpi={kpi} />)}
       </section>
 
@@ -170,7 +170,7 @@ function KmKpiCard({ kpi }: { kpi: KmMetricPoint }): React.JSX.Element {
         <span>{kpi.label}</span>
       </div>
       <strong>
-        {formatNumber(kpi.value)}
+        {kpi.value == null ? '—' : formatNumber(kpi.value)}
         {kpi.unit ? <small>{kpi.unit}</small> : null}
       </strong>
       <p>{kpi.helper}</p>
