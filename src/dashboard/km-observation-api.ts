@@ -40,6 +40,7 @@ import {
   approveKmIngestRun,
   executeKmIngestOffline,
   planKmIngest,
+  recordKmIngestRemoteResult,
   registerKmIngestTarget,
   rollbackKmIngest,
 } from '../services/km/ingest-executor.js';
@@ -49,10 +50,12 @@ import {
   listLocalExtractorApprovals,
 } from '../services/km/local-ingest-registry.js';
 import {
+  getLocalIngestSecret,
   hasLocalIngestSecret,
   listLocalIngestSecrets,
   setLocalIngestSecret,
 } from '../services/km/local-ingest-secret-store.js';
+import { executeBusinessSpaceIngest } from '../services/km/business-space-ingest-adapter.js';
 import {
   activateKmCanaryRelease,
   resolveKmCanaryRuntimeAuthorization,
@@ -133,6 +136,7 @@ export interface KmObservationApiStore {
   createKmIngestRun?(input: Parameters<ObservationStore['createKmIngestRun']>[0]): ReturnType<ObservationStore['createKmIngestRun']>;
   transitionKmIngestRun?(input: Parameters<ObservationStore['transitionKmIngestRun']>[0]): ReturnType<ObservationStore['transitionKmIngestRun']>;
   runKmIngestOffline?(input: Parameters<ObservationStore['runKmIngestOffline']>[0]): ReturnType<ObservationStore['runKmIngestOffline']>;
+  recordKmIngestRemoteAck?(input: Parameters<ObservationStore['recordKmIngestRemoteAck']>[0]): ReturnType<ObservationStore['recordKmIngestRemoteAck']>;
   rollbackKmIngestRun?(input: Parameters<ObservationStore['rollbackKmIngestRun']>[0]): ReturnType<ObservationStore['rollbackKmIngestRun']>;
   getDistillationJob?(jobId: string): ReturnType<ObservationStore['getDistillationJob']>;
   listKmIngestRuns?(input?: Parameters<ObservationStore['listKmIngestRuns']>[0]): ReturnType<ObservationStore['listKmIngestRuns']>;
@@ -198,6 +202,10 @@ function projectKmIngestTarget(target: KmIngestTargetApiRecord) {
     target: {
       endpointMode: refMode(target.target.endpointRef),
       dryRunOnly: target.target.dryRunOnly,
+      transport: target.target.transport,
+      allowedHosts: target.target.allowedHosts.map(redactKmApiText),
+      timeoutMs: target.target.timeoutMs,
+      allowPrivateNetwork: target.target.allowPrivateNetwork,
       allowedProviderIds: target.target.allowedProviderIds.map(redactKmApiText),
       ...(target.target.markIngestedCommand ? { markIngestedCommand: redactKmApiText(target.target.markIngestedCommand) } : {}),
     },
@@ -523,6 +531,10 @@ export async function handleKmObservationApi(
         targetId: String(body.targetId ?? '').trim(), endpointRef: String(body.endpointRef ?? '').trim(),
         credentialRef: String(body.credentialRef ?? '').trim(), enabled: body.enabled === true,
         dryRunOnly: body.dryRunOnly !== false,
+        transport: body.transport === 'https' ? 'https' as const : 'offline' as const,
+        allowedHosts: Array.isArray(body.allowedHosts) ? body.allowedHosts.map(String) : [],
+        timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : 10_000,
+        allowPrivateNetwork: body.allowPrivateNetwork === true,
         allowedProviderIds: Array.isArray(body.allowedProviderIds) ? body.allowedProviderIds.map(String) : [],
         ...(typeof body.markIngestedCommand === 'string' ? { markIngestedCommand: body.markIngestedCommand } : {}),
       };
@@ -577,6 +589,22 @@ export async function handleKmObservationApi(
       if (!deps.dataDir) throw new Error('km_ingest_data_dir_required');
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
       const runId = decodeURIComponent(ingestExecuteMutation[1]);
+      const current = store.getKmIngestRunReport?.(runId); const target = current ? store.getKmIngestTarget?.(current.run.targetId) : null;
+      if (target?.target.transport === 'https') {
+        if (!store.getKmMutationReplay || !store.recordKmMutation || !store.recordKmIngestRemoteAck || !current) throw new Error('km_ingest_remote_unavailable');
+        const replay = store.getKmMutationReplay<Record<string, unknown>>(ctx); if (replay) { jsonRes(res, replay.statusCode, replay.response); return true; }
+        const credential = target.credentialRef.startsWith('local-secret:') ? getLocalIngestSecret(deps.dataDir, target.credentialRef) : null;
+        if (!credential) throw new KmApiError(422, 'km_ingest_remote_credential_missing');
+        const ack = await executeBusinessSpaceIngest({ target, report: current, credential, actorId: ctx.actorId });
+        const report = recordKmIngestRemoteResult({ store: store as any, runId, actorId: ctx.actorId,
+          confirmationToken: String(body.confirmationToken ?? ''), expectedPlanHash: String(body.expectedPlanHash ?? ''), ack: ack as unknown as { accepted: Array<{ canonicalKey: string }>; rejected: Array<{ canonicalKey: string; errorCode: string }>; [key: string]: unknown } });
+        const response = { executor: { enabled: true, mode: 'local', executionApiEnabled: true }, transport: 'https', ack: {
+          contract: ack.contract, ackId: ack.ackId, requestId: ack.requestId, planHash: ack.planHash, status: ack.status,
+          acceptedCount: ack.accepted.length, rejectedCount: ack.rejected.length,
+        }, ...projectKmIngestReport(report) };
+        const recorded = store.recordKmMutation({ ...ctx, statusCode: 200, action: 'ingest.remote_execution', targetRef: runId,
+          response, afterHash: report.run.planHash }); jsonRes(res, recorded.statusCode, recorded.response); return true;
+      }
       executeMutation(ctx, 200, 'ingest.local_execution', runId, () => {
         const report = executeKmIngestOffline({ store: store as any, runId, actorId: ctx.actorId,
           confirmationToken: String(body.confirmationToken ?? ''), expectedPlanHash: String(body.expectedPlanHash ?? ''),
