@@ -15,7 +15,7 @@ export const KM_INGEST_EXECUTOR_VERSION = 'km-ingest-executor-v1';
 
 export type KmIngestExecutorStore = Pick<ObservationStore,
   'putKmIngestTarget' | 'getKmIngestTarget' | 'listKmIngestTargets'
-  | 'createKmIngestRun' | 'transitionKmIngestRun' | 'runKmIngestOffline'
+  | 'createKmIngestRun' | 'transitionKmIngestRun' | 'runKmIngestOffline' | 'recordKmIngestRemoteAck'
   | 'rollbackKmIngestRun' | 'getKmIngestRunReport' | 'listKmIngestRuns' | 'getDistillationJob'
 >;
 
@@ -140,6 +140,25 @@ export function approveKmIngestRun(input: KmIngestApproveInput): KmIngestRunRepo
     details: { externalAckHash: hashJson(input.externalAck), planHash: input.expectedPlanHash },
   });
   return input.store.getKmIngestRunReport(input.runId)!;
+}
+
+export function recordKmIngestRemoteResult(input: {
+  store: KmIngestExecutorStore;
+  runId: string;
+  actorId: string;
+  expectedPlanHash: string;
+  confirmationToken: string;
+  ack: { accepted?: Array<{ canonicalKey: string }>; rejected?: Array<{ canonicalKey: string; errorCode: string }>; [key: string]: unknown };
+}): KmIngestRunReport {
+  const report = requireRun(input.store, input.runId);
+  assertExpectedPlanHash(report.run.planHash, input.expectedPlanHash);
+  assertConfirmationToken(input.confirmationToken, report.run.confirmationTokenHash);
+  const accepted = input.ack.accepted ?? []; const rejected = input.ack.rejected ?? [];
+  input.store.recordKmIngestRemoteAck({ runId: input.runId, actorId: input.actorId, expectedPlanHash: input.expectedPlanHash,
+    ack: input.ack, rejected: rejected.map(item => ({ canonicalKey: item.canonicalKey, errorCode: item.errorCode })) });
+  if (!accepted.length) return input.store.getKmIngestRunReport(input.runId)!;
+  return input.store.runKmIngestOffline({ runId: input.runId, actorId: input.actorId, maxItems: accepted.length,
+    canonicalKeys: accepted.map(item => item.canonicalKey) });
 }
 
 export function executeKmIngestOffline(input: KmIngestExecuteInput): KmIngestRunReport {

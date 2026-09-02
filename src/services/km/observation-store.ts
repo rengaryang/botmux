@@ -909,6 +909,10 @@ export interface KmIngestTargetConfig {
   dryRunOnly?: boolean;
   allowedProviderIds?: string[];
   markIngestedCommand?: string;
+  transport?: 'offline' | 'https';
+  allowedHosts?: string[];
+  timeoutMs?: number;
+  allowPrivateNetwork?: boolean;
 }
 
 export interface KmIngestTargetRecord {
@@ -919,6 +923,10 @@ export interface KmIngestTargetRecord {
     dryRunOnly: boolean;
     allowedProviderIds: string[];
     markIngestedCommand?: string;
+    transport: 'offline' | 'https';
+    allowedHosts: string[];
+    timeoutMs: number;
+    allowPrivateNetwork: boolean;
   };
   targetHash: string;
   credentialRef: string;
@@ -3697,15 +3705,28 @@ export class ObservationStore {
     const actorId = requireText(input.actorId, 'ingest_actor');
     const targetId = requireText(input.config.targetId, 'ingest_target_id');
     const endpointRef = requireText(input.config.endpointRef, 'ingest_target_endpoint');
-    if (!endpointRef.startsWith('mock:') && !endpointRef.startsWith('file:/')) throw new Error('km_ingest_target_offline_endpoint_required');
+    const transport = input.config.transport ?? (endpointRef.startsWith('https://') ? 'https' : 'offline');
+    if (!['offline','https'].includes(transport)) throw new Error('km_ingest_target_transport_invalid');
+    if (transport === 'offline' && !endpointRef.startsWith('mock:') && !endpointRef.startsWith('file:/')) throw new Error('km_ingest_target_offline_endpoint_required');
+    if (transport === 'https' && !endpointRef.startsWith('https://')) throw new Error('km_ingest_target_https_endpoint_required');
+    const allowedHosts = [...new Set((input.config.allowedHosts ?? []).map(value => requireText(value, 'ingest_target_host').toLowerCase()))].sort();
+    if (transport === 'https') {
+      const endpoint = new URL(endpointRef);
+      if (!allowedHosts.includes(endpoint.hostname.toLowerCase())) throw new Error('km_ingest_target_host_not_allowlisted');
+      if (endpoint.username || endpoint.password || endpoint.hash) throw new Error('km_ingest_target_endpoint_invalid');
+    }
     const credentialRef = requireText(input.config.credentialRef, 'ingest_target_credential_ref');
     if (!credentialRef.startsWith('mock:') && !credentialRef.startsWith('file:/') && !credentialRef.startsWith('env:') && !credentialRef.startsWith('local-secret:')) throw new Error('km_ingest_target_credential_ref_invalid');
     const allowedProviderIds = [...new Set((input.config.allowedProviderIds ?? []).map(value => requireText(value, 'ingest_target_provider')))]
       .sort((a, b) => a.localeCompare(b));
     const target = {
       endpointRef,
-      dryRunOnly: input.config.dryRunOnly !== false,
+      dryRunOnly: transport === 'https' ? input.config.dryRunOnly === true : input.config.dryRunOnly !== false,
       allowedProviderIds,
+      transport,
+      allowedHosts,
+      timeoutMs: Math.max(500, Math.min(input.config.timeoutMs ?? 10_000, 30_000)),
+      allowPrivateNetwork: transport === 'https' && input.config.allowPrivateNetwork === true,
       ...(input.config.markIngestedCommand?.trim() ? { markIngestedCommand: input.config.markIngestedCommand.trim() } : {}),
     };
     const targetHash = sha256(canonicalJsonStringify({ ...target, credentialRef }));
@@ -3803,7 +3824,7 @@ export class ObservationStore {
     return this.getKmIngestRun(input.runId)!;
   }
 
-  runKmIngestOffline(input: { runId: string; actorId: string; maxItems?: number }): KmIngestRunReport {
+  runKmIngestOffline(input: { runId: string; actorId: string; maxItems?: number; canonicalKeys?: string[] }): KmIngestRunReport {
     const actorId = requireText(input.actorId, 'ingest_actor');
     const run = this.getKmIngestRun(input.runId);
     if (!run) throw new Error('km_ingest_run_not_found');
@@ -3815,8 +3836,12 @@ export class ObservationStore {
       this.db.prepare(`UPDATE km_ingest_runs SET state='running',started_at=COALESCE(started_at,?),updated_at=?,last_error=NULL WHERE run_id=?`)
         .run(now, now, input.runId);
       this.insertKmIngestAudit(input.runId, 'execution.started', actorId, { limit, offline: true }, now);
-      const rows = this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? AND state IN ('pending','failed')
-        ORDER BY ingest_item_id ASC LIMIT ?`).all(input.runId, limit) as any[];
+      const requestedKeys = [...new Set((input.canonicalKeys ?? []).map(value => requireText(value, 'ingest_canonical_key')))];
+      const rows = requestedKeys.length
+        ? this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? AND state IN ('pending','failed') AND canonical_key IN (${requestedKeys.map(() => '?').join(',')})
+          ORDER BY ingest_item_id ASC LIMIT ?`).all(input.runId, ...requestedKeys, limit) as any[]
+        : this.db.prepare(`SELECT * FROM km_ingest_items WHERE run_id=? AND state IN ('pending','failed')
+          ORDER BY ingest_item_id ASC LIMIT ?`).all(input.runId, limit) as any[];
       for (const row of rows) {
         try { this.applyKmIngestItem(row, run, actorId, now); }
         catch (error) { this.markKmIngestItem(String(row.ingest_item_id), 'failed', error instanceof Error ? error.message : String(error), undefined, undefined, now); }
@@ -3825,6 +3850,27 @@ export class ObservationStore {
       this.insertKmIngestAudit(input.runId, 'execution.finished', actorId, { processed: rows.length, offline: true }, now);
       this.db.exec('RELEASE km_ingest_run;');
     } catch (error) { try { this.db.exec('ROLLBACK TO km_ingest_run; RELEASE km_ingest_run;'); } catch {} throw error; }
+    return this.getKmIngestRunReport(input.runId)!;
+  }
+
+  recordKmIngestRemoteAck(input: { runId: string; actorId: string; expectedPlanHash: string; ack: Record<string, unknown>; rejected: Array<{ canonicalKey: string; errorCode: string }> }): KmIngestRunReport {
+    const run = this.getKmIngestRun(input.runId);
+    if (!run) throw new Error('km_ingest_run_not_found');
+    if (run.planHash !== input.expectedPlanHash) throw new Error('km_ingest_plan_hash_mismatch');
+    const now = new Date().toISOString();
+    this.db.exec('SAVEPOINT km_ingest_remote_ack;');
+    try {
+      this.db.prepare('UPDATE km_ingest_runs SET external_ack_json=?,updated_at=? WHERE run_id=?')
+        .run(canonicalJsonStringify(input.ack), now, input.runId);
+      for (const item of input.rejected) {
+        this.db.prepare(`UPDATE km_ingest_items SET state='failed',reason_code=?,updated_at=? WHERE run_id=? AND canonical_key=? AND state IN ('pending','failed')`)
+          .run(requireText(item.errorCode, 'ingest_remote_error'), now, input.runId, requireText(item.canonicalKey, 'ingest_canonical_key'));
+      }
+      this.insertKmIngestAudit(input.runId, 'remote.ack_verified', requireText(input.actorId, 'ingest_actor'), {
+        ackHash: sha256(canonicalJsonStringify(input.ack)), rejectedCount: input.rejected.length, planHash: input.expectedPlanHash,
+      }, now);
+      this.db.exec('RELEASE km_ingest_remote_ack;');
+    } catch (error) { try { this.db.exec('ROLLBACK TO km_ingest_remote_ack; RELEASE km_ingest_remote_ack;'); } catch {} throw error; }
     return this.getKmIngestRunReport(input.runId)!;
   }
 
@@ -4796,7 +4842,10 @@ export class ObservationStore {
     return {
       targetId: row.target_id,
       state: row.state,
-      target: parseJsonRecord(row.target_json) as KmIngestTargetRecord['target'],
+      target: (() => {
+        const target = parseJsonRecord(row.target_json) as Partial<KmIngestTargetRecord['target']> & { endpointRef: string; dryRunOnly: boolean; allowedProviderIds: string[] };
+        return { ...target, transport: target.transport ?? 'offline', allowedHosts: target.allowedHosts ?? [], timeoutMs: target.timeoutMs ?? 10_000, allowPrivateNetwork: target.allowPrivateNetwork ?? false } as KmIngestTargetRecord['target'];
+      })(),
       targetHash: row.target_hash,
       credentialRef: row.credential_ref,
       createdBy: row.created_by,

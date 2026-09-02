@@ -60,6 +60,15 @@ describe('KM local ingest control plane', () => {
     expect(approvedRes.statusCode).toBe(200);
     expect(JSON.parse(approvedRes.body)).toEqual(expect.objectContaining({ sourceRunId: job.jobId, state: 'approved' }));
 
+    const httpsTargetRes = response();
+    await handleKmObservationApi(request('PUT', { targetId: 'business-space-https', endpointRef: 'https://knowledge.example.test/v1/ingest', credentialRef: 'local-secret:business-space', transport: 'https', enabled: true, dryRunOnly: false, allowedHosts: ['knowledge.example.test'], timeoutMs: 5000, allowedProviderIds: ['builtin.rules-v1'] }, 'target-https-1') as any, httpsTargetRes as any, new URL('http://localhost/api/km/local-ingest/targets'), deps);
+    expect(httpsTargetRes.statusCode).toBe(200);
+    expect(JSON.parse(httpsTargetRes.body).target.target).toEqual(expect.objectContaining({ transport: 'https', allowedHosts: ['knowledge.example.test'], timeoutMs: 5000, dryRunOnly: false }));
+
+    const badHttpsTargetRes = response();
+    await handleKmObservationApi(request('PUT', { targetId: 'bad-https', endpointRef: 'https://knowledge.example.test/v1/ingest', credentialRef: 'local-secret:business-space', transport: 'https', enabled: true, dryRunOnly: false, allowedHosts: ['other.example.test'] }, 'target-https-bad') as any, badHttpsTargetRes as any, new URL('http://localhost/api/km/local-ingest/targets'), deps);
+    expect(badHttpsTargetRes.statusCode).toBe(422);
+
     const listRes = response();
     await handleKmObservationApi({ method: 'GET', headers: {} } as any, listRes as any, new URL('http://localhost/api/km/local-ingest/targets'), deps);
     expect(JSON.parse(listRes.body).executor).toEqual({ enabled: true, mode: 'local', executionApiEnabled: true });
