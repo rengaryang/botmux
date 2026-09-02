@@ -909,7 +909,7 @@ export interface KmIngestTargetConfig {
   dryRunOnly?: boolean;
   allowedProviderIds?: string[];
   markIngestedCommand?: string;
-  transport?: 'offline' | 'https';
+  transport?: 'offline' | 'https' | 'local-space';
   allowedHosts?: string[];
   timeoutMs?: number;
   allowPrivateNetwork?: boolean;
@@ -923,7 +923,7 @@ export interface KmIngestTargetRecord {
     dryRunOnly: boolean;
     allowedProviderIds: string[];
     markIngestedCommand?: string;
-    transport: 'offline' | 'https';
+    transport: 'offline' | 'https' | 'local-space';
     allowedHosts: string[];
     timeoutMs: number;
     allowPrivateNetwork: boolean;
@@ -3706,9 +3706,10 @@ export class ObservationStore {
     const targetId = requireText(input.config.targetId, 'ingest_target_id');
     const endpointRef = requireText(input.config.endpointRef, 'ingest_target_endpoint');
     const transport = input.config.transport ?? (endpointRef.startsWith('https://') ? 'https' : 'offline');
-    if (!['offline','https'].includes(transport)) throw new Error('km_ingest_target_transport_invalid');
+    if (!['offline','https','local-space'].includes(transport)) throw new Error('km_ingest_target_transport_invalid');
     if (transport === 'offline' && !endpointRef.startsWith('mock:') && !endpointRef.startsWith('file:/')) throw new Error('km_ingest_target_offline_endpoint_required');
     if (transport === 'https' && !endpointRef.startsWith('https://')) throw new Error('km_ingest_target_https_endpoint_required');
+    if (transport === 'local-space' && !endpointRef.startsWith('space:')) throw new Error('km_ingest_target_local_space_required');
     const allowedHosts = [...new Set((input.config.allowedHosts ?? []).map(value => requireText(value, 'ingest_target_host').toLowerCase()))].sort();
     if (transport === 'https') {
       const endpoint = new URL(endpointRef);
@@ -3721,7 +3722,7 @@ export class ObservationStore {
       .sort((a, b) => a.localeCompare(b));
     const target = {
       endpointRef,
-      dryRunOnly: transport === 'https' ? input.config.dryRunOnly === true : input.config.dryRunOnly !== false,
+      dryRunOnly: transport === 'https' || transport === 'local-space' ? input.config.dryRunOnly === true : input.config.dryRunOnly !== false,
       allowedProviderIds,
       transport,
       allowedHosts,

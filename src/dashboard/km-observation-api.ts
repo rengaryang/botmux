@@ -56,6 +56,7 @@ import {
   setLocalIngestSecret,
 } from '../services/km/local-ingest-secret-store.js';
 import { executeBusinessSpaceIngest } from '../services/km/business-space-ingest-adapter.js';
+import { executeLocalBusinessSpaceIngest, rollbackLocalBusinessSpace } from '../services/km/local-business-space-adapter.js';
 import {
   activateKmCanaryRelease,
   resolveKmCanaryRuntimeAuthorization,
@@ -531,7 +532,7 @@ export async function handleKmObservationApi(
         targetId: String(body.targetId ?? '').trim(), endpointRef: String(body.endpointRef ?? '').trim(),
         credentialRef: String(body.credentialRef ?? '').trim(), enabled: body.enabled === true,
         dryRunOnly: body.dryRunOnly !== false,
-        transport: body.transport === 'https' ? 'https' as const : 'offline' as const,
+        transport: body.transport === 'https' ? 'https' as const : body.transport === 'local-space' ? 'local-space' as const : 'offline' as const,
         allowedHosts: Array.isArray(body.allowedHosts) ? body.allowedHosts.map(String) : [],
         timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : 10_000,
         allowPrivateNetwork: body.allowPrivateNetwork === true,
@@ -579,7 +580,7 @@ export async function handleKmObservationApi(
       executeMutation(ctx, 200, 'ingest.run_approved', runId, () => {
         const report = approveKmIngestRun({ store: store as any, runId, actorId: ctx.actorId,
           confirmationToken: String(body.confirmationToken ?? ''), expectedPlanHash: String(body.expectedPlanHash ?? ''),
-          externalAck: { approved: true, approvedBy: ctx.actorId, planHash: String(body.expectedPlanHash ?? ''), source: 'botmux-local-dashboard' } });
+          externalAck: { approved: true, approvedBy: ctx.actorId, planHash: String(body.expectedPlanHash ?? ''), source: 'botmux-local-dashboard', approvalOnly: true } });
         return { executor: { enabled: true, mode: 'local', executionApiEnabled: true }, ...projectKmIngestReport(report) };
       }, { afterHash: response => response.run.planHash }); return true;
     }
@@ -590,6 +591,16 @@ export async function handleKmObservationApi(
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
       const runId = decodeURIComponent(ingestExecuteMutation[1]);
       const current = store.getKmIngestRunReport?.(runId); const target = current ? store.getKmIngestTarget?.(current.run.targetId) : null;
+      if (target?.target.transport === 'local-space') {
+        if (!store.getKmMutationReplay || !store.recordKmMutation || !store.recordKmIngestRemoteAck || !current) throw new Error('km_ingest_local_space_unavailable');
+        const replay = store.getKmMutationReplay<Record<string, unknown>>(ctx); if (replay) { jsonRes(res, replay.statusCode, replay.response); return true; }
+        const ack = executeLocalBusinessSpaceIngest({ dataDir: deps.dataDir, target, report: current, actorId: ctx.actorId });
+        const report = recordKmIngestRemoteResult({ store: store as any, runId, actorId: ctx.actorId,
+          confirmationToken: String(body.confirmationToken ?? ''), expectedPlanHash: String(body.expectedPlanHash ?? ''),
+          ack: ack as unknown as { accepted: Array<{canonicalKey:string}>; rejected: Array<{canonicalKey:string;errorCode:string}>; [key:string]:unknown } });
+        const response = { executor:{enabled:true,mode:'local',executionApiEnabled:true},transport:'local-space',ack:{contract:ack.contract,ackId:ack.ackId,spaceId:ack.spaceId,backupId:ack.backupId,acceptedCount:ack.accepted.length},...projectKmIngestReport(report) };
+        const recorded=store.recordKmMutation({...ctx,statusCode:200,action:'ingest.local_space_execution',targetRef:runId,response,afterHash:report.run.planHash});jsonRes(res,recorded.statusCode,recorded.response);return true;
+      }
       if (target?.target.transport === 'https') {
         if (!store.getKmMutationReplay || !store.recordKmMutation || !store.recordKmIngestRemoteAck || !current) throw new Error('km_ingest_remote_unavailable');
         const replay = store.getKmMutationReplay<Record<string, unknown>>(ctx); if (replay) { jsonRes(res, replay.statusCode, replay.response); return true; }
@@ -618,6 +629,12 @@ export async function handleKmObservationApi(
     if (ingestRollbackMutation && req.method === 'POST') {
       const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
       const runId = decodeURIComponent(ingestRollbackMutation[1]);
+      const current = store.getKmIngestRunReport?.(runId); const target = current ? store.getKmIngestTarget?.(current.run.targetId) : null;
+      if (target?.target.transport === 'local-space' && current?.run.externalAck) {
+        const ack=current.run.externalAck as {spaceId?:unknown;backupId?:unknown};
+        if(typeof ack.spaceId!=='string'||typeof ack.backupId!=='string')throw new KmApiError(422,'km_ingest_local_space_ack_missing');
+        rollbackLocalBusinessSpace({dataDir:deps.dataDir!,spaceId:ack.spaceId,backupId:ack.backupId});
+      }
       executeMutation(ctx, 200, 'ingest.local_rollback', runId, () => {
         const report = rollbackKmIngest({ store: store as any, runId, actorId: ctx.actorId,
           expectedPlanHash: String(body.expectedPlanHash ?? ''), reasonCode: String(body.reasonCode ?? 'dashboard_operator_rollback') });
