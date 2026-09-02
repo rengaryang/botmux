@@ -32718,6 +32718,34 @@ a.card-menu-item {
   50% { box-shadow: 0 0 0 11px color-mix(in srgb, var(--success) 2%, transparent); }
 }
 
+.km-ingest-status {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 18px;
+}
+
+.km-ingest-status > span {
+  display: grid;
+  gap: 5px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-radius: 12px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 8%, var(--surface)), var(--surface));
+}
+
+.km-ingest-status small {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.km-ingest-status strong {
+  color: var(--km-ink);
+  font-size: 20px;
+}
+
 :root[data-theme="dark"] .km-ops-page {
   --km-card: color-mix(in srgb, var(--surface-raised) 88%, #0c1421);
   --km-ink: var(--fg);
@@ -32760,7 +32788,8 @@ a.card-menu-item {
   .km-donut-wrap,
   .km-form-grid--compact,
   .km-canary-impact,
-  .km-canary-status {
+  .km-canary-status,
+  .km-ingest-status {
     grid-template-columns: 1fr;
   }
 

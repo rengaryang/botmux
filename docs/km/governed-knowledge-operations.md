@@ -65,9 +65,18 @@ All endpoints remain behind normal Dashboard authentication:
 
 The Review Queue exposes only safe metadata such as batch, route, decision, blockers, plan hash, audit time, checksums, and relative references. The ingest status projection omits endpoint, credential, candidate, ACK, and mark-ingested payloads.
 
+## Local ingest control plane (additive)
+
+Botmux also exposes a separate local-only control plane under `/api/km/local-ingest/*`. It does not replace or migrate the existing `/api/km/ingest/*` read-only offline contract, Memory Provider, Central Sink, Production Gate, or Canary configuration.
+
+- Local credential plaintext is encrypted with AES-256-GCM in a machine-local `0600` secret store; SQLite and API responses retain reference/metadata only.
+- The Dashboard provides additive forms for local credential, target, extractor run, plan confirmation, execution approval, execution, and rollback.
+- Target endpoints remain restricted to `mock:` or `file:/`; this control plane does not perform real network/business-space writes.
+- Plan creation and execution resolve `local-secret:*` references without exposing plaintext.
+
 ## Formal ingest gate
 
-The offline state machine requires all of the following before local execution can progress:
+The offline/local state machine requires all of the following before local execution can progress:
 
 1. a registered offline target and credential reference;
 2. unique canonical keys and an exact key-set hash;

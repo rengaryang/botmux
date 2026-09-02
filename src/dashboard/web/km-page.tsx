@@ -81,6 +81,10 @@ type KnowledgeExportPreview = {
   risk: { mutatesWorkspace: boolean; network: false; gitPush: false; fixtureOnly: boolean };
 };
 type MemoryItem = { memoryId: string; state: string; scope: string; subject: string; claimKey: string; confidence: string };
+type LocalIngestTarget = { targetId: string; state: string; target: { endpointMode: string; dryRunOnly: boolean; allowedProviderIds: string[]; markIngestedCommand?: string }; targetHash: string; credential: { mode: string; reference?: string }; updatedAt: string };
+type LocalIngestRun = { runId: string; state: string; targetId: string; plan: { sourceRunId: string; extractorProviderId: string; canonicalKeys: string[] }; planHash: string; sourceCount: number; ingestedCount: number; failedCount: number; rollbackCount: number; updatedAt: string; lastError?: string };
+type LocalIngestStatus = { executor: { enabled: boolean; mode: string; executionApiEnabled: boolean }; items: LocalIngestRun[] };
+type LocalIngestSecrets = { items: Array<{ ref: string; configured: boolean; createdAt: string; updatedAt: string }> };
 type ImportJob = {
   jobId: string; state: string; sourceCount: number; eligibleCount: number; importedCount: number; dedupedCount: number;
   conflictCount: number; skippedCount: number; failedCount: number; outboxEnqueuedCount: number; configHash: string; updatedAt: string;
@@ -307,6 +311,10 @@ function KmPage(): React.JSX.Element {
   const [workspaceMetrics, setWorkspaceMetrics] = useState<WorkspaceMetricsV2>();
   const [workspaceAssets, setWorkspaceAssets] = useState<WorkspaceAssetV2[]>([]);
   const [reviewQueue, setReviewQueue] = useState<KmReviewQueueV2>();
+  const [localIngest, setLocalIngest] = useState<LocalIngestStatus>();
+  const [localIngestTargets, setLocalIngestTargets] = useState<LocalIngestTarget[]>([]);
+  const [localIngestSecrets, setLocalIngestSecrets] = useState<LocalIngestSecrets['items']>([]);
+  const [localExtractorApprovals, setLocalExtractorApprovals] = useState<Array<{ sourceRunId: string; extractorProviderId: string; approvedBy: string; approvedAt: string; state: string }>>([]);
   const [workspaceAssetWorkspace, setWorkspaceAssetWorkspace] = useState('');
   const [workspaceAssetLayer, setWorkspaceAssetLayer] = useState('');
   const [workspaceAssetPage, setWorkspaceAssetPage] = useState(1);
@@ -315,6 +323,10 @@ function KmPage(): React.JSX.Element {
     primary: 'sqlite', mirrors: 'mem0,hindsight,openviking', promptTokens: 1800 });
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
   const [sinkForm, setSinkForm] = useState({ sinkId: 'central-mock', endpointRef: 'mock://central', enabled: false, batchLimit: 25, timeoutMs: 5000, maxAttempts: 5, credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET', payloadMaxBytes: 65536 });
+  const [ingestSecretForm, setIngestSecretForm] = useState({ ref: 'local-secret:km-ingest-default', secret: '' });
+  const [ingestTargetForm, setIngestTargetForm] = useState({ targetId: 'local-business-space', endpointRef: 'mock://local-business-space', credentialRef: 'local-secret:km-ingest-default', allowedProviderIds: 'builtin.rules-v1', markIngestedCommand: 'mark-ingested', enabled: false });
+  const [ingestPlanForm, setIngestPlanForm] = useState({ targetId: 'local-business-space', sourceRunId: '', extractorProviderId: 'builtin.rules-v1', confirmationToken: '', candidatesJson: '[]' });
+  const [ingestRunTokens, setIngestRunTokens] = useState<Record<string, string>>({});
   const [importForm, setImportForm] = useState({ source: 'knowledge-items', allowlistedRoots: '', markdownFiles: '', defaultScope: 'workspace', defaultSubject: 'default' });
   const [productionGateForm, setProductionGateForm] = useState({
     actionKind: 'prompt-canary' as ProductionGatePlan['actionKind'],
@@ -339,7 +351,7 @@ function KmPage(): React.JSX.Element {
     try {
       setLoading(true);
       setError('');
-      const [workspaceAssetsResult, workspaceMetricsResult, reviewQueueResult, metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
+      const [workspaceAssetsResult, workspaceMetricsResult, reviewQueueResult, localIngestResult, localIngestTargetsResult, localIngestSecretsResult, localExtractorApprovalsResult, metricsResult, h, list, knowledgeList, exportList, memoryList, importJobList, productionGateList, evalList, proposalList, syncList, centralSinkStatus, providerList, jobList, retrievalList, injectionList, profileList, providerConfigList, backendRuntimeStatus, backendOutboxList, backendMigrationList, policyDecisionList, configAuditList, quality, retentionStatus, goldenList, comparisonList, readiness] = await Promise.all([
         getJson<{ items: WorkspaceAssetV2[] }>('/api/km/knowledge-assets-v2').then(
           result => ({ ok: true as const, result }),
           error => ({ ok: false as const, error }),
@@ -352,6 +364,10 @@ function KmPage(): React.JSX.Element {
           queue => ({ ok: true as const, queue }),
           error => ({ ok: false as const, error }),
         ),
+        getJson<LocalIngestStatus>('/api/km/local-ingest?limit=50').then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
+        getJson<{ items: LocalIngestTarget[] }>('/api/km/local-ingest/targets?limit=50').then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
+        getJson<LocalIngestSecrets>('/api/km/local-ingest/secrets').then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
+        getJson<{ items: Array<{ sourceRunId: string; extractorProviderId: string; approvedBy: string; approvedAt: string; state: string }> }>('/api/km/local-ingest/extractor-approvals').then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
         getJson<KmOpsMetricsRaw>('/api/km/dashboard-metrics?rankingLimit=10').then(
           metrics => ({ ok: true as const, metrics }),
           error => ({ ok: false as const, error }),
@@ -384,6 +400,10 @@ function KmPage(): React.JSX.Element {
         getJson<{ items: ShadowComparison[] }>('/api/km/shadow-comparisons?limit=20'),
         getJson<ShadowReadiness>('/api/km/shadow-readiness'),
       ]);
+      if (localIngestResult.ok) setLocalIngest(localIngestResult.value);
+      if (localIngestTargetsResult.ok) setLocalIngestTargets(localIngestTargetsResult.value.items);
+      if (localIngestSecretsResult.ok) setLocalIngestSecrets(localIngestSecretsResult.value.items);
+      if (localExtractorApprovalsResult.ok) setLocalExtractorApprovals(localExtractorApprovalsResult.value.items);
       setHealth(h);
       setEvents(list.items);
       setKnowledge(knowledgeList.items);
@@ -531,6 +551,45 @@ function KmPage(): React.JSX.Element {
       setNotice('Central sink 配置已保存；真实 transport 仍关闭');
       await load();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const saveLocalIngestSecret = async () => {
+    if (!ingestSecretForm.secret || !window.confirm(`确认把 ${ingestSecretForm.ref} 加密保存到 Botmux 本机？明文不会进入 SQLite 或 API 响应。`)) return;
+    try { await mutateJson('/api/km/local-ingest/secrets', 'PUT', ingestSecretForm); setIngestSecretForm(form => ({ ...form, secret: '' })); setNotice('本地 ingest 凭证已加密保存'); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const saveLocalIngestTarget = async () => {
+    try { await mutateJson('/api/km/local-ingest/targets', 'PUT', { ...ingestTargetForm, dryRunOnly: true, allowedProviderIds: ingestTargetForm.allowedProviderIds.split(',').map(value => value.trim()).filter(Boolean) }); setNotice('本地 ingest target 已保存；既有配置未变'); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const approveLocalExtractor = async () => {
+    if (!window.confirm(`确认批准 extractor run ${ingestPlanForm.sourceRunId} / ${ingestPlanForm.extractorProviderId}？`)) return;
+    try { await mutateJson('/api/km/local-ingest/extractor-approvals', 'PUT', { sourceRunId: ingestPlanForm.sourceRunId, extractorProviderId: ingestPlanForm.extractorProviderId }); setNotice('Extractor Run approval 已记录'); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const createLocalIngestPlan = async () => {
+    try {
+      const candidates = JSON.parse(ingestPlanForm.candidatesJson);
+      const response = await mutateJson<{ run: LocalIngestRun }>('/api/km/local-ingest/plans', 'POST', { ...ingestPlanForm, candidates });
+      setIngestRunTokens(tokens => ({ ...tokens, [response.run.runId]: ingestPlanForm.confirmationToken }));
+      setNotice(`本地 ingest plan 已冻结：${response.run.planHash}`); await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const approveLocalIngestRun = async (run: LocalIngestRun) => {
+    const confirmationToken = ingestRunTokens[run.runId] ?? window.prompt('输入该 Plan 创建时的 confirmation token') ?? '';
+    if (!confirmationToken || !window.confirm(`确认批准本机执行计划 ${shortHash(run.planHash)}？批准不等于执行。`)) return;
+    try { await mutateJson(`/api/km/local-ingest/${encodeURIComponent(run.runId)}/approve`, 'POST', { confirmationToken, expectedPlanHash: run.planHash }); setIngestRunTokens(tokens => ({ ...tokens, [run.runId]: confirmationToken })); setNotice('Execution approval 已记录'); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const executeLocalIngestRun = async (run: LocalIngestRun) => {
+    const confirmationToken = ingestRunTokens[run.runId] ?? window.prompt('输入该 Plan 的 confirmation token') ?? '';
+    if (!confirmationToken || !window.confirm(`确认执行本机 ingest ${run.runId}？当前仅运行本地状态机，不启用外部网络写入。`)) return;
+    try { await mutateJson(`/api/km/local-ingest/${encodeURIComponent(run.runId)}/execute`, 'POST', { confirmationToken, expectedPlanHash: run.planHash, maxItems: 50 }); setNotice('本地 ingest 执行完成'); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const rollbackLocalIngestRun = async (run: LocalIngestRun) => {
+    if (!window.confirm(`确认回滚本机 ingest ${run.runId}？`)) return;
+    try { await mutateJson(`/api/km/local-ingest/${encodeURIComponent(run.runId)}/rollback`, 'POST', { expectedPlanHash: run.planHash, reasonCode: 'dashboard_operator_rollback' }); setNotice('本地 ingest 已回滚'); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const runSinkDrill = async (sinkId: string, drill: 'status' | 'partial-ack' | 'replay' | 'conflict') => {
     try {
@@ -969,6 +1028,54 @@ function KmPage(): React.JSX.Element {
       </TabOnly>
 
       <TabOnly tab="configuration">
+        <KmSection title="Local Ingest Control Plane" description="新增的 Botmux 本机自治配置；不迁移、不覆盖既有 Provider、Sink、Gate 或 Canary 配置。" badge="本机 · 独立审批" risk="high">
+          <div className="km-ingest-status" aria-label="Local ingest status">
+            <span><small>Executor</small><strong>{localIngest?.executor.enabled ? 'enabled' : 'unavailable'}</strong></span>
+            <span><small>Mode</small><strong>{localIngest?.executor.mode ?? 'local'}</strong></span>
+            <span><small>Targets</small><strong>{localIngestTargets.length}</strong></span>
+            <span><small>Runs</small><strong>{localIngest?.items.length ?? 0}</strong></span>
+          </div>
+          <details className="km-advanced-panel" open>
+            <summary>1 · 本机凭证与 Target</summary>
+            <div className="km-form-grid">
+              <input value={ingestSecretForm.ref} onChange={e => setIngestSecretForm({ ...ingestSecretForm, ref: e.target.value })} placeholder="local-secret:name" />
+              <input type="password" autoComplete="new-password" value={ingestSecretForm.secret} onChange={e => setIngestSecretForm({ ...ingestSecretForm, secret: e.target.value })} placeholder="Credential plaintext（仅本次提交）" />
+              <button disabled={!ingestSecretForm.ref.trim() || !ingestSecretForm.secret} onClick={() => void saveLocalIngestSecret()}>加密保存凭证</button>
+              <input value={ingestTargetForm.targetId} onChange={e => setIngestTargetForm({ ...ingestTargetForm, targetId: e.target.value })} placeholder="Target ID" />
+              <input value={ingestTargetForm.endpointRef} onChange={e => setIngestTargetForm({ ...ingestTargetForm, endpointRef: e.target.value })} placeholder="mock:// 或 file:/ 本地目标" />
+              <input value={ingestTargetForm.credentialRef} onChange={e => setIngestTargetForm({ ...ingestTargetForm, credentialRef: e.target.value })} placeholder="local-secret:name" />
+              <input value={ingestTargetForm.allowedProviderIds} onChange={e => setIngestTargetForm({ ...ingestTargetForm, allowedProviderIds: e.target.value })} placeholder="Allowed extractor providers" />
+              <input value={ingestTargetForm.markIngestedCommand} onChange={e => setIngestTargetForm({ ...ingestTargetForm, markIngestedCommand: e.target.value })} placeholder="mark-ingested command label" />
+              <label><input type="checkbox" checked={ingestTargetForm.enabled} onChange={e => setIngestTargetForm({ ...ingestTargetForm, enabled: e.target.checked })} /> Target ready</label>
+              <button disabled={!ingestTargetForm.targetId.trim() || !ingestTargetForm.endpointRef.trim() || !ingestTargetForm.credentialRef.trim()} onClick={() => void saveLocalIngestTarget()}>保存本地 Target</button>
+            </div>
+            <KmInlineHelp>凭证明文使用 AES-256-GCM 保存在本机 0600 secret store；SQLite 和 API 只保留 reference/metadata。当前 endpoint 仍限制为 mock: 或 file:/，不会改变既有外部配置。</KmInlineHelp>
+          </details>
+          <details className="km-advanced-panel">
+            <summary>2 · Extractor Run 与 Plan</summary>
+            <div className="km-form-grid">
+              <input value={ingestPlanForm.targetId} onChange={e => setIngestPlanForm({ ...ingestPlanForm, targetId: e.target.value })} placeholder="Target ID" />
+              <input value={ingestPlanForm.sourceRunId} onChange={e => setIngestPlanForm({ ...ingestPlanForm, sourceRunId: e.target.value })} placeholder="Completed knowledge-extractor run ID" />
+              <input value={ingestPlanForm.extractorProviderId} onChange={e => setIngestPlanForm({ ...ingestPlanForm, extractorProviderId: e.target.value })} placeholder="Extractor Provider ID" />
+              <input type="password" autoComplete="new-password" value={ingestPlanForm.confirmationToken} onChange={e => setIngestPlanForm({ ...ingestPlanForm, confirmationToken: e.target.value })} placeholder="Plan confirmation token" />
+              <textarea value={ingestPlanForm.candidatesJson} onChange={e => setIngestPlanForm({ ...ingestPlanForm, candidatesJson: e.target.value })} placeholder="Candidate JSON array" />
+              <button disabled={!ingestPlanForm.sourceRunId.trim() || !ingestPlanForm.extractorProviderId.trim()} onClick={() => void approveLocalExtractor()}>批准 Extractor Run</button>
+              <button disabled={!ingestPlanForm.targetId.trim() || !ingestPlanForm.sourceRunId.trim() || !ingestPlanForm.confirmationToken} onClick={() => void createLocalIngestPlan()}>生成并冻结 Plan</button>
+            </div>
+          </details>
+          <div className="feedback-deliveries">
+            {localExtractorApprovals.map(approval => <div key={`${approval.sourceRunId}:${approval.extractorProviderId}`}><code>extractor</code><span>{approval.sourceRunId}</span><span>{approval.extractorProviderId} · {approval.approvedBy}</span><b>{approval.state}</b></div>)}
+            {localIngestSecrets.map(secret => <div key={secret.ref}><code>secret</code><span>{secret.ref}</span><span>encrypted local store</span><b>{secret.configured ? 'configured' : 'missing'}</b></div>)}
+            {localIngestTargets.map(target => <div key={target.targetId}><code>target</code><span>{target.targetId} · {target.target.endpointMode}</span><span>{target.credential.mode} · {target.target.allowedProviderIds.join(', ') || 'all providers'}</span><b>{target.state}</b></div>)}
+            {(localIngest?.items ?? []).map(run => <div key={run.runId}><code>{run.state}</code><span>{run.targetId} · {shortHash(run.planHash)}</span><span>extractor {run.plan.sourceRunId} · source {run.sourceCount} · ingested {run.ingestedCount} · failed {run.failedCount}</span><b>
+              {run.state === 'planned' && <button onClick={() => void approveLocalIngestRun(run)}>Approve</button>}{' '}
+              {['approved','partial','failed'].includes(run.state) && <button onClick={() => void executeLocalIngestRun(run)}>Execute Local</button>}{' '}
+              {['partial','completed','failed'].includes(run.state) && <button onClick={() => void rollbackLocalIngestRun(run)}>Rollback</button>}
+            </b></div>)}
+          </div>
+          <KmInlineHelp>Target 配置、Extractor Run 就绪、Plan confirmation 与 Execution Approval 是四个独立 Gate。配置完成不会自动执行。</KmInlineHelp>
+        </KmSection>
+
         <KmSection title="Metrics Contract" description="并行开发的 metrics API 可直接实现该前端期望契约。">
           <pre className="km-contract-block">{JSON.stringify(KM_DASHBOARD_EXPECTED_CONTRACT, null, 2)}</pre>
         </KmSection>

@@ -3699,7 +3699,7 @@ export class ObservationStore {
     const endpointRef = requireText(input.config.endpointRef, 'ingest_target_endpoint');
     if (!endpointRef.startsWith('mock:') && !endpointRef.startsWith('file:/')) throw new Error('km_ingest_target_offline_endpoint_required');
     const credentialRef = requireText(input.config.credentialRef, 'ingest_target_credential_ref');
-    if (!credentialRef.startsWith('mock:') && !credentialRef.startsWith('file:/') && !credentialRef.startsWith('env:')) throw new Error('km_ingest_target_credential_ref_invalid');
+    if (!credentialRef.startsWith('mock:') && !credentialRef.startsWith('file:/') && !credentialRef.startsWith('env:') && !credentialRef.startsWith('local-secret:')) throw new Error('km_ingest_target_credential_ref_invalid');
     const allowedProviderIds = [...new Set((input.config.allowedProviderIds ?? []).map(value => requireText(value, 'ingest_target_provider')))]
       .sort((a, b) => a.localeCompare(b));
     const target = {
