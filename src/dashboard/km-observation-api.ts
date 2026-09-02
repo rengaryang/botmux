@@ -37,6 +37,23 @@ import {
 import type { WorkspaceKnowledgeSnapshotV2 } from '../services/km/workspace-knowledge/types.js';
 import type { KmReviewQueueV2 } from '../services/km/workspace-knowledge/review-queue.js';
 import {
+  approveKmIngestRun,
+  executeKmIngestOffline,
+  planKmIngest,
+  registerKmIngestTarget,
+  rollbackKmIngest,
+} from '../services/km/ingest-executor.js';
+import {
+  approveLocalExtractorRun,
+  hasLocalExtractorApproval,
+  listLocalExtractorApprovals,
+} from '../services/km/local-ingest-registry.js';
+import {
+  hasLocalIngestSecret,
+  listLocalIngestSecrets,
+  setLocalIngestSecret,
+} from '../services/km/local-ingest-secret-store.js';
+import {
   activateKmCanaryRelease,
   resolveKmCanaryRuntimeAuthorization,
   rollbackKmCanaryRelease,
@@ -110,7 +127,14 @@ export interface KmObservationApiStore {
   createKnowledgeToMemoryImportPreview?(input: Parameters<ObservationStore['createKnowledgeToMemoryImportPreview']>[0]): ReturnType<ObservationStore['createKnowledgeToMemoryImportPreview']>;
   submitKnowledgeToMemoryImportReview?(input: Parameters<ObservationStore['submitKnowledgeToMemoryImportReview']>[0]): ReturnType<ObservationStore['submitKnowledgeToMemoryImportReview']>;
   runKnowledgeToMemoryImport?(input: Parameters<ObservationStore['runKnowledgeToMemoryImport']>[0]): ReturnType<ObservationStore['runKnowledgeToMemoryImport']>;
+  putKmIngestTarget?(input: Parameters<ObservationStore['putKmIngestTarget']>[0]): ReturnType<ObservationStore['putKmIngestTarget']>;
+  getKmIngestTarget?(targetId: string): ReturnType<ObservationStore['getKmIngestTarget']>;
   listKmIngestTargets?(limit?: number): ReturnType<ObservationStore['listKmIngestTargets']>;
+  createKmIngestRun?(input: Parameters<ObservationStore['createKmIngestRun']>[0]): ReturnType<ObservationStore['createKmIngestRun']>;
+  transitionKmIngestRun?(input: Parameters<ObservationStore['transitionKmIngestRun']>[0]): ReturnType<ObservationStore['transitionKmIngestRun']>;
+  runKmIngestOffline?(input: Parameters<ObservationStore['runKmIngestOffline']>[0]): ReturnType<ObservationStore['runKmIngestOffline']>;
+  rollbackKmIngestRun?(input: Parameters<ObservationStore['rollbackKmIngestRun']>[0]): ReturnType<ObservationStore['rollbackKmIngestRun']>;
+  getDistillationJob?(jobId: string): ReturnType<ObservationStore['getDistillationJob']>;
   listKmIngestRuns?(input?: Parameters<ObservationStore['listKmIngestRuns']>[0]): ReturnType<ObservationStore['listKmIngestRuns']>;
   getKmIngestRunReport?(runId: string): ReturnType<ObservationStore['getKmIngestRunReport']>;
   createProductionGatePlan?(input: Parameters<ObservationStore['createProductionGatePlan']>[0]): ReturnType<ObservationStore['createProductionGatePlan']>;
@@ -178,7 +202,7 @@ function projectKmIngestTarget(target: KmIngestTargetApiRecord) {
       ...(target.target.markIngestedCommand ? { markIngestedCommand: redactKmApiText(target.target.markIngestedCommand) } : {}),
     },
     targetHash: target.targetHash,
-    credential: { mode: refMode(target.credentialRef) },
+    credential: { mode: refMode(target.credentialRef), reference: target.credentialRef.startsWith('local-secret:') ? redactKmApiText(target.credentialRef) : undefined },
     createdBy: redactKmApiText(target.createdBy),
     createdAt: target.createdAt,
     updatedAt: target.updatedAt,
@@ -267,6 +291,7 @@ function refMode(ref: string): string {
   if (ref.startsWith('mock:')) return 'mock';
   if (ref.startsWith('env:')) return 'env';
   if (ref.startsWith('file:')) return 'file';
+  if (ref.startsWith('local-secret:')) return 'local-secret';
   return 'unknown';
 }
 
@@ -335,6 +360,13 @@ export async function handleKmObservationApi(
     || /^\/api\/km\/imports\/[^/]+\/execute$/.test(url.pathname)
     || url.pathname === '/api/km/ingest'
     || url.pathname === '/api/km/ingest/targets'
+    || url.pathname === '/api/km/local-ingest'
+    || url.pathname === '/api/km/local-ingest/targets'
+    || url.pathname === '/api/km/local-ingest/secrets'
+    || url.pathname === '/api/km/local-ingest/plans'
+    || url.pathname === '/api/km/local-ingest/extractor-approvals'
+    || /^\/api\/km\/local-ingest\/[^/]+$/.test(url.pathname)
+    || /^\/api\/km\/local-ingest\/[^/]+\/(approve|execute|rollback)$/.test(url.pathname)
     || /^\/api\/km\/ingest\/[^/]+$/.test(url.pathname)
     || /^\/api\/km\/ingest\/[^/]+\/(approve|execute|rollback)$/.test(url.pathname)
     || url.pathname === '/api/km/production-gates'
@@ -468,6 +500,101 @@ export async function handleKmObservationApi(
       });
       jsonRes(res, recorded.statusCode, recorded.response);
       return true;
+    }
+
+    if (url.pathname === '/api/km/local-ingest/secrets' && req.method === 'PUT') {
+      if (!deps.dataDir) throw new Error('km_ingest_data_dir_required');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const ref = String(body.ref ?? '').trim(); const secret = String(body.secret ?? '');
+      if (!ref || !secret) throw new KmApiError(422, 'km_ingest_local_secret_required');
+      if (!store.getKmMutationReplay || !store.recordKmMutation) throw new Error('km_mutation_guard_unavailable');
+      const replay = store.getKmMutationReplay<ReturnType<typeof setLocalIngestSecret>>(ctx);
+      if (replay) { jsonRes(res, replay.statusCode, replay.response); return true; }
+      const response = setLocalIngestSecret(deps.dataDir, ref, secret);
+      const recorded = store.recordKmMutation({ ...ctx, statusCode: 200, action: 'ingest.local_secret_configured', targetRef: ref,
+        response, afterHash: createHash('sha256').update(`${response.ref}|${response.updatedAt}`).digest('hex') });
+      jsonRes(res, recorded.statusCode, recorded.response); return true;
+    }
+
+    if (url.pathname === '/api/km/local-ingest/targets' && req.method === 'PUT') {
+      if (!store.putKmIngestTarget) throw new Error('km_ingest_targets_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const config = {
+        targetId: String(body.targetId ?? '').trim(), endpointRef: String(body.endpointRef ?? '').trim(),
+        credentialRef: String(body.credentialRef ?? '').trim(), enabled: body.enabled === true,
+        dryRunOnly: body.dryRunOnly !== false,
+        allowedProviderIds: Array.isArray(body.allowedProviderIds) ? body.allowedProviderIds.map(String) : [],
+        ...(typeof body.markIngestedCommand === 'string' ? { markIngestedCommand: body.markIngestedCommand } : {}),
+      };
+      executeMutation(ctx, 200, 'ingest.target_configured', config.targetId,
+        () => ({ target: projectKmIngestTarget(registerKmIngestTarget(store as any, config, ctx.actorId)), localOnly: true })); return true;
+    }
+
+    if (url.pathname === '/api/km/local-ingest/extractor-approvals' && req.method === 'PUT') {
+      if (!deps.dataDir || !store.getDistillationJob) throw new Error('km_ingest_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const sourceRunId = String(body.sourceRunId ?? '').trim(); const extractorProviderId = String(body.extractorProviderId ?? '').trim();
+      const job = store.getDistillationJob(sourceRunId);
+      if (!job || !['completed','persisted'].includes(String(job.state))) throw new KmApiError(422, 'km_ingest_extractor_run_not_ready');
+      if (!store.getKmMutationReplay || !store.recordKmMutation) throw new Error('km_mutation_guard_unavailable');
+      const replay = store.getKmMutationReplay<ReturnType<typeof approveLocalExtractorRun>>(ctx);
+      if (replay) { jsonRes(res, replay.statusCode, replay.response); return true; }
+      const response = approveLocalExtractorRun(deps.dataDir, { sourceRunId, extractorProviderId, approvedBy: ctx.actorId });
+      const recorded = store.recordKmMutation({ ...ctx, statusCode: 200, action: 'ingest.extractor_run_approved', targetRef: sourceRunId,
+        response, afterHash: createHash('sha256').update(`${sourceRunId}|${extractorProviderId}|${response.approvedAt}`).digest('hex') });
+      jsonRes(res, recorded.statusCode, recorded.response); return true;
+    }
+
+    if (url.pathname === '/api/km/local-ingest/plans' && req.method === 'POST') {
+      if (!deps.dataDir || !store.createKmIngestRun || !store.getKmIngestTarget || !store.getDistillationJob) throw new Error('km_ingest_unavailable');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+      const sourceRunId = String(body.sourceRunId ?? ''); const extractorProviderId = String(body.extractorProviderId ?? '');
+      if (!hasLocalExtractorApproval(deps.dataDir, sourceRunId, extractorProviderId)) throw new KmApiError(422, 'km_ingest_extractor_approval_missing');
+      executeMutation(ctx, 201, 'ingest.plan_created', String(body.targetId ?? ''), () => {
+        const report = planKmIngest({ store: store as any, targetId: String(body.targetId ?? ''), sourceRunId,
+          extractorProviderId, candidates: candidates as any, actorId: ctx.actorId,
+          idempotencyKey: ctx.idempotencyKey, confirmationToken: String(body.confirmationToken ?? ''),
+          credentialResolver: ref => hasLocalIngestSecret(deps.dataDir!, ref) });
+        return { executor: { enabled: true, mode: 'local', executionApiEnabled: true }, ...projectKmIngestReport(report) };
+      }, { afterHash: response => response.run.planHash }); return true;
+    }
+
+    const ingestApproveMutation = url.pathname.match(/^\/api\/km\/local-ingest\/([^/]+)\/approve$/);
+    if (ingestApproveMutation && req.method === 'POST') {
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const runId = decodeURIComponent(ingestApproveMutation[1]);
+      executeMutation(ctx, 200, 'ingest.run_approved', runId, () => {
+        const report = approveKmIngestRun({ store: store as any, runId, actorId: ctx.actorId,
+          confirmationToken: String(body.confirmationToken ?? ''), expectedPlanHash: String(body.expectedPlanHash ?? ''),
+          externalAck: { approved: true, approvedBy: ctx.actorId, planHash: String(body.expectedPlanHash ?? ''), source: 'botmux-local-dashboard' } });
+        return { executor: { enabled: true, mode: 'local', executionApiEnabled: true }, ...projectKmIngestReport(report) };
+      }, { afterHash: response => response.run.planHash }); return true;
+    }
+
+    const ingestExecuteMutation = url.pathname.match(/^\/api\/km\/local-ingest\/([^/]+)\/execute$/);
+    if (ingestExecuteMutation && req.method === 'POST') {
+      if (!deps.dataDir) throw new Error('km_ingest_data_dir_required');
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const runId = decodeURIComponent(ingestExecuteMutation[1]);
+      executeMutation(ctx, 200, 'ingest.local_execution', runId, () => {
+        const report = executeKmIngestOffline({ store: store as any, runId, actorId: ctx.actorId,
+          confirmationToken: String(body.confirmationToken ?? ''), expectedPlanHash: String(body.expectedPlanHash ?? ''),
+          maxItems: typeof body.maxItems === 'number' ? body.maxItems : undefined,
+          credentialResolver: ref => hasLocalIngestSecret(deps.dataDir!, ref) });
+        return { executor: { enabled: true, mode: 'local', executionApiEnabled: true }, ...projectKmIngestReport(report) };
+      }, { afterHash: response => response.run.planHash }); return true;
+    }
+
+    const ingestRollbackMutation = url.pathname.match(/^\/api\/km\/local-ingest\/([^/]+)\/rollback$/);
+    if (ingestRollbackMutation && req.method === 'POST') {
+      const { body, raw } = await readBody(req); const ctx = mutationContext(req, deps, url.pathname, raw);
+      const runId = decodeURIComponent(ingestRollbackMutation[1]);
+      executeMutation(ctx, 200, 'ingest.local_rollback', runId, () => {
+        const report = rollbackKmIngest({ store: store as any, runId, actorId: ctx.actorId,
+          expectedPlanHash: String(body.expectedPlanHash ?? ''), reasonCode: String(body.reasonCode ?? 'dashboard_operator_rollback') });
+        return { executor: { enabled: true, mode: 'local', executionApiEnabled: true }, ...projectKmIngestReport(report) };
+      }, { afterHash: response => response.run.planHash }); return true;
     }
 
     if (url.pathname === '/api/km/imports' && req.method === 'POST') {
@@ -990,6 +1117,24 @@ export async function handleKmObservationApi(
         executor: { enabled: false, mode: 'offline', executionApiEnabled: false },
         items: store.listKmIngestTargets(positiveInteger(url.searchParams.get('limit'), 20, 100)).map(projectKmIngestTarget),
       }); return true;
+    }
+    if (url.pathname === '/api/km/local-ingest') {
+      if (!store.listKmIngestRuns) throw new Error('km_ingest_unavailable');
+      jsonRes(res, 200, { executor: { enabled: true, mode: 'local', executionApiEnabled: true },
+        items: store.listKmIngestRuns({ limit: positiveInteger(url.searchParams.get('limit'), 20, 100) }).map(projectKmIngestRun) }); return true;
+    }
+    if (url.pathname === '/api/km/local-ingest/targets') {
+      if (!store.listKmIngestTargets) throw new Error('km_ingest_targets_unavailable');
+      jsonRes(res, 200, { executor: { enabled: true, mode: 'local', executionApiEnabled: true },
+        items: store.listKmIngestTargets(positiveInteger(url.searchParams.get('limit'), 20, 100)).map(projectKmIngestTarget) }); return true;
+    }
+    if (url.pathname === '/api/km/local-ingest/secrets') {
+      if (!deps.dataDir) throw new Error('km_ingest_data_dir_required');
+      jsonRes(res, 200, { items: listLocalIngestSecrets(deps.dataDir) }); return true;
+    }
+    if (url.pathname === '/api/km/local-ingest/extractor-approvals') {
+      if (!deps.dataDir) throw new Error('km_ingest_data_dir_required');
+      jsonRes(res, 200, { items: listLocalExtractorApprovals(deps.dataDir) }); return true;
     }
     if (url.pathname === '/api/km/production-gates') {
       if (!store.listProductionGatePlans || !store.getProductionGateKillState) throw new Error('km_production_gate_unavailable');

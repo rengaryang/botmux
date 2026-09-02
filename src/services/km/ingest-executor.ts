@@ -29,6 +29,7 @@ export interface KmIngestPlanInput {
   idempotencyKey: string;
   confirmationToken: string;
   env?: NodeJS.ProcessEnv;
+  credentialResolver?: (ref: string) => boolean;
 }
 
 export interface KmIngestApproveInput {
@@ -48,6 +49,7 @@ export interface KmIngestExecuteInput {
   expectedPlanHash: string;
   maxItems?: number;
   env?: NodeJS.ProcessEnv;
+  credentialResolver?: (ref: string) => boolean;
 }
 
 export interface KmIngestRollbackInput {
@@ -73,7 +75,7 @@ export function planKmIngest(input: KmIngestPlanInput): KmIngestRunReport {
   if (!target) missingReasons.push('target_missing');
   else {
     if (target.state !== 'ready') missingReasons.push('target_disabled');
-    if (!credentialAvailable(target.credentialRef, input.env)) missingReasons.push('credential_missing');
+    if (!credentialAvailable(target.credentialRef, input.env, input.credentialResolver)) missingReasons.push('credential_missing');
   }
   const sourceRunId = requireNonEmpty(input.sourceRunId, 'km_ingest_source_run_required');
   const extractorRun = input.store.getDistillationJob(sourceRunId);
@@ -158,7 +160,7 @@ export function executeKmIngestOffline(input: KmIngestExecuteInput): KmIngestRun
     return input.store.getKmIngestRunReport(blocked.runId)!;
   }
   const target = input.store.getKmIngestTarget(report.run.targetId);
-  if (!target || target.state !== 'ready' || target.targetHash !== report.run.plan.targetHash || !credentialAvailable(target.credentialRef, input.env)) {
+  if (!target || target.state !== 'ready' || target.targetHash !== report.run.plan.targetHash || !credentialAvailable(target.credentialRef, input.env, input.credentialResolver)) {
     const reason = !target ? 'target_missing'
       : target.state !== 'ready' ? 'target_disabled'
         : target.targetHash !== report.run.plan.targetHash ? 'target_hash_mismatch'
@@ -257,9 +259,14 @@ function assertConfirmationToken(token: string, expectedHash: string): void {
   if (expected.length !== got.length || !timingSafeEqual(expected, got)) throw new Error('km_ingest_confirmation_token_invalid');
 }
 
-function credentialAvailable(ref: string, env: NodeJS.ProcessEnv = process.env): boolean {
+function credentialAvailable(
+  ref: string,
+  env: NodeJS.ProcessEnv = process.env,
+  credentialResolver?: (ref: string) => boolean,
+): boolean {
   const credentialRef = ref.trim();
   if (!credentialRef) return false;
+  if (credentialRef.startsWith('local-secret:')) return credentialResolver?.(credentialRef) === true;
   if (credentialRef.startsWith('mock:')) return true;
   if (credentialRef.startsWith('file:/')) return true;
   if (!credentialRef.startsWith('env:')) return false;
