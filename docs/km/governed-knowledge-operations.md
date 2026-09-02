@@ -71,7 +71,8 @@ Botmux also exposes a separate local-only control plane under `/api/km/local-ing
 
 - Local credential plaintext is encrypted with AES-256-GCM in a machine-local `0600` secret store; SQLite and API responses retain reference/metadata only.
 - The Dashboard provides additive forms for local credential, target, extractor run, plan confirmation, execution approval, execution, and rollback.
-- Offline targets use `mock:` or `file:/`. Real business-space targets use HTTPS only and require an exact hostname allowlist, public DNS resolution, bounded timeout, no redirect, and a local `local-secret:*` credential.
+- The recommended business-space target is `local-space` with `space:<space-id>`. Canonical entries, INDEX, versions, audit ACK and rollback backups live under the Botmux machine's `dataDir/km-business-spaces/<space-id>/`.
+- Offline targets use `mock:` or `file:/`. An optional HTTPS adapter remains available for compatibility and requires an exact hostname allowlist, bounded timeout, no redirect, and a local `local-secret:*` credential.
 - The HTTPS adapter sends `botmux.business-space.ingest.v1` with an idempotency key and plan hash. It accepts only a complete, correlated ACK partition (`accepted` / `rejected`) before applying accepted items locally; malformed or mismatched ACKs fail closed.
 - Plan creation and execution resolve `local-secret:*` references without exposing plaintext. Partial ACKs keep rejected entries retryable, and rollback remains local compensation unless the target contract later adds an explicit remote rollback endpoint.
 
@@ -86,4 +87,4 @@ The offline/local state machine requires all of the following before local execu
 5. explicit run approval;
 6. an external ACK matching the plan hash.
 
-For an offline target, execution remains local only. For an explicitly configured HTTPS target, execution performs a real write only after the same Plan and Execution Approval gates pass and the target remains hash-identical; target ACK metadata is audited without persisting credentials.
+For a `local-space` target, execution atomically writes the formal business-space files on the Botmux host and records a backup ID for rollback. For an offline target, execution remains a local dry run. Only an explicitly configured HTTPS compatibility target performs a network write after the same Plan and Execution Approval gates pass.

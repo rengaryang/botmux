@@ -81,7 +81,7 @@ type KnowledgeExportPreview = {
   risk: { mutatesWorkspace: boolean; network: false; gitPush: false; fixtureOnly: boolean };
 };
 type MemoryItem = { memoryId: string; state: string; scope: string; subject: string; claimKey: string; confidence: string };
-type LocalIngestTarget = { targetId: string; state: string; target: { endpointMode: string; dryRunOnly: boolean; transport: 'offline'|'https'; allowedHosts: string[]; timeoutMs: number; allowedProviderIds: string[]; markIngestedCommand?: string }; targetHash: string; credential: { mode: string; reference?: string }; updatedAt: string };
+type LocalIngestTarget = { targetId: string; state: string; target: { endpointMode: string; dryRunOnly: boolean; transport: 'offline'|'https'|'local-space'; allowedHosts: string[]; timeoutMs: number; allowedProviderIds: string[]; markIngestedCommand?: string }; targetHash: string; credential: { mode: string; reference?: string }; updatedAt: string };
 type LocalIngestRun = { runId: string; state: string; targetId: string; plan: { sourceRunId: string; extractorProviderId: string; canonicalKeys: string[] }; planHash: string; sourceCount: number; ingestedCount: number; failedCount: number; rollbackCount: number; updatedAt: string; lastError?: string };
 type LocalIngestStatus = { executor: { enabled: boolean; mode: string; executionApiEnabled: boolean }; items: LocalIngestRun[] };
 type LocalIngestSecrets = { items: Array<{ ref: string; configured: boolean; createdAt: string; updatedAt: string }> };
@@ -324,7 +324,7 @@ function KmPage(): React.JSX.Element {
   const [providerForm, setProviderForm] = useState({ providerId: 'mem0' as ProviderConfig['providerId'], endpoint: '', credentialRef: 'env:MEM0_API_KEY', enabled: false, timeoutMs: 5000 });
   const [sinkForm, setSinkForm] = useState({ sinkId: 'central-mock', endpointRef: 'mock://central', enabled: false, batchLimit: 25, timeoutMs: 5000, maxAttempts: 5, credentialRef: 'env:BOTMUX_KM_CENTRAL_SINK_SECRET', payloadMaxBytes: 65536 });
   const [ingestSecretForm, setIngestSecretForm] = useState({ ref: 'local-secret:km-ingest-default', secret: '' });
-  const [ingestTargetForm, setIngestTargetForm] = useState({ targetId: 'local-business-space', endpointRef: 'mock://local-business-space', credentialRef: 'local-secret:km-ingest-default', transport: 'offline' as 'offline'|'https', allowedHosts: '', timeoutMs: 10000, allowPrivateNetwork: false, allowedProviderIds: 'builtin.rules-v1', markIngestedCommand: 'mark-ingested', enabled: false });
+  const [ingestTargetForm, setIngestTargetForm] = useState({ targetId: 'local-business-space', endpointRef: 'space:default', credentialRef: 'mock:local-space', transport: 'local-space' as 'offline'|'https'|'local-space', allowedHosts: '', timeoutMs: 10000, allowPrivateNetwork: false, allowedProviderIds: 'builtin.rules-v1', markIngestedCommand: 'mark-ingested', enabled: false });
   const [ingestPlanForm, setIngestPlanForm] = useState({ targetId: 'local-business-space', sourceRunId: '', extractorProviderId: 'builtin.rules-v1', confirmationToken: '', candidatesJson: '[]' });
   const [ingestRunTokens, setIngestRunTokens] = useState<Record<string, string>>({});
   const [importForm, setImportForm] = useState({ source: 'knowledge-items', allowlistedRoots: '', markdownFiles: '', defaultScope: 'workspace', defaultSubject: 'default' });
@@ -558,7 +558,7 @@ function KmPage(): React.JSX.Element {
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const saveLocalIngestTarget = async () => {
-    try { await mutateJson('/api/km/local-ingest/targets', 'PUT', { ...ingestTargetForm, dryRunOnly: ingestTargetForm.transport !== 'https', allowedHosts: ingestTargetForm.allowedHosts.split(',').map(value => value.trim()).filter(Boolean), allowedProviderIds: ingestTargetForm.allowedProviderIds.split(',').map(value => value.trim()).filter(Boolean) }); setNotice('本地 ingest target 已保存；既有配置未变'); await load(); }
+    try { await mutateJson('/api/km/local-ingest/targets', 'PUT', { ...ingestTargetForm, dryRunOnly: ingestTargetForm.transport === 'offline', allowedHosts: ingestTargetForm.allowedHosts.split(',').map(value => value.trim()).filter(Boolean), allowedProviderIds: ingestTargetForm.allowedProviderIds.split(',').map(value => value.trim()).filter(Boolean) }); setNotice('本地 ingest target 已保存；既有配置未变'); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
   const approveLocalExtractor = async () => {
@@ -582,7 +582,7 @@ function KmPage(): React.JSX.Element {
   };
   const executeLocalIngestRun = async (run: LocalIngestRun) => {
     const confirmationToken = ingestRunTokens[run.runId] ?? window.prompt('输入该 Plan 的 confirmation token') ?? '';
-    if (!confirmationToken || !window.confirm(`确认执行 ingest ${run.runId}？若 Target 为 HTTPS，将向 allowlist 内业务空间发送真实写请求。`)) return;
+    if (!confirmationToken || !window.confirm(`确认执行 ingest ${run.runId}？Local business space 将写入 Botmux 本机；仅显式 HTTPS Target 才会发网络请求。`)) return;
     try { await mutateJson(`/api/km/local-ingest/${encodeURIComponent(run.runId)}/execute`, 'POST', { confirmationToken, expectedPlanHash: run.planHash, maxItems: 50 }); setNotice('本地 ingest 执行完成'); await load(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
@@ -1042,8 +1042,8 @@ function KmPage(): React.JSX.Element {
               <input type="password" autoComplete="new-password" value={ingestSecretForm.secret} onChange={e => setIngestSecretForm({ ...ingestSecretForm, secret: e.target.value })} placeholder="Credential plaintext（仅本次提交）" />
               <button disabled={!ingestSecretForm.ref.trim() || !ingestSecretForm.secret} onClick={() => void saveLocalIngestSecret()}>加密保存凭证</button>
               <input value={ingestTargetForm.targetId} onChange={e => setIngestTargetForm({ ...ingestTargetForm, targetId: e.target.value })} placeholder="Target ID" />
-              <select value={ingestTargetForm.transport} onChange={e => setIngestTargetForm({ ...ingestTargetForm, transport: e.target.value as 'offline'|'https' })}><option value="offline">offline mock/file</option><option value="https">HTTPS business space</option></select>
-              <input value={ingestTargetForm.endpointRef} onChange={e => setIngestTargetForm({ ...ingestTargetForm, endpointRef: e.target.value })} placeholder="mock://、file:/ 或 https://业务空间 API" />
+              <select value={ingestTargetForm.transport} onChange={e => setIngestTargetForm({ ...ingestTargetForm, transport: e.target.value as 'offline'|'https'|'local-space' })}><option value="local-space">Local business space</option><option value="offline">offline mock/file</option><option value="https">HTTPS adapter（可选）</option></select>
+              <input value={ingestTargetForm.endpointRef} onChange={e => setIngestTargetForm({ ...ingestTargetForm, endpointRef: e.target.value })} placeholder="space:<space-id>、mock://、file:/ 或 https:// API" />
               <input value={ingestTargetForm.credentialRef} onChange={e => setIngestTargetForm({ ...ingestTargetForm, credentialRef: e.target.value })} placeholder="local-secret:name" />
               <input value={ingestTargetForm.allowedHosts} onChange={e => setIngestTargetForm({ ...ingestTargetForm, allowedHosts: e.target.value })} placeholder="HTTPS host allowlist，逗号分隔" />
               <input type="number" min="500" max="30000" value={ingestTargetForm.timeoutMs} onChange={e => setIngestTargetForm({ ...ingestTargetForm, timeoutMs: Number(e.target.value) })} title="HTTPS timeout ms" />
@@ -1053,7 +1053,7 @@ function KmPage(): React.JSX.Element {
               <label><input type="checkbox" checked={ingestTargetForm.enabled} onChange={e => setIngestTargetForm({ ...ingestTargetForm, enabled: e.target.checked })} /> Target ready</label>
               <button disabled={!ingestTargetForm.targetId.trim() || !ingestTargetForm.endpointRef.trim() || !ingestTargetForm.credentialRef.trim()} onClick={() => void saveLocalIngestTarget()}>保存本地 Target</button>
             </div>
-            <KmInlineHelp>凭证明文使用 AES-256-GCM 保存在本机 0600 secret store；SQLite 和 API 只保留 reference/metadata。offline target 使用 mock:/file:/；HTTPS target 必须显式选择 HTTPS、配置精确 host allowlist 和本地 secret；内网业务域名还需显式勾选允许内网地址，且每次仍需 Plan + Execution Approval。</KmInlineHelp>
+            <KmInlineHelp>凭证明文使用 AES-256-GCM 保存在本机 0600 secret store；SQLite 和 API 只保留 reference/metadata。Local business space 使用 space:&lt;space-id&gt; 并原子写入本机 km-business-spaces；offline target 使用 mock:/file:/；HTTPS adapter 必须显式选择 HTTPS、配置精确 host allowlist 和本地 secret；内网业务域名还需显式勾选允许内网地址，且每次仍需 Plan + Execution Approval。</KmInlineHelp>
           </details>
           <details className="km-advanced-panel">
             <summary>2 · Extractor Run 与 Plan</summary>
