@@ -16037,6 +16037,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
   const registry = await loadPluginRegistryForCommand();
   const record = registry.plugins[command.pluginId];
   const { pluginRuntimeDir } = await import('./core/plugins/paths.js');
+  const sessionManifest = sessionId ? readSessionPluginManifest(sessionId) : null;
   const result = await command.run({
     runtime: 'cli',
     pluginId: command.pluginId,
@@ -16045,6 +16046,9 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
     version: record?.version ?? '0.0.0',
     manifest: record?.manifest ?? { schemaVersion: 1, id: command.pluginId },
     args: commandArgs,
+    ...(sessionId && sessionManifest?.exactBotId
+      ? { trustedContext: Object.freeze({ exactBotId: sessionManifest.exactBotId, sessionId }) }
+      : {}),
   });
   if (typeof result === 'string') console.log(result);
   if (typeof result === 'number') process.exitCode = result;

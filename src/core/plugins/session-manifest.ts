@@ -12,6 +12,8 @@ export interface SessionPluginManifest {
   schemaVersion: 1;
   sessionId: string;
   botId?: string;
+  /** App-scoped, Core-authenticated Bot identity used by plugin data planes. */
+  exactBotId: string;
   source: 'bot' | 'machine-default';
   pluginIds: string[];
   generatedAt: string;
@@ -40,6 +42,7 @@ export function readSessionPluginManifest(
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<SessionPluginManifest>;
     if (parsed.schemaVersion !== 1 || parsed.sessionId !== sessionId || !Array.isArray(parsed.pluginIds)) return null;
+    if (typeof parsed.exactBotId !== 'string' || !parsed.exactBotId) return null;
     if (!parsed.pluginIds.every(id => typeof id === 'string')) return null;
     return parsed as SessionPluginManifest;
   } catch {
@@ -69,6 +72,7 @@ function buildSessionPluginManifest(opts: SessionPluginManifestOptions): Session
     schemaVersion: 1,
     sessionId: opts.sessionId,
     botId: opts.bot.name?.trim() || opts.bot.larkAppId,
+    exactBotId: opts.bot.larkAppId,
     source: opts.bot.plugins === undefined ? 'machine-default' : 'bot',
     pluginIds: resolveEffectivePluginIds(opts.bot, opts.global),
     generatedAt: opts.now ? opts.now() : new Date().toISOString(),
