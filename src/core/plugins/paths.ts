@@ -35,6 +35,14 @@ export function pluginCardActionTokenPath(pluginId: string): string {
   return join(pluginPrivateDir(pluginId), 'card-actions.token');
 }
 
+export function pluginEventSinkPrivatePath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'event-sink.json');
+}
+
+export function pluginWorkflowExecutorPrivatePath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'workflow-executor.json');
+}
+
 export function pluginConfigPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'config.json');
 }

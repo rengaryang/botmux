@@ -195,6 +195,82 @@ describe('plugin manifest and registry basics', () => {
     });
   });
 
+  it('scans bounded protocol-v1 SPI descriptors and keeps private executors out of public contributions', () => {
+    const root = join(home, 'spi-plugin');
+    for (const dir of ['event-sink', 'dashboard-api', 'workflow-executor']) mkdirSync(join(root, dir), { recursive: true });
+    writeFileSync(join(root, 'event-sink', 'index.json'), JSON.stringify({
+      protocolVersion: 1,
+      transport: 'private-stdio',
+      command: ['node', './event-sink/server.js'],
+      events: ['turn.completed'],
+    }));
+    writeFileSync(join(root, 'event-sink', 'server.js'), 'process.stdin.resume();\n');
+    writeFileSync(join(root, 'dashboard-api', 'index.json'), JSON.stringify({
+      protocolVersion: 1,
+      capability: 'observability.read',
+      routes: [{ method: 'GET', path: '/api/plugins/spi-plugin/traces' }],
+    }));
+    writeFileSync(join(root, 'workflow-executor', 'index.json'), JSON.stringify({
+      protocolVersion: 1,
+      mode: 'read-only',
+      command: ['node', './workflow-executor/server.js'],
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+    }));
+    writeFileSync(join(root, 'workflow-executor', 'server.js'), 'process.stdin.resume();\n');
+
+    const scanned = scanPluginContributions(root, {
+      schemaVersion: 1,
+      id: 'spi-plugin',
+      compatibility: {
+        protocolVersion: 1,
+        contributions: { eventSink: 1, dashboardApi: 1, workflowExecutor: 1 },
+      },
+    });
+    expect(scanned).toMatchObject({
+      eventSink: {
+        protocolVersion: 1, transport: 'private-stdio', events: ['turn.completed'],
+        queue: { maxItems: 1000, batchSize: 25, maxBatchBytes: 262144 },
+        privateRef: 'private/event-sink.json',
+      },
+      dashboardApi: {
+        protocolVersion: 1, capability: 'observability.read',
+        routes: [{ method: 'GET', path: '/api/plugins/spi-plugin/traces' }],
+        limits: { requestBytes: 65536, responseBytes: 1048576 },
+      },
+      workflowExecutor: {
+        protocolVersion: 1, mode: 'read-only', inputSchema: { type: 'object' }, outputSchema: { type: 'object' },
+        outputMaxBytes: 1048576, privateRef: 'private/workflow-executor.json',
+      },
+    });
+    expect(JSON.stringify(scanned)).not.toContain('./event-sink/server.js');
+    expect(JSON.stringify(scanned)).not.toContain('./workflow-executor/server.js');
+    expect(JSON.stringify(scanned)).not.toContain('"command"');
+  });
+
+  it('fails closed for missing/incompatible SPI protocol gates and unallowlisted surfaces', () => {
+    const root = join(home, 'bad-spi');
+    mkdirSync(join(root, 'event-sink'), { recursive: true });
+    writeFileSync(join(root, 'event-sink', 'server.js'), 'process.stdin.resume();\n');
+    writeFileSync(join(root, 'event-sink', 'index.json'), JSON.stringify({
+      protocolVersion: 1, transport: 'private-stdio', command: ['node', './event-sink/server.js'], events: ['turn.completed'],
+    }));
+    expect(() => scanPluginContributions(root, { schemaVersion: 1, id: 'bad-spi' }))
+      .toThrow(/plugin_spi_compatibility_required/);
+    expect(() => scanPluginContributions(root, {
+      schemaVersion: 1, id: 'bad-spi',
+      compatibility: { protocolVersion: 1, contributions: { eventSink: 2 } },
+    })).toThrow(/unsupported_plugin_event_sink_protocol/);
+
+    writeFileSync(join(root, 'event-sink', 'index.json'), JSON.stringify({
+      protocolVersion: 1, transport: 'private-stdio', command: ['/tmp/evil'], events: ['secret.dump'],
+    }));
+    expect(() => scanPluginContributions(root, {
+      schemaVersion: 1, id: 'bad-spi',
+      compatibility: { protocolVersion: 1, contributions: { eventSink: 1 } },
+    })).toThrow(/invalid_plugin_event_sink_event|must_be_relative/);
+  });
+
   it('rejects unsafe, missing, and runtime-templated static MCP command paths during scanning', () => {
     const makeSource = (name: string, command: string[], env?: Record<string, string>) => {
       const root = join(home, name);

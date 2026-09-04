@@ -10,6 +10,8 @@ import {
   pluginsHome,
   pluginSettingsPath,
   pluginConfigPath,
+  pluginEventSinkPrivatePath,
+  pluginWorkflowExecutorPrivatePath,
 } from './paths.js';
 import type { InstalledPluginRecord, PluginPackageManifest, PluginSettingsFile } from './types.js';
 import { readPluginRegistry, upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
@@ -147,6 +149,22 @@ function makeRecord(
   };
 }
 
+function writePrivateSpiDescriptors(pluginId: string, runtimeDir: string, record: InstalledPluginRecord): void {
+  const descriptors = [
+    [record.contributions?.eventSink, 'event-sink/index.json', pluginEventSinkPrivatePath(pluginId)],
+    [record.contributions?.workflowExecutor, 'workflow-executor/index.json', pluginWorkflowExecutorPrivatePath(pluginId)],
+  ] as const;
+  for (const [contribution, relativePath, privatePath] of descriptors) {
+    if (!contribution) {
+      rmSync(privatePath, { force: true });
+      continue;
+    }
+    const raw = JSON.parse(readFileSync(join(runtimeDir, relativePath), 'utf8'));
+    mkdirSync(dirname(privatePath), { recursive: true });
+    atomicWriteFileSync(privatePath, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
+  }
+}
+
 function commitPluginInstall(staged: StagedPluginRecord, stagedDir: string): InstallPluginResult {
   const pluginId = staged.record.id;
   const privateSnapshot = capturePluginMcpPrivateSnapshot(pluginId);
@@ -154,6 +172,7 @@ function commitPluginInstall(staged: StagedPluginRecord, stagedDir: string): Ins
   try {
     if (staged.mcpServer) writePluginMcpDescriptor(pluginId, staged.mcpServer);
     else removePluginMcpDescriptor(pluginId);
+    writePrivateSpiDescriptors(pluginId, replacement.runtimeDir, staged.record);
     const record = upsertInstalledPlugin(staged.record);
     replacement.commit();
     return { record, runtimeDir: replacement.runtimeDir };

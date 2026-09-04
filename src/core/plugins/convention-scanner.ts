@@ -7,8 +7,11 @@ import type {
   BotmuxPluginManifest,
   PluginCliCommandIndexEntry,
   PluginCardActionsContribution,
+  PluginDashboardApiContribution,
+  PluginEventSinkContribution,
   PluginMcpServer,
   PluginServiceMode,
+  PluginWorkflowExecutorContribution,
   ScannedPluginContributions,
 } from './types.js';
 
@@ -161,6 +164,109 @@ function scanCli(runtimeDir: string): ScannedPluginContributions['cli'] {
   return { entry, commandsPath, commands };
 }
 
+const EVENT_SINK_EVENTS = new Set([
+  'turn.started', 'turn.completed', 'turn.failed',
+  'session.started', 'session.ended',
+  'workflow.started', 'workflow.completed', 'workflow.failed',
+]);
+const DASHBOARD_CAPABILITIES = new Set(['dashboard.read', 'observability.read', 'workflow.read']);
+
+function boundedInteger(raw: unknown, fallback: number, max: number, field: string): number {
+  if (raw === undefined) return fallback;
+  if (!Number.isInteger(raw) || Number(raw) < 1 || Number(raw) > max) throw new Error(`invalid_plugin_${field}`);
+  return Number(raw);
+}
+
+function readJsonSchema(raw: unknown, field: string): Record<string, unknown> {
+  const schema = optionalRecord(raw, field);
+  if (schema.type !== 'object') throw new Error(`invalid_plugin_${field}`);
+  return schema;
+}
+
+function validatePrivateCommand(runtimeDir: string, raw: unknown, field: string): void {
+  const command = readCommand(raw, field);
+  for (const part of command) {
+    if (!part.startsWith('./')) continue;
+    const target = resolvePluginPath(runtimeDir, part, field);
+    if (!isFile(target)) throw new Error(`plugin_${field}_path_not_found:${part}`);
+  }
+}
+
+function scanEventSink(runtimeDir: string, manifest: BotmuxPluginManifest): PluginEventSinkContribution | undefined {
+  const rel = 'event-sink/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  const declared = manifest.compatibility?.contributions.eventSink;
+  if (!declared) throw new Error('plugin_spi_compatibility_required:eventSink');
+  if (declared !== 1) throw new Error('unsupported_plugin_event_sink_protocol');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf8')), 'event_sink');
+  if (record.protocolVersion !== 1) throw new Error('unsupported_plugin_event_sink_protocol');
+  if (record.transport !== 'private-stdio') throw new Error('invalid_plugin_event_sink_transport');
+  validatePrivateCommand(runtimeDir, record.command, 'event_sink_command');
+  if (!Array.isArray(record.events) || record.events.length === 0) throw new Error('invalid_plugin_event_sink_events');
+  const events = [...new Set(record.events.map(value => typeof value === 'string' ? value : ''))];
+  if (events.some(event => !EVENT_SINK_EVENTS.has(event))) throw new Error('invalid_plugin_event_sink_event');
+  const queue = record.queue === undefined ? {} : optionalRecord(record.queue, 'event_sink_queue');
+  return {
+    protocolVersion: 1,
+    transport: 'private-stdio',
+    events,
+    queue: {
+      maxItems: boundedInteger(queue.maxItems, 1000, 10_000, 'event_sink_queue_max_items'),
+      batchSize: boundedInteger(queue.batchSize, 25, 100, 'event_sink_batch_size'),
+      maxBatchBytes: boundedInteger(queue.maxBatchBytes, 256 * 1024, 1024 * 1024, 'event_sink_max_batch_bytes'),
+    },
+    privateRef: 'private/event-sink.json',
+  };
+}
+
+function scanDashboardApi(runtimeDir: string, manifest: BotmuxPluginManifest): PluginDashboardApiContribution | undefined {
+  const rel = 'dashboard-api/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  const declared = manifest.compatibility?.contributions.dashboardApi;
+  if (!declared) throw new Error('plugin_spi_compatibility_required:dashboardApi');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf8')), 'dashboard_api');
+  if (declared !== 1 || record.protocolVersion !== 1) throw new Error('unsupported_plugin_dashboard_api_protocol');
+  const capability = optionalString(record.capability);
+  if (!capability || !DASHBOARD_CAPABILITIES.has(capability)) throw new Error('invalid_plugin_dashboard_api_capability');
+  if (!Array.isArray(record.routes) || record.routes.length === 0) throw new Error('invalid_plugin_dashboard_api_routes');
+  const routes = record.routes.map((rawRoute) => {
+    const route = optionalRecord(rawRoute, 'dashboard_api_route');
+    if (route.method !== 'GET' && route.method !== 'POST') throw new Error('invalid_plugin_dashboard_api_method');
+    const path = optionalString(route.path);
+    if (!path || !path.startsWith(`/api/plugins/${manifest.id}/`) || path.includes('..')) {
+      throw new Error('invalid_plugin_dashboard_api_path');
+    }
+    return { method: route.method, path } as const;
+  });
+  const limits = record.limits === undefined ? {} : optionalRecord(record.limits, 'dashboard_api_limits');
+  return {
+    protocolVersion: 1, capability, routes,
+    limits: {
+      requestBytes: boundedInteger(limits.requestBytes, 64 * 1024, 1024 * 1024, 'dashboard_api_request_bytes'),
+      responseBytes: boundedInteger(limits.responseBytes, 1024 * 1024, 4 * 1024 * 1024, 'dashboard_api_response_bytes'),
+    },
+  };
+}
+
+function scanWorkflowExecutor(runtimeDir: string, manifest: BotmuxPluginManifest): PluginWorkflowExecutorContribution | undefined {
+  const rel = 'workflow-executor/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  const declared = manifest.compatibility?.contributions.workflowExecutor;
+  if (!declared) throw new Error('plugin_spi_compatibility_required:workflowExecutor');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf8')), 'workflow_executor');
+  if (declared !== 1 || record.protocolVersion !== 1) throw new Error('unsupported_plugin_workflow_executor_protocol');
+  if (record.mode !== 'read-only') throw new Error('invalid_plugin_workflow_executor_mode');
+  validatePrivateCommand(runtimeDir, record.command, 'workflow_executor_command');
+  return {
+    protocolVersion: 1,
+    mode: 'read-only',
+    inputSchema: readJsonSchema(record.inputSchema, 'workflow_executor_input_schema'),
+    outputSchema: readJsonSchema(record.outputSchema, 'workflow_executor_output_schema'),
+    outputMaxBytes: boundedInteger(record.outputMaxBytes, 1024 * 1024, 4 * 1024 * 1024, 'workflow_executor_output_max_bytes'),
+    privateRef: 'private/workflow-executor.json',
+  };
+}
+
 function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): ScannedPluginContributions['service'] {
   const entry = 'service/index.js';
   const exists = isFile(join(runtimeDir, entry));
@@ -255,12 +361,22 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
   const cardActions = scanCardActions(runtimeDir, service);
+  const eventSink = scanEventSink(runtimeDir, manifest);
+  const dashboardApi = scanDashboardApi(runtimeDir, manifest);
+  const workflowExecutor = scanWorkflowExecutor(runtimeDir, manifest);
+  for (const [name, declared] of Object.entries(manifest.compatibility?.contributions ?? {})) {
+    const present = name === 'eventSink' ? eventSink : name === 'dashboardApi' ? dashboardApi : workflowExecutor;
+    if (declared && !present) throw new Error(`plugin_declared_contribution_not_found:${name}`);
+  }
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
     ...(dashboard ? { dashboard } : {}),
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
+    ...(eventSink ? { eventSink } : {}),
+    ...(dashboardApi ? { dashboardApi } : {}),
+    ...(workflowExecutor ? { workflowExecutor } : {}),
   };
   if (cardActions) contributions.cardActions = cardActions;
   return Object.keys(contributions).length > 0 ? contributions : undefined;

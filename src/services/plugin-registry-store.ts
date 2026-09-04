@@ -58,9 +58,19 @@ function hasPrivateMcpFields(value: unknown): boolean {
 function assertPublicPluginRegistry(registry: PluginRegistryFile): void {
   for (const record of Object.values(registry.plugins)) {
     const mcp = (record.contributions as { mcp?: unknown } | undefined)?.mcp;
-    if (mcp === undefined) continue;
-    if (!isPluginMcpContribution(mcp) || hasPrivateMcpFields(mcp)) {
+    if (mcp !== undefined && (!isPluginMcpContribution(mcp) || hasPrivateMcpFields(mcp))) {
       throw new Error(`invalid_public_plugin_mcp_contribution:${record.id}`);
+    }
+    for (const key of ['eventSink', 'workflowExecutor'] as const) {
+      const contribution = record.contributions?.[key];
+      if (!contribution) continue;
+      if (hasPrivateMcpFields(contribution) || Object.hasOwn(contribution, 'entry')) {
+        throw new Error(`invalid_public_plugin_spi_contribution:${record.id}:${key}`);
+      }
+      const expected = `private/${key === 'eventSink' ? 'event-sink' : 'workflow-executor'}.json`;
+      if (contribution.privateRef !== expected) {
+        throw new Error(`invalid_public_plugin_spi_private_ref:${record.id}:${key}`);
+      }
     }
   }
 }
