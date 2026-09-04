@@ -52,7 +52,7 @@ export interface PluginEventSinkContribution {
   protocolVersion: PluginSpiProtocolVersion;
   transport: 'private-stdio';
   events: string[];
-  queue: { maxItems: number; batchSize: number; maxBatchBytes: number };
+  queue: { maxItems: number; maxBytes: number; batchSize: number; maxBatchBytes: number; flushMs: number };
   privateRef: string;
 }
 

@@ -585,6 +585,12 @@ gh pr create \
 `service`。其中 `emit` 是 legacy Codex Notifier 兼容入口，不是通用 Plugin
 事件或 daemon hook 扩展点。以 `botmux plugin --help` 为最终准确信息。
 
+## Dashboard API 与 Workflow Executor 运行时
+
+Dashboard API 由 Core 在既有管理认证后分发，插件只能声明 `GET` / `POST /api/plugins/<id>/...` 的精确路由。Core 校验 method/path、请求与响应字节上限、capability、CSRF 和 exact Bot 启用范围，然后仅注入冻结的 trusted principal DTO；原始 HTTP request、Cookie 和 Dashboard 管理 token 不会传给插件。输入输出 DTO 递归禁止密钥字段与宿主绝对路径，schema 不匹配、路由冲突或 handler 缺失均 fail-closed。
+
+Workflow Executor v1 仅支持命名的只读 query。dispatch 前冻结 plugin id/version/protocol、QuerySpec digest、principal、exact Bot、scope、超时和输出上限；执行时再次检查插件仍安装、版本未漂移且对该 Bot 启用。Core 使用 `spawn(..., shell:false)`，拒绝 shell 入口和任意 SQL 文本，并提供 run-relative、create-or-verify 的 attempt sidecar/result，供 v3 journal/重试/恢复路径复用。取消通过 `AbortSignal` 杀死子进程，输出继续经过字节上限、安全 DTO 与 output schema 校验。
+
 ## 威胁模型
 
 Core 在安装/启用边界把插件包视作不可信输入，但插件代码开始运行后并非沙箱。协议硬

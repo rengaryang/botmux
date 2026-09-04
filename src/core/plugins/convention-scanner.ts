@@ -211,9 +211,11 @@ function scanEventSink(runtimeDir: string, manifest: BotmuxPluginManifest): Plug
     transport: 'private-stdio',
     events,
     queue: {
-      maxItems: boundedInteger(queue.maxItems, 1000, 10_000, 'event_sink_queue_max_items'),
-      batchSize: boundedInteger(queue.batchSize, 25, 100, 'event_sink_batch_size'),
+      maxItems: boundedInteger(queue.maxItems, 10_000, 10_000, 'event_sink_queue_max_items'),
+      maxBytes: boundedInteger(queue.maxBytes, 64 * 1024 * 1024, 256 * 1024 * 1024, 'event_sink_queue_max_bytes'),
+      batchSize: boundedInteger(queue.batchSize, 100, 100, 'event_sink_batch_size'),
       maxBatchBytes: boundedInteger(queue.maxBatchBytes, 256 * 1024, 1024 * 1024, 'event_sink_max_batch_bytes'),
+      flushMs: boundedInteger(queue.flushMs, 250, 5_000, 'event_sink_flush_ms'),
     },
     privateRef: 'private/event-sink.json',
   };
@@ -229,13 +231,23 @@ function scanDashboardApi(runtimeDir: string, manifest: BotmuxPluginManifest): P
   const capability = optionalString(record.capability);
   if (!capability || !DASHBOARD_CAPABILITIES.has(capability)) throw new Error('invalid_plugin_dashboard_api_capability');
   if (!Array.isArray(record.routes) || record.routes.length === 0) throw new Error('invalid_plugin_dashboard_api_routes');
+  const routeKeys = new Set<string>();
+  const reservedManagementSegments = new Set(['pin', 'global', 'bots', 'services']);
   const routes = record.routes.map((rawRoute) => {
     const route = optionalRecord(rawRoute, 'dashboard_api_route');
     if (route.method !== 'GET' && route.method !== 'POST') throw new Error('invalid_plugin_dashboard_api_method');
     const path = optionalString(route.path);
-    if (!path || !path.startsWith(`/api/plugins/${manifest.id}/`) || path.includes('..')) {
+    const prefix = `/api/plugins/${manifest.id}/`;
+    if (!path || !path.startsWith(prefix) || path.includes('..') || path.includes('?') || path.includes('#')) {
       throw new Error('invalid_plugin_dashboard_api_path');
     }
+    const tail = path.slice(prefix.length);
+    if (!/^[a-z0-9][a-z0-9._~/-]*$/.test(tail) || reservedManagementSegments.has(tail.split('/')[0]!)) {
+      throw new Error('plugin_dashboard_api_route_collision');
+    }
+    const key = `${route.method} ${path}`;
+    if (routeKeys.has(key)) throw new Error('plugin_dashboard_api_route_collision');
+    routeKeys.add(key);
     return { method: route.method, path } as const;
   });
   const limits = record.limits === undefined ? {} : optionalRecord(record.limits, 'dashboard_api_limits');

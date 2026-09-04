@@ -365,6 +365,7 @@ import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
 import { materializePlugin } from './core/plugins/materializer.js';
+import { dispatchPluginDashboardApi, sendPluginDashboardResult } from './core/plugins/dashboard-api.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
@@ -4226,6 +4227,22 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname.startsWith('/api/plugins/')) {
+      const pluginApi = await dispatchPluginDashboardApi({
+        req,
+        url,
+        identity: requestIdentity,
+        csrfAllowed: () => !!requestIdentity && guardControlRequest({
+          headers: req.headers,
+          authSessionId: requestIdentity.authSessionId,
+          tokens: controlCsrfTokens,
+        }).ok,
+      });
+      if (pluginApi.handled) {
+        sendPluginDashboardResult(res, pluginApi);
+        return;
+      }
+    }
     if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
       && await handlePluginManagementApi(req, res, url)) {
       return;

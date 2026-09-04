@@ -230,7 +230,7 @@ describe('plugin manifest and registry basics', () => {
     expect(scanned).toMatchObject({
       eventSink: {
         protocolVersion: 1, transport: 'private-stdio', events: ['turn.completed'],
-        queue: { maxItems: 1000, batchSize: 25, maxBatchBytes: 262144 },
+        queue: { maxItems: 10000, maxBytes: 67108864, batchSize: 100, maxBatchBytes: 262144, flushMs: 250 },
         privateRef: 'private/event-sink.json',
       },
       dashboardApi: {
