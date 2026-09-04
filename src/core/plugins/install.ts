@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parsePluginPackageManifest } from './manifest.js';
@@ -165,9 +165,27 @@ function writePrivateSpiDescriptors(pluginId: string, runtimeDir: string, record
   }
 }
 
+interface PrivateFileSnapshot { path: string; bytes?: Buffer; mode?: number }
+
+function capturePrivateFile(path: string): PrivateFileSnapshot {
+  if (!existsSync(path)) return { path };
+  return { path, bytes: readFileSync(path), mode: statSync(path).mode & 0o777 };
+}
+
+function restorePrivateFile(snapshot: PrivateFileSnapshot): void {
+  if (!snapshot.bytes) { rmSync(snapshot.path, { force: true }); return; }
+  mkdirSync(dirname(snapshot.path), { recursive: true, mode: 0o700 });
+  writeFileSync(snapshot.path, snapshot.bytes, { mode: snapshot.mode ?? 0o600 });
+  if (process.platform !== 'win32') chmodSync(snapshot.path, snapshot.mode ?? 0o600);
+}
+
 function commitPluginInstall(staged: StagedPluginRecord, stagedDir: string): InstallPluginResult {
   const pluginId = staged.record.id;
   const privateSnapshot = capturePluginMcpPrivateSnapshot(pluginId);
+  const spiSnapshots = [
+    capturePrivateFile(pluginEventSinkPrivatePath(pluginId)),
+    capturePrivateFile(pluginWorkflowExecutorPrivatePath(pluginId)),
+  ];
   const replacement = replacePluginRuntime(pluginId, stagedDir);
   try {
     if (staged.mcpServer) writePluginMcpDescriptor(pluginId, staged.mcpServer);
@@ -178,6 +196,9 @@ function commitPluginInstall(staged: StagedPluginRecord, stagedDir: string): Ins
     return { record, runtimeDir: replacement.runtimeDir };
   } catch (error) {
     try { restorePluginMcpPrivateSnapshot(pluginId, privateSnapshot); } catch { /* preserve the original error */ }
+    for (const snapshot of spiSnapshots) {
+      try { restorePrivateFile(snapshot); } catch { /* preserve the original error */ }
+    }
     try { replacement.rollback(); } catch { /* preserve the original error */ }
     throw error;
   }

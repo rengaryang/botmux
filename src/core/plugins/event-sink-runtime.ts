@@ -398,7 +398,9 @@ export class PluginEventSinkManager {
         occurredAt: new Date().toISOString(),
         scope: Object.freeze({
           larkAppId: bot.larkAppId,
-          botId: bot.name ?? bot.larkAppId,
+          // Use the app-scoped immutable identity everywhere. Display names are
+          // mutable and must never select a plugin data partition.
+          botId: bot.larkAppId,
           sessionId: ds.session.sessionId,
           turnId: terminal.turnId,
           workflowRunId: context.workflowRunId ?? null,
@@ -431,7 +433,7 @@ export class PluginEventSinkManager {
           const started = new DurablePluginEventSink({
             pluginId,
             larkAppId: bot.larkAppId,
-            botId: bot.name ?? bot.larkAppId,
+            botId: bot.larkAppId,
             descriptor: readDescriptor(pluginId),
             runtimeDir: pluginRuntimeDir(pluginId),
             privateDir: pluginPrivateDir(pluginId),
