@@ -624,6 +624,12 @@ The available verbs are `list`, `init`, `install`, `uninstall`, `enable`,
 compatibility entry, not a general Plugin event or daemon-hook contribution.
 Treat `botmux plugin --help` as the final source of truth.
 
+## Dashboard API and Workflow Executor runtime
+
+Core dispatches Dashboard API contributions only after the existing management authentication boundary. Plugins may declare only exact `GET` / `POST /api/plugins/<id>/...` routes. Core enforces method/path, request and response byte limits, capability, CSRF, and exact-Bot enablement, then injects only a frozen trusted-principal DTO. Raw HTTP requests, cookies, and the Dashboard management token never cross the plugin boundary. Public DTOs recursively reject credential fields and absolute host paths; schema mismatches, route collisions, and missing handlers fail closed.
+
+Workflow Executor v1 accepts named read-only queries only. Before dispatch, Core freezes plugin id/version/protocol, the QuerySpec digest, principal, exact Bot, scope, timeout, and output limit. Execution rechecks installation, version, protocol, and exact-Bot enablement. Core uses `spawn(..., shell:false)`, rejects shell entrypoints and arbitrary SQL text, and exposes run-relative create-or-verify attempt sidecars/results for v3 journal/retry/recovery integration. Cancellation terminates the subprocess through `AbortSignal`; output remains subject to byte limits, safe-DTO validation, and the declared output schema.
+
 ## Threat model
 
 The Core treats plugin packages as untrusted input at install/enable boundaries,

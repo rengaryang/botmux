@@ -95,6 +95,7 @@ import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-
 import { isKmShadowQualityEnabled, runKmShadowQualityOnce } from './services/km/shadow-quality-runtime.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { PluginEventSinkManager } from './core/plugins/event-sink-runtime.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -510,6 +511,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
+const pluginEventSinkManager = new PluginEventSinkManager();
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
@@ -21933,6 +21935,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
+      // Core-authored projection only. enqueue is synchronous/non-blocking and
+      // the manager rejects stale generations before touching a plugin child.
+      pluginEventSinkManager.emitTurnTerminal(getBot(ds.larkAppId).config, ds, terminal, context);
       // Feedback turn-completion persistence is a synchronous node:sqlite write.
       // Route it through the nonblocking, tracked retry queue so a cross-process
       // write-lock (a `botmux send --response-kind final` subprocess) can never
@@ -23304,6 +23309,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         + `leaving feedback queue admission OPEN to avoid refusing a late terminal`,
       );
     }
+    // Plugin children receive only the remaining shared shutdown budget. Any
+    // unacknowledged envelope is atomically moved to its private per-Bot spool.
+    await pluginEventSinkManager.shutdown(remainingBudget());
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
