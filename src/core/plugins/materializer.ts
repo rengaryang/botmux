@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
 import { resolvePluginSkillPackages } from './skills.js';
+import { assertPluginProtocolCompatibility } from './manifest.js';
 import { pluginMaterializedPath } from './paths.js';
 import type { InstalledPluginRecord, PluginMaterializedFile } from './types.js';
 
@@ -47,6 +48,9 @@ function requireInstalledPlugin(pluginId: string): InstalledPluginRecord {
  */
 export function materializePlugin(pluginId: string): PluginMaterializedFile {
   const record = requireInstalledPlugin(pluginId);
+  // Re-check persisted metadata at enable time so a corrupt/downgraded registry
+  // cannot bypass the installation scanner's fail-closed protocol gate.
+  assertPluginProtocolCompatibility(record);
   const resolvedSkills = resolvePluginSkillPackages([record.id]);
   if (resolvedSkills.diagnostics.length > 0) {
     throw new Error(resolvedSkills.diagnostics.join(','));

@@ -31,6 +31,14 @@ export function pluginMcpPrivatePath(pluginId: string): string {
   return join(pluginPrivateDir(pluginId), 'mcp.json');
 }
 
+export function pluginEventSinkPrivatePath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'event-sink.json');
+}
+
+export function pluginWorkflowExecutorPrivatePath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'workflow-executor.json');
+}
+
 export function pluginConfigPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'config.json');
 }

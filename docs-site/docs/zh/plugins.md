@@ -21,8 +21,9 @@ Service。本文面向插件作者与运维者，说明从创建项目、构建�
 | Dashboard | `src/dashboard/` | `dist/dashboard/index.js` |
 | Host Service | `src/service/` | `dist/service/index.js` |
 
-当前没有通用的 worker/daemon hook 扩展点。插件应把长期进程放进 Host
-Service，把 Agent 工具放进 MCP 或 Skill，把运维入口放进 CLI。
+Core 不提供任意 worker/daemon hook。P0 只定义三个窄化、带版本的 SPI 描述：
+事件接收器、Dashboard API 和只读工作流执行器。产品特定策略与行为必须留在胖
+Plugin 中；薄 Core 只负责校验、限流和传输契约。
 
 安装和启用是两个动作：
 
@@ -114,10 +115,37 @@ Plugin ID 仍可保留为 `my-plugin`。第三方包安装时必须使用完整 
 `npm pack --dry-run`。npm 仍可能自动包含根目录的
 `package.json`、README 和 LICENSE，因此也要检查这些文件是否含敏感信息。
 
+使用 P0 SPI 的插件必须声明协议硬门禁：
+
+```json
+"compatibility": {
+  "protocolVersion": 1,
+  "contributions": { "eventSink": 1, "dashboardApi": 1, "workflowExecutor": 1 }
+}
+```
+
+声明和固定路径描述文件必须同时存在且都使用协议 v1。缺失、未知或不匹配时，安装和
+启用均 fail-closed。不使用这些贡献项的既有 manifest v1 插件保持兼容。
+
 `botmux.dependencies.plugins` 只声明 Plugin
 ID，不支持版本范围。启用当前插件时，依赖插件必须已安装，并在同一机器默认或 Bot 作用域中启用；禁用或卸载仍被其他已启用插件依赖的插件会被拒绝。
 
 ## 开发扩展点
+
+### 协议 v1 SPI 贡献项
+
+三个 JSON 描述分别位于 `dist/event-sink/index.json`、
+`dist/dashboard-api/index.json` 和 `dist/workflow-executor/index.json`。
+
+- **eventSink** 只允许 `private-stdio` 和白名单生命周期事件；默认最多排队 1000
+  条、每批 25 条、每批 256 KiB。
+- **dashboardApi** 声明白名单 capability，只允许 `/api/plugins/<id>/` 下的
+  `GET`/`POST` 路由；默认请求 64 KiB、响应 1 MiB。
+- **workflowExecutor** 必须为 `read-only`，声明对象型输入/输出 JSON schema，
+  默认输出上限 1 MiB。
+
+事件接收器和工作流执行器的命令会写入权限 0600 的插件私有描述；公共 registry
+只保留有界元数据和 `privateRef`，绝不包含命令、环境密钥、请求头或任意可执行路径。
 
 ### CLI 命令
 
@@ -528,6 +556,15 @@ gh pr create \
 `list`、`init`、`install`、`uninstall`、`enable`、`disable`、`emit` 和
 `service`。其中 `emit` 是 legacy Codex Notifier 兼容入口，不是通用 Plugin
 事件或 daemon hook 扩展点。以 `botmux plugin --help` 为最终准确信息。
+
+## 威胁模型
+
+Core 在安装/启用边界把插件包视作不可信输入，但插件代码开始运行后并非沙箱。协议硬
+门禁阻止静默降级；事件、路由和 capability 白名单缩小 confused-deputy 攻击面；
+字节、队列和批次上限约束内存放大；私有描述避免 registry 读取者获知命令或凭证。
+工作流执行器契约只读，不是通用宿主命令 hook。这些控制不能让发布者代码自动变安全：
+npm lifecycle 与启用后的插件代码仍拥有安装用户权限。运维者必须固定并审计可信包，
+插件必须把 secret 留在私有配置中。
 
 ## 安全与发布清单
 

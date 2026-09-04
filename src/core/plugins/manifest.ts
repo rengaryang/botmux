@@ -1,7 +1,9 @@
 import { assertValidPluginId, isValidPluginId } from './ids.js';
 import type {
   BotmuxPluginManifest,
+  InstalledPluginRecord,
   PluginPackageManifest,
+  PluginProtocolCompatibility,
   PluginServiceConfig,
 } from './types.js';
 
@@ -31,6 +33,21 @@ function readDependencies(raw: unknown): BotmuxPluginManifest['dependencies'] {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readCompatibility(raw: unknown): PluginProtocolCompatibility | undefined {
+  if (raw === undefined) return undefined;
+  const record = asRecord(raw, 'botmux_compatibility');
+  if (record.protocolVersion !== 1) throw new Error('unsupported_plugin_protocol_version');
+  const declared = asRecord(record.contributions, 'botmux_compatibility_contributions');
+  const contributions: PluginProtocolCompatibility['contributions'] = {};
+  for (const key of ['eventSink', 'dashboardApi', 'workflowExecutor'] as const) {
+    if (declared[key] === undefined) continue;
+    if (declared[key] !== 1) throw new Error(`unsupported_plugin_${key}_protocol`);
+    contributions[key] = 1;
+  }
+  if (Object.keys(contributions).length === 0) throw new Error('plugin_compatibility_contributions_required');
+  return { protocolVersion: 1, contributions };
+}
+
 function readService(raw: unknown): PluginServiceConfig | undefined {
   if (raw === undefined) return undefined;
   const record = asRecord(raw, 'botmux_service');
@@ -45,13 +62,31 @@ export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
   const displayName = optionalString(record.displayName);
   const dependencies = readDependencies(record.dependencies);
   const service = readService(record.service);
+  const compatibility = readCompatibility(record.compatibility);
   return {
     schemaVersion: 1,
     id,
     ...(displayName ? { displayName } : {}),
     ...(dependencies ? { dependencies } : {}),
     ...(service ? { service } : {}),
+    ...(compatibility ? { compatibility } : {}),
   };
+}
+
+export function assertPluginProtocolCompatibility(record: InstalledPluginRecord): void {
+  const compatibility = record.manifest.compatibility;
+  const contributions = record.contributions;
+  const checks = [
+    ['eventSink', contributions?.eventSink, compatibility?.contributions.eventSink],
+    ['dashboardApi', contributions?.dashboardApi, compatibility?.contributions.dashboardApi],
+    ['workflowExecutor', contributions?.workflowExecutor, compatibility?.contributions.workflowExecutor],
+  ] as const;
+  for (const [name, contribution, declared] of checks) {
+    if (!contribution && !declared) continue; // manifest v1 legacy plugin
+    if (!compatibility || compatibility.protocolVersion !== 1 || declared !== 1 || contribution?.protocolVersion !== 1) {
+      throw new Error(`plugin_protocol_incompatible:${record.id}:${name}`);
+    }
+  }
 }
 
 export function parsePluginPackageManifest(raw: unknown): PluginPackageManifest {
