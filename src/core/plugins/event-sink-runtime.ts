@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import type { BotConfig } from '../../bot-registry.js';
 import type { DaemonSession } from '../types.js';
@@ -42,7 +42,7 @@ interface PrivateDescriptor {
   transport: 'private-stdio';
   command: string[];
   env?: Record<string, string>;
-  queue?: { maxItems?: number; maxBytes?: number; batchSize?: number; flushMs?: number };
+  queue?: { maxItems?: number; maxBytes?: number; batchSize?: number; maxBatchBytes?: number; flushMs?: number };
   ackTimeoutMs?: number;
 }
 
@@ -85,6 +85,7 @@ export class DurablePluginEventSink {
   private readonly maxItems: number;
   private readonly maxBytes: number;
   private readonly batchSize: number;
+  private readonly maxBatchBytes: number;
   private readonly flushMs: number;
   private readonly ackTimeoutMs: number;
   private readonly spoolDir: string;
@@ -107,6 +108,7 @@ export class DurablePluginEventSink {
     this.maxItems = bounded(q.maxItems, EVENT_SINK_DEFAULT_MAX_ITEMS, EVENT_SINK_MAX_ITEMS);
     this.maxBytes = bounded(q.maxBytes, EVENT_SINK_DEFAULT_MAX_BYTES, EVENT_SINK_MAX_BYTES);
     this.batchSize = bounded(q.batchSize, EVENT_SINK_MAX_BATCH, EVENT_SINK_MAX_BATCH);
+    this.maxBatchBytes = bounded((q as { maxBatchBytes?: number }).maxBatchBytes, 256 * 1024, 1024 * 1024);
     this.flushMs = bounded(q.flushMs, EVENT_SINK_DEFAULT_FLUSH_MS, 5_000);
     this.ackTimeoutMs = bounded(options.descriptor.ackTimeoutMs, 10_000, 60_000);
     this.spawnChild = options.spawnChild ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions) as ChildProcessWithoutNullStreams);
@@ -114,7 +116,7 @@ export class DurablePluginEventSink {
     this.spoolDir = join(options.privateDir, 'spool', safeBotDirectory(options.larkAppId, options.botId));
     assertContained(options.privateDir, this.spoolDir);
     mkdirSync(this.spoolDir, { recursive: true, mode: 0o700 });
-    try { statSync(this.spoolDir).mode; } catch { /* diagnosed by writes */ }
+    chmodSync(this.spoolDir, 0o700);
     this.replaySpool();
   }
 
@@ -157,6 +159,7 @@ export class DurablePluginEventSink {
 
   private writeSpool(event: PendingEvent): string {
     mkdirSync(this.spoolDir, { recursive: true, mode: 0o700 });
+    chmodSync(this.spoolDir, 0o700);
     const finalPath = join(this.spoolDir, this.spoolName(event));
     assertContained(this.spoolDir, finalPath);
     if (existsSync(finalPath)) return finalPath;
@@ -196,7 +199,15 @@ export class DurablePluginEventSink {
     if (!command) throw new Error('plugin_event_sink_command_missing');
     const child = this.spawnChild(command, args, {
       cwd: this.options.runtimeDir,
-      env: { ...process.env, ...(this.options.descriptor.env ?? {}) },
+      // Do not leak the daemon's provider/Lark credentials. Plugins receive
+      // only process-launch essentials plus their own 0600 private descriptor.
+      env: {
+        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+        ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+        ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
+        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+        ...(this.options.descriptor.env ?? {}),
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
     });
@@ -283,8 +294,15 @@ export class DurablePluginEventSink {
     try {
       this.ensureChild();
       if (!this.child?.stdin.writable) throw new Error('plugin_event_sink_child_not_writable');
-      const events = this.queue.splice(0, this.batchSize);
-      this.queuedBytes -= events.reduce((sum, item) => sum + item.bytes, 0);
+      const events: PendingEvent[] = [];
+      let batchBytes = 0;
+      while (events.length < this.batchSize && this.queue.length > 0) {
+        const next = this.queue[0];
+        if (events.length > 0 && batchBytes + next.bytes > this.maxBatchBytes) break;
+        events.push(this.queue.shift()!);
+        batchBytes += next.bytes;
+      }
+      this.queuedBytes -= batchBytes;
       const generation = this.generation;
       const line = `${JSON.stringify({ type: 'events', protocolVersion: 1, generation, events: events.map(event => event.envelope) })}\n`;
       if (Buffer.byteLength(line) > EVENT_SINK_MAX_LINE_BYTES) {
@@ -356,6 +374,7 @@ function readDescriptor(pluginId: string): PrivateDescriptor {
  * plugin defaults: a canary sink runs only where bot.plugins names it. */
 export class PluginEventSinkManager {
   private readonly sinks = new Map<string, DurablePluginEventSink>();
+  private readonly starting = new Map<string, TrustedPluginEventEnvelope[]>();
 
   emitTurnTerminal(
     bot: BotConfig,
@@ -372,23 +391,6 @@ export class PluginEventSinkManager {
       const contribution = registry.plugins[pluginId]?.contributions?.eventSink;
       if (!contribution?.events.includes(eventType)) continue;
       const key = `${pluginId}\0${bot.larkAppId}`;
-      let sink = this.sinks.get(key);
-      if (!sink) {
-        try {
-          sink = new DurablePluginEventSink({
-            pluginId,
-            larkAppId: bot.larkAppId,
-            botId: bot.name ?? bot.larkAppId,
-            descriptor: readDescriptor(pluginId),
-            runtimeDir: pluginRuntimeDir(pluginId),
-            privateDir: pluginPrivateDir(pluginId),
-          });
-          this.sinks.set(key, sink);
-        } catch (error) {
-          logger.error(`[plugin-event-sink:${pluginId}:${bot.larkAppId}] disabled after initialization failure: ${String(error)}`);
-          continue;
-        }
-      }
       const envelope: TrustedPluginEventEnvelope = Object.freeze({
         schemaVersion: 1,
         eventId: randomUUID(),
@@ -407,11 +409,47 @@ export class PluginEventSinkManager {
           ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
         }),
       });
-      sink.enqueue(envelope);
+      const sink = this.sinks.get(key);
+      if (sink) {
+        sink.enqueue(envelope);
+        continue;
+      }
+      // Initialization performs private descriptor/spool filesystem reads, so
+      // never do it on the turn-terminal hot stack. A small bounded bootstrap
+      // queue bridges the single microtask until the real per-Bot queue exists.
+      const pending = this.starting.get(key);
+      if (pending) {
+        if (pending.length < EVENT_SINK_MAX_ITEMS) pending.push(envelope);
+        else logger.error(`[plugin-event-sink:${pluginId}:${bot.larkAppId}] bootstrap queue overflow; event was not silently discarded`);
+        continue;
+      }
+      this.starting.set(key, [envelope]);
+      queueMicrotask(() => {
+        const buffered = this.starting.get(key) ?? [];
+        this.starting.delete(key);
+        try {
+          const started = new DurablePluginEventSink({
+            pluginId,
+            larkAppId: bot.larkAppId,
+            botId: bot.name ?? bot.larkAppId,
+            descriptor: readDescriptor(pluginId),
+            runtimeDir: pluginRuntimeDir(pluginId),
+            privateDir: pluginPrivateDir(pluginId),
+          });
+          this.sinks.set(key, started);
+          for (const item of buffered) started.enqueue(item);
+        } catch (error) {
+          // Initialization failure is loud. The plugin is not allowed to break
+          // the conversation; no untrusted code or network endpoint is used.
+          logger.error(`[plugin-event-sink:${pluginId}:${bot.larkAppId}] initialization failed with ${buffered.length} retained-in-process event(s): ${String(error)}`);
+        }
+      });
     }
   }
 
   async shutdown(timeoutMs = 2_000): Promise<void> {
+    // Let scheduled initializers transfer their bootstrap queues first.
+    await Promise.resolve();
     const sinks = [...this.sinks.values()];
     this.sinks.clear();
     await Promise.allSettled(sinks.map(sink => sink.shutdown(timeoutMs)));
