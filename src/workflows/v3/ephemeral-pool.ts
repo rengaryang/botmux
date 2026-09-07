@@ -79,6 +79,14 @@ export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode
 type RunNodeInternalDeps = Required<Pick<EphemeralPoolDeps, 'factory' | 'workerPath' | 'quiesceMs' | 'cancelGraceMs' | 'manifestPollMs' | 'manifestSettleMs'>> &
   Pick<EphemeralPoolDeps, 'resolveLarkAppSecret'>;
 
+function directProfileHostEnv(snapshot: RunNodeRequest['botSnapshot']): NodeJS.ProcessEnv {
+  if (!snapshot.directCli) return stripPm2GracefulExitMarker(process.env);
+  const always = new Set(['PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'XDG_RUNTIME_DIR']);
+  const denied = new Set(snapshot.envDenylist ?? []);
+  const allowed = new Set([...always, ...(snapshot.envAllowlist ?? [])]);
+  return Object.fromEntries(Object.entries(stripPm2GracefulExitMarker(process.env)).filter(([key]) => allowed.has(key) && !denied.has(key)));
+}
+
 async function runNodeImpl(
   req: RunNodeRequest,
   deps: RunNodeInternalDeps,
@@ -106,7 +114,7 @@ async function runNodeImpl(
   }
   let secret: string | undefined;
   try {
-    secret = await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
+    secret = req.botSnapshot.directCli ? '' : await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
   } catch (err) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     throw err;
@@ -115,7 +123,7 @@ async function runNodeImpl(
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
     return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
   }
-  if (!secret) {
+  if (!req.botSnapshot.directCli && !secret) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'secret_missing');
     return { status: 'fail', manifestPath };
   }
@@ -146,7 +154,7 @@ async function runNodeImpl(
         // "only daemon/dashboard carry the marker" invariant — harmless today
         // (the worker doesn't read the graceful helper and its CLI children go
         // through redactChildEnv), but this keeps the boundary honest.
-        ...stripPm2GracefulExitMarker(process.env),
+        ...directProfileHostEnv(req.botSnapshot),
         ...req.env,
         [GOAL_ENV.V3_MARKER]: '1',
         BOTMUX_WORKFLOW: '1',
@@ -248,8 +256,9 @@ async function runNodeImpl(
     backendType: 'pty' as const,
     prompt: '',
     resume: false,
-    larkAppId: req.botSnapshot.larkAppId,
-    larkAppSecret: secret,
+    larkAppId: req.botSnapshot.directCli ? `local_${req.botSnapshot.executionProfileId ?? 'workflow'}` : req.botSnapshot.larkAppId,
+    larkAppSecret: secret ?? '',
+    apiOnly: req.botSnapshot.directCli === true,
     botName: req.node.bot,
     locale: 'zh' as const,
   };
@@ -464,6 +473,7 @@ async function runNodeImpl(
           status: 'cancelled',
           manifestPath,
           cancelReason,
+        diagnosticReason: 'cancelled',
           sessionInfo: sessionInfo(),
         });
         return;
@@ -472,7 +482,7 @@ async function runNodeImpl(
       const status = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
       const reason = pendingResult?.reason ?? 'worker-exit';
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
-      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
+      resolve({ status, manifestPath, diagnosticReason: reason, sessionInfo: sessionInfo() });
     });
 
     try {
@@ -487,7 +497,12 @@ async function runNodeImpl(
 
 export function buildGoalCommand(req: RunNodeRequest): string {
   const env = GOAL_ENV;
-  return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  const instruction = `Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  // Pi deliberately has no built-in /goal command. Sending `/goal ...` to Pi
+  // is parsed as an unknown command and never starts the agent. Its ordinary
+  // prompt path provides the same environment and filesystem tools; the pool's
+  // stable manifest watcher remains the authoritative completion boundary.
+  return req.botSnapshot.cliId === 'pi' ? instruction : `${GOAL_COMMAND} ${instruction}`;
 }
 
 function defaultWorkerPath(): string {

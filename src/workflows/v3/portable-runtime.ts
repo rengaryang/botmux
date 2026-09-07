@@ -8,6 +8,7 @@
 import type { BotSnapshot, RunNodeRequest } from './contract.js';
 import type { ValidateManifest } from './artifact-contract.js';
 import {
+  executionSelector,
   isGoalNode,
   isLoopNode,
   validateDag,
@@ -163,10 +164,10 @@ export async function runPortableWorkflow(
   };
 
   for (const node of normalizedDag.nodes) {
-    if (isGoalNode(node)) resolveProfile(node.bot);
+    if (isGoalNode(node)) resolveProfile(executionSelector(node));
     if (isLoopNode(node)) {
       for (const bodyNode of node.body.nodes) {
-        resolveProfile(bodyNode.bot ?? node.bot);
+        resolveProfile(executionSelector(bodyNode, executionSelector(node)));
       }
     }
   }

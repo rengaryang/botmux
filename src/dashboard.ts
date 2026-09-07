@@ -111,6 +111,13 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
+import { handleKmObservationApi } from './dashboard/km-observation-api.js';
+import { isKmObservationEnabled } from './services/km/observation-queue.js';
+import { ObservationStore } from './services/km/observation-store.js';
+import { WorkspaceKnowledgeSnapshotCache } from './services/km/workspace-knowledge/snapshot-cache.js';
+import { kmBackendRuntimeStatus } from './services/km/memory-backend-runtime.js';
+import { centralSinkRuntimeStatus, runKmCentralSinkDrill } from './services/km/central-sink-runtime.js';
+import { kmRetentionRuntimeStatus } from './services/km/retention-runtime.js';
 import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
@@ -340,6 +347,7 @@ import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
 import { materializePlugin } from './core/plugins/materializer.js';
+import { dispatchPluginDashboardApi, sendPluginDashboardResult } from './core/plugins/dashboard-api.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
@@ -808,6 +816,16 @@ aggregator.on(sessionPresentation.onEvent);
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
+const workspaceKnowledgeCache = new WorkspaceKnowledgeSnapshotCache(() => [
+  process.cwd(),
+  ...loadBotConfigs().map(bot => effectiveDefaultWorkingDir(bot)),
+  ...aggregator.getSessions().map(session => {
+    const workingDir = (session as unknown as { workingDir?: unknown }).workingDir;
+    return typeof workingDir === 'string' ? workingDir : undefined;
+  }),
+]);
+workspaceKnowledgeCache.start();
+
 const debugTerminalManager = createDebugTerminalManager({
   getActiveToken: currentDashboardToken,
   // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
@@ -3941,6 +3959,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const kmMutation = url.pathname.startsWith('/api/km/') && !['GET', 'HEAD'].includes((req.method ?? 'GET').toUpperCase());
+    if (kmMutation) {
+      if (!requestIdentity) return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+    }
+    if (await handleKmObservationApi(req, res, url, {
+      enabled: isKmObservationEnabled(),
+      actorId: requestIdentity?.userId,
+      dataDir: config.session.dataDir,
+      openStore: () => ObservationStore.open(config.session.dataDir),
+      backendRuntimeStatus: () => kmBackendRuntimeStatus({ dataDir: config.session.dataDir }),
+      centralSinkRuntimeStatus: () => centralSinkRuntimeStatus({ dataDir: config.session.dataDir }),
+      centralSinkDrill: input => runKmCentralSinkDrill({ dataDir: config.session.dataDir, ...input }),
+      retentionRuntimeStatus: () => kmRetentionRuntimeStatus({ dataDir: config.session.dataDir }),
+      workspaceKnowledgeSnapshot: () => workspaceKnowledgeCache.get(),
+      kmReviewQueueSnapshot: () => workspaceKnowledgeCache.getReviewQueue(),
+    })) return;
+
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
       if (!dashboardDevReloadEnabled()) return jsonRes(res, 404, { error: 'dev_reload_disabled' });
       res.writeHead(200, {
@@ -3960,6 +3996,22 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname.startsWith('/api/plugins/')) {
+      const pluginApi = await dispatchPluginDashboardApi({
+        req,
+        url,
+        identity: requestIdentity,
+        csrfAllowed: () => !!requestIdentity && guardControlRequest({
+          headers: req.headers,
+          authSessionId: requestIdentity.authSessionId,
+          tokens: controlCsrfTokens,
+        }).ok,
+      });
+      if (pluginApi.handled) {
+        sendPluginDashboardResult(res, pluginApi);
+        return;
+      }
+    }
     if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
       && await handlePluginManagementApi(req, res, url)) {
       return;
@@ -5867,9 +5919,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // v3 workflow runs. Reads project directly from disk; cancel resolves the
-    // immutable run owner and proxies to that daemon (the dashboard never
-    // writes the v3 journal itself).
+    // v3 workflow runs and execution-profile control plane. Profile mutations
+    // are management writes and require the same CSRF boundary as other
+    // Dashboard control APIs; runtime journals remain daemon-owned.
+    if (url.pathname.startsWith('/api/v3/execution-profiles') && !['GET', 'HEAD'].includes(req.method ?? 'GET')) {
+      if (!requestIdentity) return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+    }
     if (await handleV3RunsApi(req, res, url, {
       runsDir: v3RunsDir(),
       proxyToDaemon,
@@ -7941,6 +7997,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 
 // Graceful shutdown
 function shutdown(): void {
+  workspaceKnowledgeCache.stop();
   codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();

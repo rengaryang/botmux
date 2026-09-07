@@ -37,6 +37,41 @@ export interface PluginMcpContribution {
   privateRef: string;
 }
 
+export type PluginSpiProtocolVersion = 1;
+
+export interface PluginProtocolCompatibility {
+  protocolVersion: PluginSpiProtocolVersion;
+  contributions: {
+    eventSink?: PluginSpiProtocolVersion;
+    dashboardApi?: PluginSpiProtocolVersion;
+    workflowExecutor?: PluginSpiProtocolVersion;
+  };
+}
+
+export interface PluginEventSinkContribution {
+  protocolVersion: PluginSpiProtocolVersion;
+  transport: 'private-stdio';
+  events: string[];
+  queue: { maxItems: number; maxBytes: number; batchSize: number; maxBatchBytes: number; flushMs: number };
+  privateRef: string;
+}
+
+export interface PluginDashboardApiContribution {
+  protocolVersion: PluginSpiProtocolVersion;
+  capability: string;
+  routes: Array<{ method: 'GET' | 'POST'; path: string }>;
+  limits: { requestBytes: number; responseBytes: number };
+}
+
+export interface PluginWorkflowExecutorContribution {
+  protocolVersion: PluginSpiProtocolVersion;
+  mode: 'read-only';
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+  outputMaxBytes: number;
+  privateRef: string;
+}
+
 export interface PluginServiceConfig {
   mode: PluginServiceMode;
 }
@@ -74,6 +109,9 @@ export interface PluginContributions {
   cli?: PluginCliContribution;
   service?: PluginServiceContribution;
   cardActions?: PluginCardActionsContribution;
+  eventSink?: PluginEventSinkContribution;
+  dashboardApi?: PluginDashboardApiContribution;
+  workflowExecutor?: PluginWorkflowExecutorContribution;
 }
 
 /** Installation-time scan result before MCP details are moved to private
@@ -90,6 +128,7 @@ export interface BotmuxPluginManifest {
     plugins?: string[];
   };
   service?: PluginServiceConfig;
+  compatibility?: PluginProtocolCompatibility;
 }
 
 export interface PluginPackageManifest {

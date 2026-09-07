@@ -84,12 +84,22 @@ import {
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
-import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { getSkillFeedbackStore, type TurnCompletionEventPayload } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
+import { observationFromTurnCompletion } from './services/km/observation-producers.js';
+import { drainObservationQueue, enqueueObservation, isKmObservationEnabled } from './services/km/observation-queue.js';
+import { composePromptMemoryForTurn, drainDistillationJobs, enqueueAutomaticDistillation, resolveBoundedTranscriptWindow, runOneDistillationJob } from './services/km/runtime-orchestrator.js';
+import { retrievalQueryHash } from './services/km/prompt-memory.js';
+import { isKmBackendWorkerEnabled, kmBackendWorkerIntervalMs, kmBackendWorkerStartupDelayMs, runKmBackendWorkerOnce } from './services/km/memory-backend-runtime.js';
+import { isKmCentralSinkEnabled, kmCentralSinkIntervalMs, kmCentralSinkStartupDelayMs, runKmCentralSinkOnce } from './services/km/central-sink-runtime.js';
+import { isKmRetentionShadowEnabled, kmRetentionShadowIntervalMs, kmRetentionShadowStartupDelayMs, runKmRetentionShadowOnce } from './services/km/retention-runtime.js';
+import { isKmAutoEvalEnabled, runKmEvalEvolutionOnce } from './services/km/eval-evolution-runtime.js';
+import { isKmShadowQualityEnabled, runKmShadowQualityOnce } from './services/km/shadow-quality-runtime.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { PluginEventSinkManager } from './core/plugins/event-sink-runtime.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -195,6 +205,74 @@ function trustedCallerForTurn(
     ...(senderIsBot === undefined ? {} : { senderType: senderIsBot ? 'bot' as const : 'user' as const }),
   };
 }
+
+function handleDurableTurnCompletionForKm(
+  ds: DaemonSession,
+  payload: TurnCompletionEventPayload,
+  source: string,
+): void {
+  if (!isKmObservationEnabled()) return;
+  const observation = observationFromTurnCompletion(payload);
+  void enqueueObservation({
+    dataDir: config.session.dataDir,
+    event: observation,
+    onResult: result => {
+      if (result.status === 'quarantined') return;
+      const botConfig = getBot(ds.larkAppId).config;
+      const cwd = ds.session.workingDir ?? ds.workingDir;
+      try {
+        const window = resolveBoundedTranscriptWindow({
+          event: observation,
+          cliId: ds.session.cliId ?? botConfig.cliId,
+          cliSessionId: ds.session.cliSessionId,
+          cwd,
+          larkAppId: ds.larkAppId,
+          maxBytes: 262_144,
+        });
+        const kmRetrieval = ds.kmRetrievalTurns?.[payload.turnId];
+        if (window.segments.length > 0 && kmRetrieval?.queryHash) {
+          void import('./services/km/workspace-knowledge/transcript-evidence.js')
+            .then(({ recordTranscriptWorkspaceRetrievalEvidence }) => recordTranscriptWorkspaceRetrievalEvidence({
+              workingDir: cwd,
+              queryHash: kmRetrieval.queryHash,
+              transcriptText: window.segments.map(segment => segment.text).join('\n'),
+              botAppId: ds.larkAppId,
+              sessionId: ds.session.sessionId,
+              turnId: payload.turnId,
+              ...(kmRetrieval.retrievalRunId ? { retrievalRunId: kmRetrieval.retrievalRunId } : {}),
+              userId: payload.requesterSubjectId,
+              source: 'transcript_observation',
+              observedAt: payload.time,
+            }))
+            .then(evidence => {
+              if (evidence.warnings.length) logger.debug(`[km-transcript-evidence:${source}] ${evidence.warnings.join(',')}`);
+            })
+            .catch(error => logger.debug(`[km-transcript-evidence:${source}] ${error instanceof Error ? error.message : String(error)}`));
+        }
+      } catch (error) {
+        logger.debug(`[km-transcript-evidence:${source}] ${error instanceof Error ? error.message : String(error)}`);
+      }
+      void enqueueAutomaticDistillation({
+        dataDir: config.session.dataDir,
+        event: observation,
+        cliId: ds.session.cliId ?? botConfig.cliId,
+        model: ds.session.model ?? botConfig.model,
+        cliSessionId: ds.session.cliSessionId,
+        cwd,
+      })
+        .then(() => runOneDistillationJob({
+          dataDir: config.session.dataDir,
+          cliId: ds.session.cliId ?? botConfig.cliId,
+          model: ds.session.model ?? botConfig.model,
+        }))
+        .catch(error => logger.warn(`[km-distillation:${source}] ${error instanceof Error ? error.message : String(error)}`));
+    },
+    onError: error => logger.warn(
+      `[km-observation:${source}] turn persistence failed turn=${payload.turnId.slice(0, 12)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ),
+  });
+}
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import {
@@ -296,7 +374,7 @@ import {
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, tryHandleInteractiveModelCommand } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -500,6 +578,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
+const pluginEventSinkManager = new PluginEventSinkManager();
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
@@ -18159,6 +18238,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
+    const existingInteractiveDs = activeSessions.get(sessionKey(anchor, larkAppId));
+    if (await tryHandleInteractiveModelCommand({
+      cmd,
+      commandContent,
+      rootId: anchor,
+      messageId: parsed.messageId,
+      invokerOpenId: senderOpenId,
+      ds: existingInteractiveDs,
+      deps: invocationDeps,
+    })) return;
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
@@ -19649,6 +19738,15 @@ async function handleThreadReplyAdmitted(
     const passthroughCliId = existingDs?.session.cliLaunchSnapshot?.cliId
       ?? existingDs?.session.cliId
       ?? getBot(larkAppId).config.cliId;
+    if (await tryHandleInteractiveModelCommand({
+      cmd,
+      commandContent,
+      rootId: anchor,
+      messageId: parsed.messageId,
+      invokerOpenId: threadSenderOpenId,
+      ds: existingDs,
+      deps: invocationDeps,
+    })) return;
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
@@ -19945,6 +20043,57 @@ async function handleThreadReplyAdmitted(
     ?? initialCodexAppMessageContext;
   const codexAppApplicationContext = initialCodexAppApplicationContext;
 
+  const rememberKmRetrievalTurn = (session: DaemonSession, patch?: { retrievalRunId?: string }): string => {
+    const queryHash = retrievalQueryHash({ text: parsed.content, botAppId: larkAppId, userId: senderOpenIdForPrefix });
+    session.kmRetrievalTurns ??= {};
+    const now = Date.now();
+    for (const [turnId, entry] of Object.entries(session.kmRetrievalTurns)) {
+      if (now - entry.recordedAt > 6 * 60 * 60_000) delete session.kmRetrievalTurns[turnId];
+    }
+    session.kmRetrievalTurns[parsed.messageId] = {
+      queryHash,
+      ...(patch?.retrievalRunId ? { retrievalRunId: patch.retrievalRunId } : {}),
+      ...((session.session.workingDir ?? session.workingDir) ? { workingDir: session.session.workingDir ?? session.workingDir } : {}),
+      recordedAt: now,
+    };
+    if (Object.keys(session.kmRetrievalTurns).length > 200) {
+      const oldest = Object.entries(session.kmRetrievalTurns).sort((a, b) => a[1].recordedAt - b[1].recordedAt)[0]?.[0];
+      if (oldest) delete session.kmRetrievalTurns[oldest];
+    }
+    return queryHash;
+  };
+
+  const composePromptMemoryAtBoundary = async (session: DaemonSession): Promise<void> => {
+    const fallbackQueryHash = rememberKmRetrievalTurn(session);
+    try {
+      const result = await composePromptMemoryForTurn({
+        dataDir: config.session.dataDir,
+        botAppId: larkAppId,
+        sessionId: session.session.sessionId,
+        turnId: parsed.messageId,
+        userId: senderOpenIdForPrefix,
+        queryText: parsed.content,
+        promptContent,
+        workingDir: session.session.workingDir ?? session.workingDir,
+      });
+      if (result.queryHash) {
+        rememberKmRetrievalTurn(session, { ...(result.retrievalRunId ? { retrievalRunId: result.retrievalRunId } : {}) });
+      } else if (!session.kmRetrievalTurns?.[parsed.messageId]) {
+        session.kmRetrievalTurns ??= {};
+        session.kmRetrievalTurns[parsed.messageId] = { queryHash: fallbackQueryHash, recordedAt: Date.now() };
+      }
+      if (result.workspaceEvidenceWarnings?.length) {
+        logger.debug(`[km-retrieval-evidence] ${result.workspaceEvidenceWarnings.join(',')}`);
+      }
+      if (result.injected) {
+        promptContent = result.promptContent;
+        logger.info(`[${tag(session)}] KM live prompt-memory injected for turn ${parsed.messageId.substring(0, 12)}`);
+      }
+    } catch (error) {
+      logger.warn(`[km-prompt-memory] ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
   let attachments: LarkAttachment[];
@@ -20005,6 +20154,7 @@ async function handleThreadReplyAdmitted(
   // preparation. Re-check once at the final routing boundary so the oldest
   // surviving follower atomically takes over instead of proceeding unclaimed.
   tryAcquireInitialStartClaim();
+  if (ds) await composePromptMemoryAtBoundary(ds);
 
   // A published worker:null owner is not necessarily ready to refork: its
   // opening turn may still be preparing. Buffer both repo-pending and
@@ -20455,6 +20605,8 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
+    await composePromptMemoryAtBoundary(newDs);
+    newDs.pendingPrompt = promptContent;
     if (newDs.pendingRepo) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
@@ -22242,6 +22394,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
+      // Core-authored projection only. enqueue is synchronous/non-blocking and
+      // the manager rejects stale generations before touching a plugin child.
+      pluginEventSinkManager.emitTurnTerminal(getBot(ds.larkAppId).config, ds, terminal, context);
       // Feedback turn-completion persistence is a synchronous node:sqlite write.
       // Route it through the nonblocking, tracked retry queue so a cross-process
       // write-lock (a `botmux send --response-kind final` subprocess) can never
@@ -22260,6 +22415,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
+          onPersisted: payload => {
+            if (payload) handleDurableTurnCompletionForKm(ds, payload, 'terminal');
+          },
         });
       }
       // Record the failed/interrupted turn for /retry. Best-effort: a persist
@@ -22289,6 +22447,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+    onTurnCompletion(ds, payload, context) {
+      void context;
+      handleDurableTurnCompletionForKm(ds, payload, 'delivery');
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
@@ -22504,6 +22666,107 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     occupancyState = next;
   };
   claimOccupancy();
+
+  let kmDistillationDraining = false;
+  const drainKmDistillation = () => {
+    if (kmDistillationDraining || !isKmObservationEnabled()) return;
+    kmDistillationDraining = true;
+    void drainDistillationJobs({ dataDir: config.session.dataDir, maxJobs: 10 })
+      .catch(error => logger.warn(`[km-distillation-recovery] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmDistillationDraining = false; });
+  };
+  // Startup jitter avoids migration stampedes; the durable SQLite lease in
+  // drainDistillationJobs elects one owner and allows failover across daemons.
+  const kmRecoveryStartupTimer = setTimeout(drainKmDistillation, 2_000 + idx * 750);
+  kmRecoveryStartupTimer.unref?.();
+  const kmDistillationRecoveryTimer = setInterval(drainKmDistillation, 30_000);
+  kmDistillationRecoveryTimer.unref?.();
+  let kmBackendWorkerRunning = false;
+  const runKmBackendWorker = () => {
+    if (kmBackendWorkerRunning || !isKmObservationEnabled() || !isKmBackendWorkerEnabled()) return;
+    kmBackendWorkerRunning = true;
+    void runKmBackendWorkerOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.worker && (result.worker.delivered > 0 || result.worker.retried > 0 || result.worker.quarantined > 0)) {
+          logger.info(`[km-backend-worker] delivered=${result.worker.delivered} retried=${result.worker.retried} quarantined=${result.worker.quarantined}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-backend-worker] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmBackendWorkerRunning = false; });
+  };
+  const kmBackendWorkerStartupTimer = setTimeout(runKmBackendWorker, kmBackendWorkerStartupDelayMs(idx));
+  kmBackendWorkerStartupTimer.unref?.();
+  const kmBackendWorkerTimer = setInterval(runKmBackendWorker, kmBackendWorkerIntervalMs());
+  kmBackendWorkerTimer.unref?.();
+  let kmEvalEvolutionRunning = false;
+  const runKmEvalEvolutionWorker = () => {
+    if (kmEvalEvolutionRunning || !isKmObservationEnabled() || !isKmAutoEvalEnabled()) return;
+    kmEvalEvolutionRunning = true;
+    void runKmEvalEvolutionOnce({ dataDir: config.session.dataDir, maxTargets: 100 })
+      .then(result => {
+        if (result.createdEvalRuns > 0 || result.createdProposals > 0) {
+          logger.info(`[km-eval-evolution] evaluated=${result.createdEvalRuns} proposals=${result.createdProposals}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-eval-evolution] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmEvalEvolutionRunning = false; });
+  };
+  const kmEvalStartupTimer = setTimeout(runKmEvalEvolutionWorker, 5_000 + idx * 750);
+  kmEvalStartupTimer.unref?.();
+  const kmEvalEvolutionTimer = setInterval(runKmEvalEvolutionWorker, 60_000);
+  kmEvalEvolutionTimer.unref?.();
+  let kmRetentionShadowRunning = false;
+  const runKmRetentionShadow = () => {
+    if (kmRetentionShadowRunning || !isKmObservationEnabled() || !isKmRetentionShadowEnabled()) return;
+    kmRetentionShadowRunning = true;
+    void runKmRetentionShadowOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.report) {
+          logger.info(`[km-retention-shadow] eligible=${result.report.totalEligible} slo=${result.report.worstSloState} report=${result.report.reportId}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-retention-shadow] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmRetentionShadowRunning = false; });
+  };
+  const kmRetentionShadowStartupTimer = setTimeout(runKmRetentionShadow, kmRetentionShadowStartupDelayMs(idx));
+  kmRetentionShadowStartupTimer.unref?.();
+  const kmRetentionShadowTimer = setInterval(runKmRetentionShadow, kmRetentionShadowIntervalMs());
+  kmRetentionShadowTimer.unref?.();
+  let kmShadowQualityRunning = false;
+  const runKmShadowQualityWorker = () => {
+    if (kmShadowQualityRunning || !isKmObservationEnabled() || !isKmShadowQualityEnabled()) return;
+    kmShadowQualityRunning = true;
+    void runKmShadowQualityOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.createdComparisons > 0) {
+          logger.info(`[km-shadow-quality] scanned=${result.scannedCases} comparisons=${result.createdComparisons} ready=${result.readinessReady}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-shadow-quality] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmShadowQualityRunning = false; });
+  };
+  const kmShadowQualityStartupTimer = setTimeout(runKmShadowQualityWorker, 8_000 + idx * 750);
+  kmShadowQualityStartupTimer.unref?.();
+  const kmShadowQualityTimer = setInterval(runKmShadowQualityWorker, 60_000);
+  kmShadowQualityTimer.unref?.();
+  let kmCentralSinkRunning = false;
+  const runKmCentralSinkWorker = () => {
+    if (kmCentralSinkRunning || !isKmObservationEnabled() || !isKmCentralSinkEnabled()) return;
+    kmCentralSinkRunning = true;
+    void runKmCentralSinkOnce({ dataDir: config.session.dataDir, holderId: `daemon:${idx}:${process.pid}` })
+      .then(result => {
+        if (result.delivered > 0 || result.retried > 0 || result.quarantined > 0) {
+          logger.info(`[km-central-sink] scanned=${result.scanned} enqueued=${result.enqueued} delivered=${result.delivered} retried=${result.retried} quarantined=${result.quarantined}`);
+        }
+      })
+      .catch(error => logger.warn(`[km-central-sink] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { kmCentralSinkRunning = false; });
+  };
+  const kmCentralSinkStartupTimer = setTimeout(runKmCentralSinkWorker, kmCentralSinkStartupDelayMs(idx));
+  kmCentralSinkStartupTimer.unref?.();
+  const kmCentralSinkTimer = setInterval(runKmCentralSinkWorker, kmCentralSinkIntervalMs());
+  kmCentralSinkTimer.unref?.();
+
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
@@ -23476,6 +23739,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
+    if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
+    clearInterval(kmDistillationRecoveryTimer);
+    if (kmBackendWorkerStartupTimer) clearTimeout(kmBackendWorkerStartupTimer);
+    clearInterval(kmBackendWorkerTimer);
+    if (kmRetentionShadowStartupTimer) clearTimeout(kmRetentionShadowStartupTimer);
+    clearInterval(kmRetentionShadowTimer);
+    if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
+    clearInterval(kmEvalEvolutionTimer);
+    if (kmShadowQualityStartupTimer) clearTimeout(kmShadowQualityStartupTimer);
+    clearInterval(kmShadowQualityTimer);
+    if (kmCentralSinkStartupTimer) clearTimeout(kmCentralSinkStartupTimer);
+    clearInterval(kmCentralSinkTimer);
     clearInterval(docCommentPollTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
@@ -23643,6 +23918,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (drainBudget > 0) {
         const undrained = await drainTurnTerminalQueue(drainBudget);
         if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
+        if (isKmObservationEnabled()) {
+          const kmBudget = remainingBudget();
+          if (kmBudget > 0) {
+            const kmUndrained = await drainObservationQueue(kmBudget);
+            if (kmUndrained > 0) logger.warn(`[km-observation] shutdown drain timed out with ${kmUndrained} pending`);
+          } else {
+            logger.warn('[km-observation] shutdown deadline exhausted before observation drain');
+          }
+        }
       } else {
         logger.error('[turn-completion] shutdown deadline exhausted before drain — in-memory queued turn terminals were NOT persisted and are LOST (they are not yet in the durable store)');
       }
@@ -23656,6 +23940,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         + `leaving feedback queue admission OPEN to avoid refusing a late terminal`,
       );
     }
+    // Plugin children receive only the remaining shared shutdown budget. Any
+    // unacknowledged envelope is atomically moved to its private per-Bot spool.
+    await pluginEventSinkManager.shutdown(remainingBudget());
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
@@ -23703,6 +23990,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   process.on('exit', () => {
     setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
+    if (kmRecoveryStartupTimer) clearTimeout(kmRecoveryStartupTimer);
+    clearInterval(kmDistillationRecoveryTimer);
+    if (kmBackendWorkerStartupTimer) clearTimeout(kmBackendWorkerStartupTimer);
+    clearInterval(kmBackendWorkerTimer);
+    if (kmRetentionShadowStartupTimer) clearTimeout(kmRetentionShadowStartupTimer);
+    clearInterval(kmRetentionShadowTimer);
+    if (kmEvalStartupTimer) clearTimeout(kmEvalStartupTimer);
+    clearInterval(kmEvalEvolutionTimer);
+    if (kmShadowQualityStartupTimer) clearTimeout(kmShadowQualityStartupTimer);
+    clearInterval(kmShadowQualityTimer);
+    if (kmCentralSinkStartupTimer) clearTimeout(kmCentralSinkStartupTimer);
+    clearInterval(kmCentralSinkTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);

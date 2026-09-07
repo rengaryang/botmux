@@ -50,6 +50,9 @@ export interface PluginConfigApi {
 
 export interface PluginCommandContext extends PluginApplyContext {
   args: string[];
+  /** Core-derived session binding. Plugin commands must never infer Bot scope
+   * from mutable environment variables or accept it from command arguments. */
+  trustedContext?: Readonly<{ exactBotId: string; sessionId: string }>;
   api?: Record<string, unknown>;
 }
 

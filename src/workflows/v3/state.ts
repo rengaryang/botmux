@@ -179,6 +179,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
       e.type !== 'runCancelRequested' &&
       e.type !== 'nodeCancelled' &&
       e.type !== 'nodeAttemptDrained' &&
+      e.type !== 'nodeAttemptDrainObserved' &&
       e.type !== 'hostEffectUncertain' &&
       e.type !== 'hostEffectRetryDeferred' &&
       e.type !== 'runCancelled'
@@ -402,6 +403,10 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         }
         break;
       }
+      case 'nodeAttemptDrainObserved':
+        // Audit-only reliability telemetry. It never proves resource closure;
+        // only nodeAttemptDrained / terminal attempt verdicts mutate state.
+        break;
       case 'runCancelRequested':
         // First request wins. A true terminal event committed before it wins
         // instead; requestV3RunCancel normally prevents that combination, but

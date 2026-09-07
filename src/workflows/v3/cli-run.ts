@@ -56,6 +56,7 @@ import {
   type V3ManualCliRunEnvelope,
 } from './run-envelope.js';
 import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
+import { summarizeRunReliability } from './ops-projection.js';
 import {
   createDefaultHostExecutorRegistry,
   createDefaultProviderReconcilers,
@@ -68,6 +69,8 @@ interface V3RunArgs {
   baseDir: string;
   autoApproveGates: boolean;
   maxParallel?: number;
+  perBotParallel?: number;
+  perCliParallel?: number;
 }
 
 /** Default run root: `~/.botmux/v3-runs/<runId>`. */
@@ -147,16 +150,32 @@ function firstRejectOption(wait: GateWait): string | undefined {
   return wait.options.find((opt) => !wait.approveOptions.includes(opt));
 }
 
-function parseArgs(rest: string[]): V3RunArgs {
-  const flagsWithValue = ['--bot', '--working-dir', '--base-dir', '--max-parallel'];
+export function parseV3RunArgs(rest: string[]): V3RunArgs {
+  const flagsWithValue = [
+    '--bot', '--working-dir', '--base-dir', '--max-parallel',
+    '--per-bot-parallel', '--per-cli-parallel',
+  ];
   const dagPath = firstPositional(rest, flagsWithValue);
-  if (!dagPath) {
-    throw new Error('用法: botmux v3 run <dag.json> [--bot <larkAppId|name>] [--working-dir <dir>] [--base-dir <dir>] [--max-parallel <n>] [--yes]');
+  const usage = '用法: botmux v3 run <dag.json> [--bot <larkAppId|name>] [--working-dir <dir>] [--base-dir <dir>] [--max-parallel <n>] [--per-bot-parallel <n>] [--per-cli-parallel <n>] [--yes]';
+  if (!dagPath) throw new Error(usage);
+
+  const positiveInteger = (flag: string): number | undefined => {
+    const raw = argValue(rest, flag);
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`${flag} 必须是正整数，收到 "${raw}"`);
+    }
+    return value;
+  };
+  const maxParallel = positiveInteger('--max-parallel');
+  const perBotParallel = positiveInteger('--per-bot-parallel');
+  const perCliParallel = positiveInteger('--per-cli-parallel');
+  if (maxParallel !== undefined && perBotParallel !== undefined && perBotParallel > maxParallel) {
+    throw new Error('--per-bot-parallel 不能大于 --max-parallel');
   }
-  const maxParallelRaw = argValue(rest, '--max-parallel');
-  const maxParallel = maxParallelRaw ? Number(maxParallelRaw) : undefined;
-  if (maxParallel !== undefined && (!Number.isInteger(maxParallel) || maxParallel < 1)) {
-    throw new Error(`--max-parallel 必须是正整数，收到 "${maxParallelRaw}"`);
+  if (maxParallel !== undefined && perCliParallel !== undefined && perCliParallel > maxParallel) {
+    throw new Error('--per-cli-parallel 不能大于 --max-parallel');
   }
   return {
     dagPath: resolve(dagPath),
@@ -165,6 +184,8 @@ function parseArgs(rest: string[]): V3RunArgs {
     baseDir: argValue(rest, '--base-dir') ? resolve(argValue(rest, '--base-dir')!) : defaultBaseDir(),
     autoApproveGates: rest.includes('--yes') || rest.includes('-y'),
     maxParallel,
+    perBotParallel,
+    perCliParallel,
   };
 }
 
@@ -182,6 +203,21 @@ function printOutcome(runDir: string): void {
       const ge = e as any;
       console.log(`  🛑 ${ge.nodeId}  gate → ${ge.resolution} (by ${ge.by})`);
     }
+  }
+  const reliability = summarizeRunReliability(events);
+  if (
+    reliability.openAttempts > 0 ||
+    reliability.timeoutFailures > 0 ||
+    reliability.orphanRecoveries > 0 ||
+    reliability.drainObservations > 0
+  ) {
+    console.log(`\n── 可靠性诊断 ──`);
+    console.log(`  attempts: dispatched=${reliability.dispatchedAttempts}, completed=${reliability.completedAttempts}, open=${reliability.openAttempts}`);
+    console.log(`  timeout=${reliability.timeoutFailures}, orphanRecovery=${reliability.orphanRecoveries}, orphanRate=${reliability.orphanRecoveryRate.toFixed(3)}`);
+    if (reliability.signals.sigint || reliability.signals.sigkill) {
+      console.log(`  drain signals: SIGINT=${reliability.signals.sigint}, SIGKILL=${reliability.signals.sigkill}`);
+    }
+    for (const diagnostic of reliability.diagnostics) console.log(`  - ${diagnostic}`);
   }
 }
 
@@ -295,7 +331,7 @@ export function authorizeManualCliRun(opts: AuthorizeManualCliRunOptions): Autho
  */
 export async function cmdV3(sub: string, rest: string[]): Promise<void> {
   if (sub !== 'run') {
-    console.error(`未知子命令: ${sub || '(空)'}\n用法: botmux v3 run <dag.json> [--bot ...] [--working-dir ...] [--base-dir ...] [--yes]`);
+    console.error(`未知子命令: ${sub || '(空)'}\n用法: botmux v3 run <dag.json> [--bot ...] [--working-dir ...] [--base-dir ...] [--max-parallel <n>] [--per-bot-parallel <n>] [--per-cli-parallel <n>] [--yes]`);
     process.exit(1);
   }
 
@@ -308,7 +344,7 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
 
   let args: V3RunArgs;
   try {
-    args = parseArgs(rest);
+    args = parseV3RunArgs(rest);
   } catch (err) {
     console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
@@ -391,6 +427,8 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     authorizedArtifacts: true,
     frozenBotSnapshots,
     ...(args.maxParallel ? { globalConcurrency: args.maxParallel } : {}),
+    ...(args.perBotParallel ? { perBotConcurrency: args.perBotParallel } : {}),
+    ...(args.perCliParallel ? { perCliConcurrency: args.perCliParallel } : {}),
   };
 
   const defaultBot = resolveBotConfig(args.botSelector, bots);

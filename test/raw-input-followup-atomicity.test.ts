@@ -265,7 +265,7 @@ describe('worker command-line write mutex', () => {
     expect(serialized).toContain('commandLineWritesPending += 1');
     expect(serialized).toContain('await previous');
     expect(serialized).toContain('runAmbiguousSubmissionTransaction(');
-    expect(serialized).toContain('() => sendRawCommandLine(be, content)');
+    expect(serialized).toContain('() => sendRawCommandLine(be, content, submission)');
     expect(serialized).toContain('beforeWrite');
     expect(serialized).toContain('release()');
   });
@@ -274,64 +274,42 @@ describe('worker command-line write mutex', () => {
 describe('worker sendRawCommandLine helper', () => {
   const helper = caseRegion(rawWriterSrc, 'export async function writeRawCommandLine', 2200);
 
-  it('generic CLIs: literal text → 200ms beat → Enter in order (slash-picker safe)', () => {
+  it('generic CLIs: literal text → 200ms beat → bounded submit helper in order', () => {
     const textIdx = helper.indexOf('sendText(content)');
     expect(textIdx).toBeGreaterThanOrEqual(0);
-    // Anchor the beat/Enter lookups AFTER the text write so the CoCo branch's own
-    // 200ms beat (which precedes the generic path) can't be mistaken for this one.
+    const rejectionIdx = helper.indexOf('=== false) return false', textIdx);
     const beatIdx = helper.indexOf('delay(beatMs)', textIdx);
-    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", beatIdx);
-    expect(beatIdx).toBeGreaterThan(textIdx);
-    expect(enterIdx).toBeGreaterThan(beatIdx);
+    const submitIdx = helper.indexOf('return submitSpecialKeys()', beatIdx);
+    expect(rejectionIdx).toBeGreaterThan(textIdx);
+    expect(beatIdx).toBeGreaterThan(rejectionIdx);
+    expect(submitIdx).toBeGreaterThan(beatIdx);
   });
 
-  it('CoCo: types char-by-char (throttled) before a single Enter (paste-coalescing safe)', () => {
+  it('CoCo: types char-by-char before the same bounded submit helper', () => {
     const cocoIdx = helper.indexOf('opts.coco');
     expect(cocoIdx, 'CoCo branch present').toBeGreaterThanOrEqual(0);
     const genericTextIdx = helper.indexOf('sendText(content)');
-    // The CoCo branch fully precedes the generic one-shot path.
-    expect(cocoIdx).toBeLessThan(genericTextIdx);
-    // Per-char keystrokes spaced by the throttle — a one-shot write coalesces into
-    // a paste on CoCo, which skips command mode + the slash picker.
-    const charIdx = helper.indexOf('sendText(ch)', cocoIdx);
-    const throttleIdx = helper.indexOf('opts.cocoThrottleMs', cocoIdx);
-    expect(charIdx).toBeGreaterThan(cocoIdx);
-    expect(charIdx).toBeLessThan(genericTextIdx);
-    expect(throttleIdx).toBeGreaterThan(cocoIdx);
-    // Exactly one Enter, after the beat (a stray 2nd Enter would confirm a /model
-    // selector pick); the branch returns immediately after.
-    const cocoEnterIdx = helper.indexOf("sendSpecialKeys('Enter')", throttleIdx);
-    const returnIdx = helper.indexOf("return sendSpecialKeys('Enter') !== false", throttleIdx);
-    expect(cocoEnterIdx).toBeGreaterThan(throttleIdx);
-    expect(cocoEnterIdx).toBeLessThan(genericTextIdx);
-    expect(returnIdx).toBeGreaterThan(throttleIdx);
-    expect(cocoEnterIdx).toBeGreaterThan(returnIdx);
-    expect(returnIdx).toBeLessThan(genericTextIdx);
-  });
-
-  it('fails before Enter when a backend explicitly rejects the generic text write', () => {
-    const textIdx = helper.indexOf('sendText(content)');
-    const rejectionIdx = helper.indexOf('=== false) return false', textIdx);
-    const beatIdx = helper.indexOf('delay(beatMs)', textIdx);
-    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", textIdx);
-
-    expect(helper.slice(textIdx - 30, rejectionIdx + 30)).toContain('=== false');
-    expect(rejectionIdx).toBeGreaterThan(textIdx);
-    expect(rejectionIdx).toBeLessThan(beatIdx);
-    expect(rejectionIdx).toBeLessThan(enterIdx);
-  });
-
-  it('stops CoCo typing immediately on rejection and also checks the submit key', () => {
-    const cocoIdx = helper.indexOf('opts.coco');
     const charIdx = helper.indexOf('sendText(ch)', cocoIdx);
     const charRejectionIdx = helper.indexOf('=== false) return false', charIdx);
     const throttleIdx = helper.indexOf('opts.cocoThrottleMs', charIdx);
-    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", throttleIdx);
-
-    expect(helper.slice(charIdx - 30, charRejectionIdx + 30)).toContain('=== false');
+    const submitIdx = helper.indexOf('return submitSpecialKeys()', throttleIdx);
+    expect(cocoIdx).toBeLessThan(genericTextIdx);
+    expect(charIdx).toBeGreaterThan(cocoIdx);
     expect(charRejectionIdx).toBeGreaterThan(charIdx);
     expect(charRejectionIdx).toBeLessThan(throttleIdx);
-    expect(enterIdx).toBeGreaterThan(throttleIdx);
+    expect(submitIdx).toBeGreaterThan(throttleIdx);
+    expect(submitIdx).toBeLessThan(genericTextIdx);
+  });
+
+  it('bounds submit presses and checks every Enter result', () => {
+    const countIdx = helper.indexOf('opts.submitCount === 2 ? 2 : 1');
+    const loopIdx = helper.indexOf('index < submitCount', countIdx);
+    const enterIdx = helper.indexOf("sendSpecialKeys!('Enter') === false", loopIdx);
+    const intervalIdx = helper.indexOf('delay(submitIntervalMs)', enterIdx);
+    expect(countIdx).toBeGreaterThanOrEqual(0);
+    expect(loopIdx).toBeGreaterThan(countIdx);
+    expect(enterIdx).toBeGreaterThan(loopIdx);
+    expect(intervalIdx).toBeGreaterThan(enterIdx);
   });
 });
 
@@ -519,6 +497,52 @@ describe('raw command backend acceptance', () => {
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(delay).toHaveBeenCalledWith(7);
     expect(calls.at(-1)).toBe('sendSpecialKeys:Enter');
+  });
+
+  it('can confirm TUI autocomplete and then submit with two bounded Enter presses', async () => {
+    const calls: string[] = [];
+    const sendText = vi.fn((text: string) => { calls.push(`text:${text}`); return true; });
+    const sendSpecialKeys = vi.fn((key: string) => { calls.push(`key:${key}`); return true; });
+    const delay = vi.fn(async (ms: number) => { calls.push(`delay:${ms}`); });
+
+    await expect(writeRawCommandLine({
+      write: vi.fn(), sendText, sendSpecialKeys,
+    }, '/model provider/model', {
+      submitCount: 2,
+      submitIntervalMs: 300,
+      delay,
+    })).resolves.toBe(true);
+
+    expect(calls).toEqual([
+      'text:/model provider/model',
+      'delay:200',
+      'key:Enter',
+      'delay:300',
+      'key:Enter',
+    ]);
+  });
+
+  it('keeps ordinary raw commands on one Enter by default', async () => {
+    const sendText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    await expect(writeRawCommandLine({
+      write: vi.fn(), sendText, sendSpecialKeys,
+    }, '/compact', { delay: immediateDelay })).resolves.toBe(true);
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when the second Enter is rejected', async () => {
+    const sendText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(false);
+    await expect(writeRawCommandLine({
+      write: vi.fn(), sendText, sendSpecialKeys,
+    }, '/model provider/model', {
+      submitCount: 2,
+      delay: immediateDelay,
+    })).resolves.toBe(false);
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(2);
   });
 
   it('fails closed when the text write is rejected', async () => {

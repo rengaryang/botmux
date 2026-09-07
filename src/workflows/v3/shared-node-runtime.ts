@@ -28,6 +28,7 @@ import {
   isHostNode,
   isLoopNode,
   loopInstanceId,
+  executionSelector,
   validateDag,
   type V3Dag,
   type V3InputRef,
@@ -106,6 +107,7 @@ import {
 import type {
   AttemptLeaseAcquisition,
   AttemptLeaseBinding,
+  AttemptLeaseDrainDiagnostic,
   AttemptLeaseProvider,
   ExecutionContextSnapshot,
   GateResolver,
@@ -688,12 +690,12 @@ export async function runWorkflow(
     botSnapshots.set(key, deps.resolveBotSnapshot(bot));
   };
   for (const node of dag.nodes) {
-    if (isGoalNode(node)) freezeBot(node.bot);
+    if (isGoalNode(node)) freezeBot(executionSelector(node));
     if (isHostNode(node) && !deps.hostExecutors?.has(node.executor)) {
       throw new Error(`v3 runtime: host executor "${node.executor}" is not registered`);
     }
     if (isLoopNode(node)) {
-      for (const b of node.body.nodes) freezeBot(b.bot ?? node.bot);
+      for (const b of node.body.nodes) freezeBot(executionSelector(b, executionSelector(node)));
     }
   }
 
@@ -1029,7 +1031,8 @@ export async function runWorkflow(
           if (!a.instanceId) throw new Error(`v3 runtime: host node "${node.id}" has no runtime instance`);
           if (startHost(node, events, a.instanceId)) startedThisTick++;
         } else {
-          const botKey = node.bot ?? '';
+          const inherited = a.loop ? executionSelector(nodesById.get(a.loop.loopId)!) : undefined;
+          const botKey = executionSelector(node, inherited) ?? '';
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
@@ -1100,6 +1103,7 @@ export async function runWorkflow(
 
   /** Atomically turn a direct AbortSignal into the durable cancel protocol. */
   function requestRuntimeCancellation(): void {
+    const cancellationReason = runtimeCancellationReason();
     withJournalMutationSync(journalPath, ({ events, append }) => {
       const snap = materialize([...events]);
       if (isTrueRunTerminal(snap.runStatus) || snap.runStatus === 'cancelling') return;
@@ -1107,8 +1111,25 @@ export async function runWorkflow(
         type: 'runCancelRequested',
         cancelRequestId: `cancel-${randomUUID()}`,
         by: 'runtime-signal',
+        ...(cancellationReason ? { reason: cancellationReason } : {}),
       }, { durable: true });
     });
+  }
+
+  function runtimeCancellationReason(): string | undefined {
+    const reason = opts.cancelSignal?.reason as unknown;
+    if (typeof reason === 'object' && reason !== null) {
+      const kind = (reason as { kind?: unknown }).kind;
+      if (kind === 'goalCliTimeout') return 'goal-cli-timeout';
+      if (kind === 'goalCliSignal') {
+        const signal = (reason as { signal?: unknown }).signal;
+        return signal === 'SIGINT' || signal === 'SIGTERM'
+          ? `goal-cli-${signal.toLowerCase()}`
+          : 'goal-cli-signal';
+      }
+      if (kind === 'run') return 'run-cancel-request';
+    }
+    return opts.cancelSignal?.aborted ? 'runtime-signal' : undefined;
   }
 
   /** Re-derive and publish a terminal only while holding the journal lock and
@@ -1354,6 +1375,43 @@ export async function runWorkflow(
     });
   }
 
+  function appendDrainObservedIfChanged(
+    attempt: V3OpenWorkerAttempt,
+    drainReason: AttemptDrainReason,
+    diagnostic: AttemptLeaseDrainDiagnostic | undefined,
+  ): void {
+    if (!diagnostic) return;
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const last = [...events].reverse().find((
+        event,
+      ): event is StoredEvent & Extract<V3Event, { type: 'nodeAttemptDrainObserved' }> =>
+        event.type === 'nodeAttemptDrainObserved' &&
+        event.nodeId === attempt.nodeId &&
+        event.instanceId === attempt.instanceId &&
+        event.attemptId === attempt.attemptId &&
+        event.reason === drainReason);
+      if (
+        last?.status === diagnostic.status &&
+        last.leaseReason === diagnostic.reason &&
+        last.signal === diagnostic.signal &&
+        last.workerPid === diagnostic.workerPid &&
+        last.workerProcStart === diagnostic.workerProcStart
+      ) return;
+      append({
+        type: 'nodeAttemptDrainObserved',
+        nodeId: attempt.nodeId,
+        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+        attemptId: attempt.attemptId,
+        reason: drainReason,
+        status: diagnostic.status,
+        ...(diagnostic.reason ? { leaseReason: diagnostic.reason } : {}),
+        ...(diagnostic.signal ? { signal: diagnostic.signal } : {}),
+        ...(diagnostic.workerPid !== undefined ? { workerPid: diagnostic.workerPid } : {}),
+        ...(diagnostic.workerProcStart ? { workerProcStart: diagnostic.workerProcStart } : {}),
+      });
+    });
+  }
+
   type ExternalDrainMode =
     | { kind: 'runCancellation'; cancelRequestId: string }
     | { kind: 'quiescence'; attemptIds: ReadonlySet<string>; reason: AttemptDrainReason };
@@ -1414,6 +1472,7 @@ export async function runWorkflow(
         allDrained = false;
         continue;
       }
+      appendDrainObservedIfChanged(attempt, drainReason, drain.diagnostic);
       if (drain.status === 'closed') {
         if (!recordClosed(attempt, drain.finalizeAfterProof)) allDrained = false;
       } else {
@@ -2589,7 +2648,10 @@ export async function runWorkflow(
       env,
       ...(opts.chatBinding ? { chatBinding: opts.chatBinding } : {}),
       workerFence: leaseAcquisition.hostToken as RunNodeRequest['workerFence'],
-      timeoutMs: (node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC) * 1000,
+      timeoutMs: Math.min(
+        node.timeoutSec ?? effSnap.timeoutDefaultSec ?? DEFAULT_NODE_TIMEOUT_SEC,
+        effSnap.timeoutMaxSec ?? node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC,
+      ) * 1000,
       cancelSignal: controller.signal,
       // Worker terminal is ready mid-run → stamp nodeSessionReady so the
       // dashboard can attach to the LIVE terminal.  Sync appendEvent (no await
@@ -2749,7 +2811,11 @@ export async function runWorkflow(
         let errorCode: string | undefined;
         let selfReportedFail = false;
         let retryable: boolean | undefined;
-        if (!verdict.ok) {
+        if (result.diagnosticReason === 'timeout') {
+          errorClass = 'timeout';
+          errorCode = 'NODE_TIMEOUT';
+          message = `worker timed out after ${req.timeoutMs}ms`;
+        } else if (!verdict.ok) {
           // Manifest missing / malformed.  If the process itself also failed,
           // the worker crash is the root cause; otherwise it's a bad manifest.
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';

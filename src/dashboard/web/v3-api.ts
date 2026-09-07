@@ -1,7 +1,24 @@
 import type { RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
 import type { V3RunStatus } from '../../workflows/v3/state.js';
+import type { WorkflowExecutionProfile } from '../../workflows/v3/execution-profile-store.js';
+import type { WorkflowProfileRecommendation } from '../../workflows/v3/model-recommender.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 export type V3Fetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+export interface WorkflowModelChoice {
+  value: string;
+  provider?: string;
+  model: string;
+  label: string;
+}
+
+export interface WorkflowModelChoices {
+  models: string[];
+  choices: WorkflowModelChoice[];
+  source: 'static' | 'live';
+  detectedAt?: number;
+}
 
 export interface V3RunDetailOk {
   ok: true;
@@ -27,6 +44,33 @@ export type V3RunCancelResult =
     status: number;
     error: string;
   };
+
+export async function fetchWorkflowModelChoices(cli: string, fetcher: V3Fetch = fetch): Promise<WorkflowModelChoices> {
+  const response = await fetcher(`/api/cli-options/models?key=${encodeURIComponent(cli)}`);
+  if (!response.ok) return { models: [], choices: [], source: 'static' };
+  const body = await response.json() as Partial<WorkflowModelChoices>;
+  const models = Array.isArray(body.models) ? body.models.filter((item): item is string => typeof item === 'string') : [];
+  const choices = Array.isArray(body.choices) ? body.choices.filter((item): item is WorkflowModelChoice => Boolean(item) && typeof item.value === 'string' && typeof item.model === 'string') : models.map(value => ({ value, model: value, label: value }));
+  return { models, choices, source: body.source === 'live' ? 'live' : 'static', ...(typeof body.detectedAt === 'number' ? { detectedAt: body.detectedAt } : {}) };
+}
+
+export async function fetchWorkflowExecutionProfiles(goal = '', fetcher: V3Fetch = fetch): Promise<{ profiles: WorkflowExecutionProfile[]; recommendations: WorkflowProfileRecommendation[] }> {
+  const response = await fetcher(`/api/v3/execution-profiles?goal=${encodeURIComponent(goal)}`);
+  if (!response.ok) return { profiles: [], recommendations: [] };
+  return response.json() as Promise<{ profiles: WorkflowExecutionProfile[]; recommendations: WorkflowProfileRecommendation[] }>;
+}
+
+export async function saveWorkflowExecutionProfile(profile: Partial<WorkflowExecutionProfile>, fetcher: V3Fetch = fetch): Promise<WorkflowExecutionProfile> {
+  const response = await fetcher('/api/v3/execution-profiles', { method: 'PUT', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() }, body: JSON.stringify(profile) });
+  const body = await response.json() as { profile?: WorkflowExecutionProfile; error?: string };
+  if (!response.ok || !body.profile) throw new Error(body.error ?? `http_${response.status}`);
+  return body.profile;
+}
+
+export async function disableWorkflowExecutionProfile(profileId: string, fetcher: V3Fetch = fetch): Promise<void> {
+  const response = await fetcher(`/api/v3/execution-profiles/${encodeURIComponent(profileId)}/disable`, { method: 'POST', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() }, body: '{}' });
+  if (!response.ok) throw new Error(`http_${response.status}`);
+}
 
 export async function fetchV3Runs(fetcher: V3Fetch = fetch): Promise<RunSummary[]> {
   const response = await fetcher('/api/v3/runs');

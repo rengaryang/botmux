@@ -503,11 +503,18 @@ export class PluginMcpGateway {
   private trustedTurnMeta(): Record<string, unknown> | undefined {
     const identity = this.trustedTurnIdentity?.();
     const caller = identity?.caller;
-    if (!caller && !identity?.turnId) return undefined;
+    // The gateway strips every caller-supplied botmux* field before injecting
+    // this object. Subject and exact Bot scope are both derived by Core.
+    const subject = caller?.requestUserOpenId ?? caller?.requestUserUnionId;
+    const exactBotId = caller?.requestLarkAppId;
+    if (!subject || !exactBotId) return undefined;
     return {
+      subject,
+      exactBotId,
+      scopes: Object.freeze(['observability.read']),
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
-      ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+      requestLarkAppId: exactBotId,
       // Provenance travels with the identity so a plugin can tell "a human just
       // asked" from "a scheduled task is running as them". Deliberately NOT
       // mirrored into the `x-botmux-trusted-*` HTTP headers: those go to every

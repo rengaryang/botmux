@@ -25,9 +25,10 @@ fixed paths:
 | Dashboard | `src/dashboard/` | `dist/dashboard/index.js` |
 | Host Service | `src/service/` | `dist/service/index.js` |
 
-There is currently no general worker/daemon hook contribution. Put long-running
-processes in a Host Service, Agent tools in MCP or a Skill, and operational
-entry points in CLI commands.
+There is no arbitrary worker/daemon hook. P0 instead defines three narrow,
+versioned SPI descriptors: an event sink, a Dashboard API, and a read-only
+workflow executor. Put all product-specific policy and behavior in the plugin;
+the Core only validates, bounds, and transports these contracts.
 
 Installation and enablement are separate operations:
 
@@ -129,6 +130,19 @@ Restrict `files` to `dist/` and inspect `npm pack --dry-run` before publishing.
 npm may still include root files such as `package.json`, README, and LICENSE
 automatically, so those files must not contain secrets either.
 
+A plugin using the P0 SPI must declare the hard protocol gate:
+
+```json
+"compatibility": {
+  "protocolVersion": 1,
+  "contributions": { "eventSink": 1, "dashboardApi": 1, "workflowExecutor": 1 }
+}
+```
+
+The declaration and fixed-path descriptor must both exist and use protocol v1.
+Install and enable fail closed on a missing, unknown, or mismatched version.
+Legacy manifest-v1 plugins that do not use these contributions remain valid.
+
 `botmux.dependencies.plugins` contains Plugin IDs only; version ranges are not
 supported. Before the current plugin can be enabled, every dependency must be
 installed and enabled in the same machine-default or Bot scope. Botmux also
@@ -136,6 +150,23 @@ refuses to disable or uninstall a plugin while another enabled plugin depends on
 it.
 
 ## Develop contribution types
+
+### Protocol-v1 SPI contributions
+
+Descriptors are JSON at `dist/event-sink/index.json`,
+`dist/dashboard-api/index.json`, and `dist/workflow-executor/index.json`.
+
+- **eventSink** uses only `private-stdio`, an allowlist of lifecycle events, and
+  bounded defaults: 1,000 queued items, batches of 25, and 256 KiB per batch.
+- **dashboardApi** declares one allowlisted capability, only `GET`/`POST` routes
+  below `/api/plugins/<id>/`, and defaults of 64 KiB request / 1 MiB response.
+- **workflowExecutor** must be `read-only`, declares object input/output JSON
+  schemas, and defaults to a 1 MiB output limit.
+
+Executable commands for event sinks and workflow executors are copied to
+mode-0600 plugin-private descriptors. The public registry contains only bounded
+metadata and `privateRef`; it never contains commands, environment secrets,
+headers, or arbitrary executable paths.
 
 ### CLI commands
 
@@ -597,6 +628,24 @@ The available verbs are `list`, `init`, `install`, `uninstall`, `enable`,
 `disable`, `emit`, and `service`. `emit` is a legacy Codex Notifier
 compatibility entry, not a general Plugin event or daemon-hook contribution.
 Treat `botmux plugin --help` as the final source of truth.
+
+## Dashboard API and Workflow Executor runtime
+
+Core dispatches Dashboard API contributions only after the existing management authentication boundary. Plugins may declare only exact `GET` / `POST /api/plugins/<id>/...` routes. Core enforces method/path, request and response byte limits, capability, CSRF, and exact-Bot enablement, then injects only a frozen trusted-principal DTO. Raw HTTP requests, cookies, and the Dashboard management token never cross the plugin boundary. Public DTOs recursively reject credential fields and absolute host paths; schema mismatches, route collisions, and missing handlers fail closed.
+
+Workflow Executor v1 accepts named read-only queries only. Before dispatch, Core freezes plugin id/version/protocol, the QuerySpec digest, principal, exact Bot, scope, timeout, and output limit. Execution rechecks installation, version, protocol, and exact-Bot enablement. Core uses `spawn(..., shell:false)`, rejects shell entrypoints and arbitrary SQL text, and exposes run-relative create-or-verify attempt sidecars/results for v3 journal/retry/recovery integration. Cancellation terminates the subprocess through `AbortSignal`; output remains subject to byte limits, safe-DTO validation, and the declared output schema.
+
+## Threat model
+
+The Core treats plugin packages as untrusted input at install/enable boundaries,
+not as a sandbox after code starts. Protocol gates prevent silent downgrade;
+allowlisted events/routes/capabilities reduce confused-deputy surfaces; byte,
+queue, and batch limits bound memory amplification; private descriptors prevent
+registry readers from learning commands or credentials. The workflow executor
+is read-only by contract and is not a generic host-command hook. These controls
+do not make publisher code safe: npm lifecycle scripts and enabled plugin code
+still execute with the installing user's authority. Operators must pin and
+audit trusted packages, and plugins must keep secrets in private configuration.
 
 ## Security and release checklist
 

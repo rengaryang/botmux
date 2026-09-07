@@ -45,6 +45,7 @@ describe('plugin session manifest', () => {
 
     expect(first).toMatchObject({
       botId: 'app-1',
+      exactBotId: 'app-1',
       source: 'machine-default',
       pluginIds: ['chrome', 'gitlab'],
     });
@@ -61,7 +62,7 @@ describe('plugin session manifest', () => {
       global: { plugins: ['chrome'] },
       dataDir,
     });
-    expect(manifest).toMatchObject({ botId: 'review', source: 'bot', pluginIds: ['chrome'] });
+    expect(manifest).toMatchObject({ botId: 'review', exactBotId: 'app-2', source: 'bot', pluginIds: ['chrome'] });
   });
 
   it('rejects traversal-like session ids', () => {

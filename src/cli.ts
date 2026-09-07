@@ -13587,6 +13587,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'workflow',
     'template',
     'v3',
+    'km',
   ]);
   const rootDenied = !allowedRoot.has(command);
   const mcpSub = command === 'mcp' ? (process.argv[3] ?? '') : '';
@@ -13626,6 +13627,11 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
   const v3Sub = command === 'v3' ? (process.argv[3] ?? '') : '';
+  const kmSub = command === 'km' ? (process.argv[3] ?? '') : '';
+  const kmDenied = command === 'km' && !(
+    kmSub === 'ops-readiness' ||
+    (kmSub === 'backfill' && process.argv.slice(4).includes('--dry-run'))
+  );
   const workflowMutation =
     (command === 'workflow' && blockedWorkflowSub.has(workflowSub)) ||
     (command === 'template' && blockedTemplateSub.has(templateSub)) ||
@@ -13633,6 +13639,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
   if (
     rootDenied ||
     mcpDenied ||
+    kmDenied ||
     (isSchedule && blockedScheduleSub.has(scheduleSub)) ||
     workflowMutation
   ) {
@@ -13648,11 +13655,15 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
             ? templateSub
             : command === 'v3'
               ? v3Sub
+              : command === 'km'
+                ? kmSub
               : '';
     const guidance = mcpDenied
       ? 'Only the botmux-owned Plugin MCP gateway bootstrap (`mcp serve`) is available inside a workflow subagent.'
       : workflowMutation
         ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
+        : kmDenied
+          ? 'Only local, offline KM introspection is available inside a workflow subagent.'
         : rootDenied
           ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
           : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
@@ -14362,6 +14373,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
   const registry = await loadPluginRegistryForCommand();
   const record = registry.plugins[command.pluginId];
   const { pluginRuntimeDir } = await import('./core/plugins/paths.js');
+  const sessionManifest = sessionId ? readSessionPluginManifest(sessionId) : null;
   const result = await command.run({
     runtime: 'cli',
     pluginId: command.pluginId,
@@ -14370,6 +14382,9 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
     version: record?.version ?? '0.0.0',
     manifest: record?.manifest ?? { schemaVersion: 1, id: command.pluginId },
     args: commandArgs,
+    ...(sessionId && sessionManifest?.exactBotId
+      ? { trustedContext: Object.freeze({ exactBotId: sessionManifest.exactBotId, sessionId }) }
+      : {}),
   });
   if (typeof result === 'string') console.log(result);
   if (typeof result === 'number') process.exitCode = result;
@@ -14551,10 +14566,136 @@ switch (command) {
   }
   case 'skill': {
     const { runSkillSessionCommand } = await import('./core/skills/cli-session-command.js');
-    const result = runSkillSessionCommand(process.argv.slice(3));
+    const skillArgs = process.argv.slice(3);
+    const result = runSkillSessionCommand(skillArgs);
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exitCode = result.code;
+    // KM observation: a `skill show|read` executed inside a live CLI session is
+    // observed evidence the model actually pulled skill content. Failures of
+    // this telemetry must never break the command output above.
+    if ((skillArgs[0] === 'show' || skillArgs[0] === 'read') && skillArgs[1]) {
+      try {
+        const { isKmObservationEnabled, enqueueObservation } = await import('./services/km/observation-queue.js');
+        if (isKmObservationEnabled()) {
+          const { observationFromSkillCommand } = await import('./services/km/observation-producers.js');
+          const { config } = await import('./config.js');
+          const botAppId = process.env.BOTMUX_LARK_APP_ID;
+          const sessionId = process.env.BOTMUX_SESSION_ID;
+          if (botAppId && sessionId) {
+            void enqueueObservation({
+              dataDir: config.session.dataDir,
+              event: observationFromSkillCommand({
+                botAppId,
+                sessionId,
+                turnId: process.env.BOTMUX_TURN_ID ?? null,
+                subcommand: skillArgs[0],
+                skillName: skillArgs[1],
+                exitCode: result.code,
+                bytes: result.stdout ? Buffer.byteLength(result.stdout) : undefined,
+                at: new Date().toISOString(),
+                invocationId: randomUUID(),
+              }),
+            });
+          }
+        }
+      } catch {
+        // Telemetry is best-effort; never fail the skill command on it.
+      }
+    }
+    break;
+  }
+  case 'km': {
+    // `botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]`
+    // `botmux km ops-readiness [--output <file>] [--now <ISO>] [--data-dir <dir>] [--keep-data-dir]`
+    // `botmux km retrieval-evidence <event> --working-dir <dir> --query-hash sha256:... [event fields]`
+    // Read-only backfill of historical turn.completed events into the KM
+    // observation store. Dry-run (default: no, requires --execute to write).
+    const kmArgs = process.argv.slice(3);
+    const kmSub = kmArgs[0] ?? 'help';
+    if (kmSub !== 'backfill' && kmSub !== 'ops-readiness' && kmSub !== 'retrieval-evidence') {
+      console.error('用法: botmux km backfill [--since <ISO>] [--limit <n>] [--dry-run]');
+      console.error('      botmux km ops-readiness [--output <file>] [--now <ISO>] [--data-dir <dir>] [--keep-data-dir]');
+      console.error('      botmux km retrieval-evidence <index-query|entry-read|entry-used|fallback|query-feedback> --working-dir <dir> --query-hash sha256:...');
+      process.exitCode = 2;
+      break;
+    }
+    if (kmSub === 'retrieval-evidence') {
+      const flags = kmArgs.slice(2); const eventName = kmArgs[1] ?? '';
+      const value = (name: string): string | undefined => { const index = flags.indexOf(name); return index >= 0 ? flags[index + 1] : undefined; };
+      const workingDir = value('--working-dir'); const queryHash = value('--query-hash');
+      if (!flags.includes('--execute')) { console.error('retrieval-evidence is append-only and requires explicit --execute'); process.exitCode = 2; break; }
+      if (!workingDir || !queryHash) { console.error('retrieval-evidence requires --working-dir and --query-hash'); process.exitCode = 2; break; }
+      const eventType = eventName.replaceAll('-', '_');
+      const common = { workingDir: resolve(workingDir), queryHash, source: 'cli' as const, ...(value('--observed-at') ? { observedAt: value('--observed-at') } : {}) };
+      const { recordWorkspaceRetrievalEvidence } = await import('./services/km/workspace-knowledge/retrieval-evidence.js');
+      let input: any;
+      if (eventType === 'index_query') input = { ...common, eventType, ...(value('--entry-count') !== undefined ? { entryCount: Number(value('--entry-count')) } : {}) };
+      else if (eventType === 'entry_read') input = { ...common, eventType, entryId: value('--entry-id') ?? '' };
+      else if (eventType === 'entry_used') input = { ...common, eventType, entryId: value('--entry-id') ?? '', useLabel: value('--use-label') ?? '' };
+      else if (eventType === 'fallback') input = { ...common, eventType, outcome: value('--outcome') ?? '' };
+      else if (eventType === 'query_feedback') input = { ...common, eventType, feedback: value('--feedback') ?? '' };
+      else { console.error('unknown retrieval evidence event'); process.exitCode = 2; break; }
+      try { console.log(JSON.stringify({ ok: true, ...recordWorkspaceRetrievalEvidence(input) })); }
+      catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2; }
+      break;
+    }
+    if (kmSub === 'ops-readiness') {
+      const flags = kmArgs.slice(1);
+      const outputIdx = flags.indexOf('--output');
+      const dataDirIdx = flags.indexOf('--data-dir');
+      const nowIdx = flags.indexOf('--now');
+      const output = outputIdx >= 0 && flags[outputIdx + 1] ? flags[outputIdx + 1] : undefined;
+      const dataDir = dataDirIdx >= 0 && flags[dataDirIdx + 1] ? flags[dataDirIdx + 1] : undefined;
+      const now = nowIdx >= 0 && flags[nowIdx + 1] ? flags[nowIdx + 1] : undefined;
+      const keepDataDir = flags.includes('--keep-data-dir');
+      const { runKmOpsReadinessDrill } = await import('./services/km/ops-readiness-drill.js');
+      const report = await runKmOpsReadinessDrill({
+        ...(dataDir ? { dataDir: resolve(dataDir) } : {}),
+        ...(now ? { now } : {}),
+        keepDataDir,
+      });
+      const body = `${JSON.stringify(report, null, 2)}\n`;
+      if (output) {
+        const target = resolve(output);
+        mkdirSync(dirname(target), { recursive: true });
+        atomicWriteFileSync(target, body, { mode: 0o600 });
+      } else {
+        process.stdout.write(body);
+      }
+      break;
+    }
+    {
+      const flags = kmArgs.slice(1);
+      const dryRun = flags.includes('--dry-run');
+      const sinceIdx = flags.indexOf('--since');
+      const since = sinceIdx >= 0 && flags[sinceIdx + 1] ? flags[sinceIdx + 1] : undefined;
+      const limitIdx = flags.indexOf('--limit');
+      const limit = limitIdx >= 0 && flags[limitIdx + 1] ? Number(flags[limitIdx + 1]) : undefined;
+      const { config } = await import('./config.js');
+      const { isKmObservationEnabled, enqueueObservation, drainObservationQueue } =
+        await import('./services/km/observation-queue.js');
+      const { backfillTurnCompletionObservations } = await import('./services/km/observation-backfill.js');
+      const { result, events } = backfillTurnCompletionObservations({
+        dataDir: config.session.dataDir,
+        ...(since ? { since } : {}),
+        ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+      });
+      if (dryRun) {
+        console.log(JSON.stringify({ dryRun: true, ...result }, null, 2));
+      } else {
+        if (!isKmObservationEnabled()) {
+          console.error('KM 观测未开启（BOTMUX_KM_OBSERVATION_ENABLED），拒绝写入。先开启或在 dry-run 验证。');
+          process.exitCode = 2;
+          break;
+        }
+        for (const event of events) {
+          await enqueueObservation({ dataDir: config.session.dataDir, event });
+        }
+        const undrained = await drainObservationQueue(3_000);
+        console.log(JSON.stringify({ ...result, undrained }, null, 2));
+      }
+    }
     break;
   }
   case 'skills': {

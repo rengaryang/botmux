@@ -72,6 +72,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('office', '#/office', () => import('./office-page.js'), 'renderOfficePage'),
   pageRoute('insights', '#/insights', () => import('./insights-page.js'), 'renderInsightsPage'),
   pageRoute('feedback', '#/feedback', () => import('./feedback-page.js'), 'renderFeedbackPage'),
+  pageRoute('km', '#/km', () => import('./km-page.js'), 'renderKmPage'),
 ];
 
 export function findDashboardRoute(hash: string): DashboardRoute | undefined {

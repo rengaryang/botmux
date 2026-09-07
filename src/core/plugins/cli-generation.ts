@@ -8,6 +8,8 @@ import type { SessionSkillManifest } from '../skills/types.js';
 import { refreshSessionPluginManifest, type SessionPluginManifest } from './session-manifest.js';
 import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
+import { observationFromSessionSkillManifest } from '../../services/km/observation-producers.js';
+import { enqueueObservation, isKmObservationEnabled } from '../../services/km/observation-queue.js';
 
 export interface CliPluginGenerationResult {
   pluginManifest: SessionPluginManifest;
@@ -68,6 +70,15 @@ export function prepareCliPluginGeneration(opts: {
     botPolicy: opts.bot.skills,
     pluginSkills: pluginSkills.skills,
   });
+  if (preparedSkills.manifest && isKmObservationEnabled() && opts.dataDir) {
+    void enqueueObservation({
+      dataDir: opts.dataDir,
+      event: observationFromSessionSkillManifest({
+        botAppId: opts.bot.larkAppId,
+        manifest: preparedSkills.manifest,
+      }),
+    });
+  }
   const delivery = prepareSkillDelivery(
     opts.adapter,
     preparedSkills.manifest,

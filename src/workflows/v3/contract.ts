@@ -118,14 +118,13 @@ export type { GoalAnswer, GoalAsk } from './event-contract.js';
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
 /**
- * v3 goal-mode is delivered via the native `/goal` command.  Keep this list
- * capability-based and explicit. Claude Code, Codex, Seed, and Traex have
- * direct `/goal` execution evidence (Traex 0.200.16+ also needs its automation
- * hook-trust flag). Relay is admitted from its exact Claude-family adapter and
- * slash-command compatibility with Seed; a Relay-binary smoke remains pending
- * on hosts where that binary is installed. The manifest watcher and goal env
- * contract are CLI-neutral after dispatch. The runtime rejects a run whose
- * nodes resolve to any other CLI at start time.
+ * v3 goal-mode is delivered through a capability-specific command. Claude
+ * Code, Codex, Seed, Traex, and Relay use the native `/goal` command. Pi has no
+ * native `/goal`; it receives an ordinary, file-backed prompt and completion is
+ * determined exclusively by the stable manifest watcher. The same frozen bot,
+ * goal env, sandbox, timeout, cancellation, and outer-worker fence apply to
+ * both paths. Keep this list capability-based and explicit; adding a CLI
+ * requires dispatch and lifecycle contract tests, not just an allowlist edit.
  */
 export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'claude-code',
@@ -133,6 +132,7 @@ export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'seed',
   'traex',
   'relay',
+  'pi',
 ];
 
 export function isV3SupportedCli(cliId: CliId): boolean {
@@ -154,9 +154,14 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  /** Execution identity. For legacy profiles this is a Lark app id; for direct
+   * CLI profiles it is `profile:<profileId>` and carries no transport secret. */
   larkAppId: string;
   cliId: CliId;
+  executionProfileId?: string;
+  directCli?: boolean;
   cliPathOverride?: string;
+  provider?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. */
@@ -170,6 +175,11 @@ export interface BotSnapshot {
   sandboxNetwork?: boolean;
   /** The resolved working directory for this run. */
   workingDir: string;
+  timeoutDefaultSec?: number;
+  timeoutMaxSec?: number;
+  costTier?: 'low' | 'medium' | 'high';
+  envAllowlist?: string[];
+  envDenylist?: string[];
 }
 
 // ─── runNode (the single call across the boundary) ──────────────────────────
@@ -230,6 +240,10 @@ export interface RunNodeResult {
    *  (runtime validates the manifest at `manifestPath` after `runNode`
    *  resolves — codex point 4: NOT v0.2 final_output semantics). */
   status: 'ok' | 'fail' | 'cancelled';
+  /** Non-secret pool diagnostic for the process-level settlement path. Runtime
+   *  uses bounded vocabulary values such as `timeout` for journal
+   *  classification; callers must not treat this as user-authored content. */
+  diagnosticReason?: string;
   /** Preserved AbortSignal.reason for a cancelled worker. The runtime treats
    *  this as audit/control metadata only; it is never rendered to users. */
   cancelReason?: unknown;

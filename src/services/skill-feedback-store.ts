@@ -108,6 +108,29 @@ export interface TurnCompletionEventPayload {
   durationMs?: number; usage?: Record<string, unknown>;
   cliId?: string; cliVersion?: string; model?: string; reasoningEffort?: string;
   skillName?: string; skillVersion?: string; workflowId?: string; taskId?: string; parentTaskId?: string;
+  requesterSubjectId?: string;
+}
+
+export interface TurnDeliveryRecord {
+  deliveryId: string; responseId: string;
+  botAppId?: string; sessionId?: string; turnId?: string;
+  nativeSessionId?: string; platform: string; platformAppId: string;
+  platformMessageId: string; dispatchAttempt?: number;
+  contentHash?: string; contentRef?: string;
+  chatId?: string; topicRootId?: string; scope?: TurnDeliveryScope;
+  workflowId?: string; taskId?: string; parentTaskId?: string;
+  cliId?: string; cliVersion?: string; model?: string; reasoningEffort?: string;
+  skillName?: string; skillVersion?: string; cardMode?: TurnDeliveryCardMode;
+  status?: TurnDeliveryStatus; durationMs?: number; usage?: Record<string, unknown>;
+  completedAt?: string; level: SkillFeedbackLevel;
+  policy?: FeedbackPolicy; baseCard?: Record<string, unknown>;
+  requesterSubjectId?: string; webhookDestinations?: FeedbackWebhookDestination[];
+  correlationDiscriminator?: string; context?: Record<string, unknown>; createdAt: string;
+}
+
+export interface RecordTurnDeliveryResult {
+  delivery: TurnDeliveryRecord;
+  completion?: TurnCompletionEventPayload;
 }
 
 interface ResponseRow {
@@ -549,7 +572,11 @@ export class SkillFeedbackStore {
     };
   }
 
-  recordTurnDelivery(input: RecordTurnDeliveryInput): ReturnType<SkillFeedbackStore['mapDelivery']> {
+  recordTurnDelivery(input: RecordTurnDeliveryInput): TurnDeliveryRecord {
+    return this.recordTurnDeliveryWithCompletion(input).delivery;
+  }
+
+  recordTurnDeliveryWithCompletion(input: RecordTurnDeliveryInput): RecordTurnDeliveryResult {
     const hash = contentHash(input.content);
     const attempt = input.dispatchAttempt ?? 0;
     const discriminator = input.correlationDiscriminator ?? '';
@@ -600,10 +627,10 @@ export class SkillFeedbackStore {
           SELECT 1 FROM deliveries WHERE response_id=responses.response_id
         )`).run(responseId);
       }
-      this.reconcileTurnCompletion(deliveryId);
+      const completion = this.reconcileTurnCompletion(deliveryId);
       const completedRow = this.db.prepare('SELECT * FROM deliveries WHERE delivery_id=?').get(deliveryId) as unknown as DeliveryRow;
       this.db.exec('COMMIT');
-      return this.mapDelivery(completedRow);
+      return { delivery: this.mapDelivery(completedRow), ...(completion ? { completion } : {}) };
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
@@ -761,6 +788,7 @@ export class SkillFeedbackStore {
       ...(row.skill_name ? { skillName: row.skill_name } : {}), ...(row.skill_version ? { skillVersion: row.skill_version } : {}),
       ...(row.workflow_id ? { workflowId: row.workflow_id } : {}), ...(row.task_id ? { taskId: row.task_id } : {}),
       ...(row.parent_task_id ? { parentTaskId: row.parent_task_id } : {}),
+      ...(row.requester_subject_id ? { requesterSubjectId: row.requester_subject_id } : {}),
     };
     // COALESCE so a terminal that carries no usage/duration (the turn-terminal
     // path only records status) does not clobber the usage/duration_ms the
@@ -928,7 +956,7 @@ export class SkillFeedbackStore {
     return { responseId: row.response_id, interactionId: row.interaction_id, skillRunId: row.skill_run_id ?? undefined, contentHash: row.content_hash, contentRef: row.content_ref ?? undefined, createdAt: row.created_at };
   }
 
-  private mapDelivery(row: DeliveryRow) {
+  private mapDelivery(row: DeliveryRow): TurnDeliveryRecord {
     const response = this.db.prepare('SELECT content_hash,content_ref FROM responses WHERE response_id=?')
       .get(row.response_id) as { content_hash: string; content_ref: string | null } | undefined;
     return {

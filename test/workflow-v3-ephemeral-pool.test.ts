@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND } from '../src/workflows/v3/ephemeral-pool.js';
 import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
@@ -214,6 +214,33 @@ describe('v3 ephemeral pool', () => {
     await promise;
   });
 
+  it('starts a direct CLI execution profile without resolving a Lark secret', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const resolveLarkAppSecret = vi.fn();
+    const base = request();
+    const req: RunNodeRequest = {
+      ...base,
+      botSnapshot: { ...base.botSnapshot, larkAppId: 'profile:direct-pi', executionProfileId: 'direct-pi', directCli: true, cliId: 'pi', envAllowlist: ['WORKFLOW_PROFILE_SAFE'], envDenylist: ['WORKFLOW_PROFILE_DENIED'] },
+    };
+    process.env.WORKFLOW_PROFILE_SAFE = 'safe'; process.env.WORKFLOW_PROFILE_DENIED = 'denied'; process.env.WORKFLOW_PROFILE_UNLISTED = 'hidden';
+    const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret });
+    const result = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(result).resolves.toMatchObject({ status: 'ok' });
+    expect(resolveLarkAppSecret).not.toHaveBeenCalled();
+    expect(worker.init).toMatchObject({ apiOnly: true, larkAppId: 'local_direct-pi', larkAppSecret: '' });
+    expect(factory.lastOpts?.env.WORKFLOW_PROFILE_SAFE).toBe('safe');
+    expect(factory.lastOpts?.env.WORKFLOW_PROFILE_DENIED).toBeUndefined();
+    expect(factory.lastOpts?.env.WORKFLOW_PROFILE_UNLISTED).toBeUndefined();
+    delete process.env.WORKFLOW_PROFILE_SAFE; delete process.env.WORKFLOW_PROFILE_DENIED; delete process.env.WORKFLOW_PROFILE_UNLISTED;
+  });
+
   it('passes frozen sandbox policy to the goal-mode worker init', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);
@@ -331,6 +358,36 @@ describe('v3 ephemeral pool', () => {
     await expect(promise).resolves.toMatchObject({
       status: 'cancelled',
       cancelReason: 'user-requested',
+    });
+  });
+
+  it('bounds cancellation escalation from SIGINT to SIGKILL when the worker ignores close', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const ac = new AbortController();
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      cancelGraceMs: 5,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode({ ...request(), cancelSignal: ac.signal });
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+
+    ac.abort('user-requested');
+    await waitFor(() => worker.kills.includes('SIGINT'));
+    await waitFor(() => worker.kills.includes('SIGKILL'));
+    expect(worker.kills.indexOf('SIGINT')).toBeLessThan(worker.kills.indexOf('SIGKILL'));
+
+    worker.emitExit(137);
+    await expect(promise).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: 'user-requested',
+      diagnosticReason: 'cancelled',
     });
   });
 
@@ -554,6 +611,44 @@ describe('v3 ephemeral pool', () => {
     expect(Buffer.byteLength(cmd, 'utf-8')).toBeLessThanOrEqual(180);
   });
 
+  it('dispatches Pi through an ordinary file-backed prompt and keeps manifest completion authoritative', async () => {
+    const worker = new ScriptedWorker({ autoReadyAfterInit: true });
+    const factory = factoryFor(worker);
+    const base = request();
+    const req: RunNodeRequest = {
+      ...base,
+      botSnapshot: { ...base.botSnapshot, cliId: 'pi' },
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      manifestPollMs: 5,
+      manifestSettleMs: 10,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    await waitFor(() => worker.readyEmitted);
+    worker.emitMessage({ type: 'prompt_ready' });
+
+    expect(worker.init?.cliId).toBe('pi');
+    expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
+    expect(worker.rawInputs[0]).not.toMatch(/^\/goal(?:\s|$)/);
+    expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.GOAL_PATH}`);
+    expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
+
+    writeFileSync(req.env[GOAL_ENV.MANIFEST_PATH]!, '{"schemaVersion":1}');
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(promise).resolves.toMatchObject({
+      status: 'ok',
+      diagnosticReason: 'manifest-written',
+      manifestPath: req.env[GOAL_ENV.MANIFEST_PATH],
+    });
+  });
+
   it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {
     const worker = new ScriptedWorker({ autoReadyAfterInit: true });
     const factory = factoryFor(worker);
@@ -623,6 +718,34 @@ describe('v3 ephemeral pool', () => {
     await waitFor(() => worker.kills.includes('SIGTERM'));
     worker.emitExit(0);
     await expect(promise).resolves.toMatchObject({ status: 'ok' });
+  });
+
+  it('reports hard deadline timeout and bounds close escalation to SIGTERM then SIGKILL', async () => {
+    const worker = new ScriptedWorker({ autoReadyAfterInit: true });
+    const factory = factoryFor(worker);
+    const req = { ...request(), timeoutMs: 5 };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      cancelGraceMs: 5,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    await waitFor(() => worker.readyEmitted);
+    worker.emitMessage({ type: 'prompt_ready' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    await waitFor(() => worker.kills.includes('SIGKILL'));
+
+    worker.emitExit(1);
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      diagnosticReason: 'timeout',
+      manifestPath: req.env[GOAL_ENV.MANIFEST_PATH],
+    });
+    expect(worker.kills.indexOf('SIGTERM')).toBeLessThan(worker.kills.indexOf('SIGKILL'));
   });
 });
 

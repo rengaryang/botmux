@@ -22,6 +22,12 @@ describe('Agent Workbench route and surface integration', () => {
     }
   });
 
+  it('registers the KM observation page as a lazy dashboard route', () => {
+    expect(findDashboardRoute('#/km')?.id).toBe('km');
+    expect(findDashboardRoute('#/km/anything/deeper')?.id).toBe('km');
+    expect(dashboardRoutes.find(route => route.id === 'km')?.load).toBeTypeOf('function');
+  });
+
   it('uses a chrome-less host for both Workbench surfaces', () => {
     const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
     expect(app).toContain("activeHash.startsWith('#/agent-workbench-dock')");
