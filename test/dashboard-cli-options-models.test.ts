@@ -46,10 +46,13 @@ describe('GET /api/cli-options/models — 200 响应 shape', () => {
     const body = await buildModelChoicesResponse('claude-code', { now: () => 1_700_000_000_000 });
     expect(body).toEqual({
       models: expect.arrayContaining(['sonnet']) as unknown as string[],
+      choices: expect.arrayContaining([
+        expect.objectContaining({ value: 'sonnet', model: 'sonnet', label: 'sonnet' }),
+      ]) as unknown as typeof body.choices,
       source: 'static',
       detectedAt: 1_700_000_000_000,
     });
-    expect(Object.keys(body).sort()).toEqual(['detectedAt', 'models', 'source']);
+    expect(Object.keys(body).sort()).toEqual(['choices', 'detectedAt', 'models', 'source']);
     expect(typeof body.detectedAt).toBe('number');
   });
 
