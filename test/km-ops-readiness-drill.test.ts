@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runKmOpsReadinessDrill } from '../src/services/km/ops-readiness-drill.js';
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
 function tempDir(prefix: string): string {
@@ -76,8 +77,9 @@ describe('KM ops readiness drill', () => {
       if (key.startsWith('BOTMUX_GOAL_') || key.startsWith('BOTMUX_WORKFLOW')) delete env[key];
     }
     delete env.BOTMUX_V3_GOAL;
-    execFileSync('pnpm', [
-      'tsx',
+    const runner = tsRunnerPrefix();
+    execFileSync(runner.command, [
+      ...runner.prefixArgs,
       'src/cli.ts',
       'km',
       'ops-readiness',

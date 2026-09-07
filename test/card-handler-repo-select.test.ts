@@ -154,6 +154,20 @@ vi.mock('../src/services/default-worktree.js', () => ({
   maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
 }));
 
+vi.mock('../src/services/model-catalog.js', () => ({
+  buildModelChoicesResponse: vi.fn(async () => ({
+    models: ['bytedance-hybrid/glm-5.3'],
+    choices: [{
+      value: 'bytedance-hybrid/glm-5.3',
+      provider: 'bytedance-hybrid',
+      model: 'glm-5.3',
+      label: 'glm-5.3 · bytedance-hybrid',
+    }],
+    source: 'live',
+    detectedAt: Date.now(),
+  })),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -285,6 +299,11 @@ beforeEach(() => {
   __testOnly_resetBotTurnMutationGates();
   __testOnlyResetModelPickerBindings();
   vi.clearAllMocks();
+  vi.mocked(sendWorkerSessionInput).mockImplementation((ds: any, message: any) => {
+    if (!ds.worker || ds.worker.killed) return false;
+    ds.worker.send(message);
+    return true;
+  });
   vi.mocked(deleteMessage).mockReset().mockResolvedValue(true);
   vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
   vi.mocked(getBot).mockImplementation(() => ({

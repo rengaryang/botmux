@@ -58,7 +58,9 @@ const SKIN_TOKENS: Record<string, Record<string, string>> = {
 
 describe('Agent Workbench visual contract', () => {
   const css = readFileSync(join(process.cwd(), 'src/dashboard/web/style.css'), 'utf8');
-  const block = css.slice(css.indexOf('/* Agent Workbench'));
+  const workbenchStart = css.indexOf('/* Agent Workbench');
+  const nextFeatureStart = css.indexOf('/* ── KM operations dashboard', workbenchStart);
+  const block = css.slice(workbenchStart, nextFeatureStart >= 0 ? nextFeatureStart : undefined);
 
   it('分层令牌是唯一配色入口：深色兜底 = slate-blue，历史 --wb-* 只做映射，段内零渐变', () => {
     // 配色从「一把散落的字面量」换成「四层底 + 三档文字 + 语义色」的分层令牌。
