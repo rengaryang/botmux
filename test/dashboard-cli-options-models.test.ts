@@ -71,6 +71,10 @@ describe('GET /api/cli-options/models — 200 响应 shape', () => {
     });
     expect(body).toEqual({
       models: ['deepseek-v4-pro', 'gpt-6-astra'],
+      choices: [
+        { value: 'deepseek-v4-pro', model: 'deepseek-v4-pro', label: 'deepseek-v4-pro' },
+        { value: 'gpt-6-astra', model: 'gpt-6-astra', label: 'gpt-6-astra' },
+      ],
       source: 'live',
       detectedAt: 1_700_000_000_001,
     });
